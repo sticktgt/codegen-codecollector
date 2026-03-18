@@ -1,0 +1,98 @@
+version: 1
+
+project:
+  title: Support App Demo
+  description: >-
+    Демонстрационный Python-проект для поиска мест изменения, сборки context pack
+    и безопасного применения заранее подготовленных артефактов.
+
+modules:
+  support_app.api.controllers:
+    title: Контроллеры demo API
+    description: Адаптируют входные запросы к сервисному слою и формируют ответы API-уровня.
+    layer: api
+  support_app.services.ticket_service:
+    title: Сервис работы с тикетами
+    description: Создает, назначает и закрывает тикеты, используя репозиторий и уведомления.
+    layer: services
+  support_app.services.notification_service:
+    title: Уведомления о назначении
+    description: Формирует текстовые сообщения после назначения тикета агенту.
+    layer: services
+  support_app.services.report_service:
+    title: Отчетные функции
+    description: Строит сводки и проекции по списку тикетов.
+    layer: services
+  support_app.storage.ticket_repository:
+    title: Репозиторий тикетов
+    description: Хранит тикеты в памяти и предоставляет операции выборки.
+    layer: storage
+  support_app.domain.models:
+    title: Модели предметной области
+    description: Хранит dataclass-модели тикета, краткой карточки и сводки по агенту.
+    layer: domain
+
+symbols:
+  support_app.services.ticket_service.TicketService.assign_ticket:
+    title: Назначение тикета агенту
+    description: Назначает тикет выбранному агенту, сохраняет изменения в репозитории и формирует уведомление.
+    keywords:
+      - назначение тикета
+      - назначить тикет агенту
+      - уведомление о назначении
+    requirements:
+      - REQ-DEMO-001
+  support_app.services.report_service.build_agent_summary:
+    title: Сводка по агенту
+    description: Формирует краткую сводку по открытым тикетам агента с учетом срочных тикетов.
+    keywords:
+      - сводка по агенту
+      - отчет по агенту
+      - summary агента
+    requirements:
+      - REQ-DEMO-002
+  support_app.services.notification_service.build_assignment_message:
+    title: Текст уведомления о назначении
+    description: Формирует короткий текст уведомления после назначения тикета агенту.
+    keywords:
+      - уведомление
+      - сообщение о назначении
+      - assignment message
+    requirements:
+      - REQ-DEMO-001
+  support_app.api.controllers.TicketController.assign_ticket_endpoint:
+    title: API-обработчик назначения тикета
+    description: Принимает команду назначения тикета и возвращает ответ API-уровня.
+    keywords:
+      - endpoint назначения
+      - api назначения тикета
+    requirements:
+      - REQ-DEMO-001
+
+requirements:
+  REQ-DEMO-001:
+    title: Назначение тикета агенту
+    description: Пользователь должен иметь возможность назначить тикет агенту и получить уведомление о назначении.
+    linked_symbols:
+      - support_app.services.ticket_service.TicketService.assign_ticket
+      - support_app.services.notification_service.build_assignment_message
+      - support_app.api.controllers.TicketController.assign_ticket_endpoint
+  REQ-DEMO-002:
+    title: Получение краткой сводки по агенту
+    description: Пользователь должен иметь возможность получить краткую сводку по открытым тикетам выбранного агента.
+    linked_symbols:
+      - support_app.services.report_service.build_agent_summary
+      - support_app.api.controllers.TicketController.agent_summary_endpoint
+
+architecture:
+  layers:
+    api:
+      - support_app.api.controllers
+    services:
+      - support_app.services.ticket_service
+      - support_app.services.notification_service
+      - support_app.services.report_service
+    storage:
+      - support_app.storage.ticket_repository
+    domain:
+      - support_app.domain.models

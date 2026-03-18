@@ -1,0 +1,41 @@
+cases:
+  - id: search_update_assignment_message_by_change_request
+    kind: search
+    query: "Изменить сообщение, которое формируется после назначения тикета агенту"
+    expected_top_qualname: support_app.services.notification_service.build_assignment_message
+    expected_relevance_category: высокая
+    expected_candidates:
+      - support_app.services.notification_service.build_assignment_message
+      - support_app.services.ticket_service.TicketService.assign_ticket
+      - support_app.api.controllers.TicketController.assign_ticket_endpoint
+  - id: search_add_reassign_method_by_change_request
+    kind: search
+    query: "Добавить в сервис тикетов метод повторного назначения тикета другому агенту"
+    expected_top_qualname: support_app.services.ticket_service.TicketService.assign_ticket
+    expected_relevance_category: высокая
+    expected_candidates:
+      - support_app.services.ticket_service.TicketService.assign_ticket
+      - support_app.services.notification_service.build_assignment_message
+      - support_app.api.controllers.TicketController.assign_ticket_endpoint
+  - id: context_notification_message_v2
+    kind: context
+    qualname: support_app.services.notification_service.build_assignment_message
+    expected_related_test: tests.test_ticket_service.test_assign_ticket_returns_message
+    expected_inbound_relations:
+      - support_app.services.ticket_service.TicketService.assign_ticket
+    expected_outbound_relations:
+      - REQ-DEMO-001
+  - id: apply_replace_notification_v2
+    kind: apply
+    operation: replace_symbol
+    qualname: support_app.services.notification_service.build_assignment_message
+    artifact_file: demo_artifacts/build_assignment_message_v2.py
+    expected_related_test: tests.test_ticket_service.test_assign_ticket_returns_message
+    expected_impacted_callers:
+      - support_app.services.ticket_service.TicketService.assign_ticket
+  - id: apply_add_service_method_v2
+    kind: apply
+    operation: add_symbol
+    qualname: support_app.services.ticket_service.TicketService
+    artifact_file: demo_artifacts/reopen_ticket_method.py
+    expected_new_symbol: support_app.services.ticket_service.TicketService.reopen_ticket

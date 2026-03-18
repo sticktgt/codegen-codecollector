@@ -1,0 +1,22 @@
+cases:
+  - id: search_change_notification_message
+    kind: search
+    query: "Изменить формирование текста уведомления о назначении тикета"
+    expected_top_qualname: support_app.services.notification_service.build_assignment_message
+    expected_candidates:
+      - support_app.services.notification_service.build_assignment_message
+      - support_app.services.ticket_service.TicketService.assign_ticket
+      - support_app.api.controllers.TicketController.assign_ticket_endpoint
+  - id: context_assign_ticket
+    kind: context
+    qualname: support_app.services.ticket_service.TicketService.assign_ticket
+    expected_related_test: tests.test_ticket_service.test_assign_ticket_returns_message
+    expected_neighbors:
+      - support_app.services.ticket_service.TicketService.list_open_tickets
+      - support_app.services.ticket_service.TicketService.close_ticket
+  - id: apply_replace_notification
+    kind: apply
+    operation: replace_symbol
+    qualname: support_app.services.notification_service.build_assignment_message
+    artifact_file: demo_artifacts/build_assignment_message_v2.py
+    expected_related_test: tests.test_ticket_service.test_assign_ticket_returns_message

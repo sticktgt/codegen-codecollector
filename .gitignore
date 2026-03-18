@@ -1,0 +1,52 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# VSCode & IDE settings
+.vscode/
+.idea/
+
+# Virtual environments
+.env/
+.venv/
+env/
+venv/
+
+# Jupyter notebooks checkpoints
+.ipynb_checkpoints
+
+# Logs and output
+*.log
+.runs/
+.workspaces/
+*.tmp
+*.bak
+*.swp
+*.DS_Store
+*.egg-info/
+
+# Python profiling/debugging
+*.prof
+*.coverage
+htmlcov/
+.cache/
+.mypy_cache/
+.pytest_cache/
+
+# Docker/Build artifacts
+*.tar
+*.gz
+*.whl
+dist/
+build/
+
+# Secrets (if any)
+.env.local
+.env.secrets
+secrets.yaml
+
+# JSON metadata if generated
+*.jsonl

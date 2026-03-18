@@ -1,0 +1,22 @@
+app:
+  name: codecollector
+  version: 0.8.0
+
+index:
+  overlay_dirname: .codecollector
+
+workspace:
+  root_dirname: .workspaces
+
+runs:
+  root_dirname: .runs
+
+logging:
+  level: INFO
+  format: '%(asctime)s | %(levelname)s | %(name)s | %(message)s'
+
+ui:
+  default_demo_project: demo_projects/sample_python_app
+
+search:
+  default_limit: 5
