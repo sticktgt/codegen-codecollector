@@ -63,6 +63,25 @@ def _render_candidates(candidates: list[dict]) -> None:
                 st.code(item['docstring'])
 
 
+
+
+def _render_reference_artifacts(reference_artifacts: list[dict]) -> None:
+    if not reference_artifacts:
+        return
+    st.subheader('Reference Library')
+    for item in reference_artifacts:
+        st.markdown(f"**{item['title']}**")
+        st.caption(f"{item['artifact_type']} · {item['usage_mode']} · score={item.get('relevance_score', 0.0)} · {item.get('content_mode', 'full_file')}")
+        if item.get('description'):
+            st.write(item['description'])
+        if item.get('why_selected'):
+            st.write(f"Почему выбран: {item['why_selected']}")
+        if item.get('selected_span'):
+            span = item['selected_span']
+            st.write(f"Фрагмент: строки {span.get('start_line')}–{span.get('end_line')}")
+        with st.expander('Показать передаваемый reference-код'):
+            st.code(item.get('content', ''), language=item.get('language', 'python'))
+
 def _render_context(context_pack: dict) -> None:
     st.subheader('Context pack')
     target = context_pack['target']
@@ -239,12 +258,15 @@ with tab_search:
                     'knowledge_description': context_pack.knowledge_description,
                     'requirement_ids': context_pack.requirement_ids,
                     'requirement_titles': context_pack.requirement_titles,
+                    'reference_artifacts': [asdict(item) for item in context_pack.reference_artifacts],
+                    'reference_summary': context_pack.reference_summary,
                 }
             except Exception as exc:
                 LOGGER.exception('Context build failed: %s', exc)
                 st.error(str(exc))
     if 'context_pack' in st.session_state:
         _render_context(st.session_state['context_pack'])
+        _render_reference_artifacts(st.session_state['context_pack'].get('reference_artifacts', []))
 
 with tab_apply:
     apply_target = st.text_input('Target qualname для apply', st.session_state.get('selected_qualname', 'support_app.services.notification_service.build_assignment_message'))
@@ -331,6 +353,8 @@ with tab_pipeline:
                         'knowledge_description': result.context_pack.knowledge_description,
                         'requirement_ids': result.context_pack.requirement_ids,
                         'requirement_titles': result.context_pack.requirement_titles,
+                        'reference_artifacts': [asdict(item) for item in result.context_pack.reference_artifacts],
+                        'reference_summary': result.context_pack.reference_summary,
                     },
                     'generation_replay': asdict(result.generation_replay),
                     'apply_result': {
@@ -352,3 +376,4 @@ with tab_pipeline:
 
     if 'pipeline_result' in st.session_state:
         _render_pipeline_result(st.session_state['pipeline_result'])
+        _render_reference_artifacts(st.session_state['pipeline_result']['context_pack'].get('reference_artifacts', []))

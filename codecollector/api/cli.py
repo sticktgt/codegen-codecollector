@@ -103,6 +103,8 @@ def main() -> None:
                 'knowledge_description': context_pack.knowledge_description,
                 'requirement_ids': context_pack.requirement_ids,
                 'requirement_titles': context_pack.requirement_titles,
+                'reference_artifacts': [asdict(item) for item in context_pack.reference_artifacts],
+                'reference_summary': context_pack.reference_summary,
             }
             print(json.dumps(payload, ensure_ascii=False, indent=2))
             return

@@ -26,7 +26,7 @@
 ## Что лежит в `.codecollector/`
 
 - `knowledge.yaml` — human-readable knowledge-слой: описания модулей и symbol-ов, requirements, architecture.
-- runtime graph/index хранится в Postgres и не создаёт локальный `index.db` рядом с проектом.
+- runtime graph/index хранится в Postgres. Локальный индекс рядом с проектом не используется.
 
 ## Структура demo-проекта
 

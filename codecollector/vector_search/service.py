@@ -18,8 +18,8 @@ class DescriptionVectorSearchService:
         self.config = config
         self.backend = PGVectorDescriptionSearchService(self.project_root, config)
 
-    def sync_documents(self, documents: list[dict[str, str]]) -> None:
-        self.backend.sync_documents(documents)
+    def sync_documents(self, documents: list[dict[str, str]], project_key: str | None = None) -> None:
+        self.backend.sync_documents(documents, project_key=project_key or self.project_key)
 
-    def search(self, query: str, limit: int = 10) -> dict[str, float]:
-        return self.backend.search(query, limit=limit)
+    def search(self, query: str, limit: int = 10, project_key: str | None = None) -> dict[str, float]:
+        return self.backend.search(query, limit=limit, project_key=project_key or self.project_key)

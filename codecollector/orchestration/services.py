@@ -12,6 +12,7 @@ from codecollector.logger import get_logger
 from codecollector.orchestration.pipeline_service import PipelineService
 from codecollector.orchestration.run_artifacts import RunArtifactsManager
 from codecollector.overlays.service import OverlayService
+from codecollector.reference_library.service import ReferenceLibraryService
 from codecollector.patching.apply_service import ApplyService
 from codecollector.search.service import SearchService
 from codecollector.vector_search.service import DescriptionVectorSearchService
@@ -36,6 +37,7 @@ class ProjectServices:
             config=self.config,
         )
         self.context_service = ContextService(self.project_root, self.store, self.overlays)
+        self.reference_library_service = ReferenceLibraryService(self.tool_root, self.store, self.vector_search_service, self.config)
         self.apply_service = ApplyService(
             self.tool_root,
             config=self.config,
@@ -57,14 +59,23 @@ class ProjectServices:
         report.vector_index_sync_ms = sync_stats['vector_index_sync_ms']
         report.search_documents_count = sync_stats['search_documents_count']
         report.search_documents_changed = sync_stats['search_documents_changed']
+        ref_stats = self.reference_library_service.sync_documents()
+        report.reference_documents_count = int(ref_stats['reference_documents_count'])
+        report.reference_documents_changed = bool(ref_stats['reference_documents_changed'])
+        report.reference_sync_ms = int(ref_stats.get('reference_sync_ms', 0))
+        report.reference_vector_sync_ms = int(ref_stats.get('reference_vector_sync_ms', 0))
         LOGGER.info(
-            'Build timings for %s: graph_indexing_ms=%s search_documents_sync_ms=%s vector_index_sync_ms=%s search_documents_count=%s changed=%s',
+            'Build timings for %s: graph_indexing_ms=%s search_documents_sync_ms=%s vector_index_sync_ms=%s search_documents_count=%s changed=%s reference_sync_ms=%s reference_vector_sync_ms=%s reference_docs=%s reference_changed=%s',
             self.project_root,
             report.graph_indexing_ms,
             report.search_documents_sync_ms,
             report.vector_index_sync_ms,
             report.search_documents_count,
             report.search_documents_changed,
+            report.reference_sync_ms,
+            report.reference_vector_sync_ms,
+            report.reference_documents_count,
+            report.reference_documents_changed,
         )
         return report
 
@@ -81,6 +92,18 @@ class ProjectServices:
     def apply(self, artifact: PatchArtifact) -> ApplyResult:
         LOGGER.info('Applying artifact %s (%s) to %s', artifact.target_qualname, artifact.operation, self.project_root)
         return self.apply_service.apply_artifact(self.project_root, artifact)
+
+    def retrieve_reference_artifacts(self, change_request: ChangeRequest, selected_target: str) -> list:
+        target = self.store.get_symbol(str(self.project_root), selected_target)
+        target_summary = ''
+        if target is not None:
+            bundle = self.overlays.candidate_text_bundle(target.module_name, target.qualname)
+            target_summary = ' '.join([target.name, target.docstring, str(bundle.get('symbol_title', '')), str(bundle.get('symbol_description', ''))]).strip()
+        return self.reference_library_service.retrieve_for_change_request(
+            query=change_request.search_text(),
+            target_summary=target_summary,
+            limit=self.config.reference_top_n,
+        )
 
     def pipeline_replay(
         self,

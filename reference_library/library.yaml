@@ -1,0 +1,29 @@
+version: 1
+artifacts:
+  - artifact_id: ref.python.template.notification_message
+    language: python
+    artifact_type: template
+    usage_mode: adapt
+    source_path: python/templates/notification_message_template.py
+    title: Шаблон функции формирования текстового уведомления
+    description: Пример небольшой функции, которая принимает доменный объект и формирует локализованное текстовое уведомление для пользователя.
+    keywords:
+      - уведомление
+      - текст сообщения
+      - локализация
+      - assignment
+  - artifact_id: ref.python.reusable.ru_message_builder
+    language: python
+    artifact_type: reusable_component
+    usage_mode: reuse
+    source_path: python/reusable/ru_message_builder.py
+    title: Переиспользуемый строитель русскоязычных сообщений
+    description: Готовый компонент для аккуратного формирования русскоязычных сообщений о назначении и статусе тикета.
+    keywords:
+      - русскоязычное сообщение
+      - reusable
+      - builder
+      - ticket
+      - assignment
+    snippet_start_line: 9
+    snippet_end_line: 37

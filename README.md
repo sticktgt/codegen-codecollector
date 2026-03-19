@@ -19,7 +19,7 @@ Runtime использует module/class/function docstring как главны
 
 ### 2. Knowledge-слой рядом с проектом
 Рядом с индексируемым проектом хранится `.codecollector/knowledge.yaml`.
-Локальный `index.db` рядом с проектом не используется: runtime graph/index хранится в Postgres.
+Локальный файл индекса рядом с проектом не используется: runtime graph/index хранится в Postgres.
 Он содержит:
 - описания модулей и symbol-ов;
 - связи с requirement-ами;
@@ -46,7 +46,16 @@ Postgres используется для:
 
 Векторный поиск не заменяет graph retrieval, а помогает semantic retrieval по описаниям и требованиям.
 
-### 5. Полный dry-run pipeline
+### 5. Reference Library
+Reference Library — отдельный индексируемый источник reference-кода.
+Он не является частью изменяемого проекта и не участвует в primary target search.
+
+Reference Library используется только для generation context:
+- ищутся релевантные reference artifacts;
+- затем они materialize-ятся в `full_file` или `snippet`;
+- после этого попадают в generation context и run bundle.
+
+### 6. Полный dry-run pipeline
 Pipeline состоит из шагов:
 - build/update index;
 - primary target search;
@@ -102,6 +111,14 @@ Raw code не индексируется embeddings-ами.
 
 ### ADR-005. Project-level validation выполняет текущий PoC
 Генератор изменений может вернуть optional test artifact, но project-level validation и execution тестов — ответственность текущего PoC.
+
+### ADR-006. Reference Library индексируется отдельно от project code
+Reference artifacts хранятся отдельно от master-кода проекта.
+
+Причина:
+- target всегда ищется только в коде проекта;
+- reference artifacts нужны как supporting context для генерации;
+- генератор получает materialized content, а не ссылки на файлы.
 
 ## Почему одновременно Postgres и YAML
 
@@ -270,6 +287,20 @@ python -m codecollector pipeline replay \
 - graph/index в Postgres обновляется при `index build` инкрементально по hash файлов и адресно после `apply` только для измененных файлов.
 - semantic search documents пересчитываются после `index build` из docstring и `knowledge.yaml`. Синхронизация в Postgres/PGVector выполняется только если тексты документов реально изменились.
 
+
+## Когда обновляются graph, search documents, vector index и `knowledge.yaml`
+
+- **Graph / index** обновляется при `index build` инкрементально по hash файлов и после `apply` адресно по измененным файлам в staging.
+- **Search documents** пересчитываются после `index build` из docstring, `knowledge.yaml` и requirement-текстов.
+- **Vector index** синхронизируется только если тексты search documents реально изменились.
+- **`knowledge.yaml`** не перестраивается автоматически: это curated source-of-truth для human-readable knowledge.
+
+### Что происходит при появлении нового symbol
+
+- новый публичный или значимый symbol должен иметь docstring;
+- если symbol важен для поиска, requirements или повторного использования, должен формироваться **update/proposal** в `knowledge.yaml`;
+- итоговое решение о сохранении такой записи принимает человек при review.
+
 ## Что означает `relation_confidence_summary`
 
 `relation_confidence_summary` — это краткая сводка надежности найденных связей в `context_pack`.
@@ -290,3 +321,41 @@ python -m codecollector pipeline replay \
 - `vector_index_sync_ms` — синхронизация embedding/vector index;
 - `search_documents_count` — количество search documents;
 - `search_documents_changed` — изменились ли search documents по сравнению с уже сохраненными.
+
+## Reference Library MVP
+
+Структура MVP:
+
+```text
+reference_library/
+  library.yaml
+  python/
+    templates/
+    reusable/
+```
+
+### Типы reference artifacts
+- `template` — пример/образец для адаптации;
+- `reusable_component` — почти готовый код для прямого переиспользования.
+
+### Retrieval stage
+Reference-кандидаты ищутся:
+- по change request;
+- по выбранному target;
+- по knowledge descriptions.
+
+### Materialization stage
+Перед передачей в generation context reference artifacts materialize-ятся в:
+- `full_file`, если файл небольшой;
+- `snippet`, если файл больше лимита.
+
+### Что попадает в generation context
+Для каждого reference artifact передается:
+- title;
+- artifact type;
+- usage mode;
+- why selected;
+- content mode;
+- actual content.
+
+Генератору не нужен прямой доступ к Reference Library.

@@ -26,6 +26,10 @@ class BuildReport:
     vector_index_sync_ms: int = 0
     search_documents_count: int = 0
     search_documents_changed: bool = False
+    reference_documents_count: int = 0
+    reference_documents_changed: bool = False
+    reference_sync_ms: int = 0
+    reference_vector_sync_ms: int = 0
 
 
 class PythonIndexBuilder:

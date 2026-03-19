@@ -67,6 +67,19 @@ class PipelineService:
             lambda: self.project_services.context(selected_target),
         )
 
+        reference_artifacts = self._run_step(
+            steps,
+            'reference_retrieval',
+            'Подобрать reference artifacts для генерации',
+            lambda: self.project_services.retrieve_reference_artifacts(change_request, selected_target),
+        )
+        context_pack.reference_artifacts = reference_artifacts
+        context_pack.reference_summary = {
+            'count': len(reference_artifacts),
+            'titles': [item.title for item in reference_artifacts],
+            'content_modes': [item.content_mode for item in reference_artifacts],
+        }
+
         generation_replay = self._run_step(
             steps,
             'generation_replay',
@@ -132,6 +145,20 @@ class PipelineService:
             ],
             'outbound_relations': [
                 relation.target_qualname or relation.target_ref for relation in context_pack.outbound_relations[:8]
+            ],
+            'reference_summary': context_pack.reference_summary,
+            'reference_artifacts': [
+                {
+                    'artifact_id': item.artifact_id,
+                    'title': item.title,
+                    'artifact_type': item.artifact_type,
+                    'usage_mode': item.usage_mode,
+                    'content_mode': item.content_mode,
+                    'why_selected': item.why_selected,
+                    'source_path': item.source_path,
+                    'content': item.content,
+                }
+                for item in context_pack.reference_artifacts
             ],
         }
         return GenerationReplay(

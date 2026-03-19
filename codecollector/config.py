@@ -31,6 +31,10 @@ class AppConfig:
     search_vector_enabled: bool
     search_vector_backend: str
     search_vector_weight: float
+    reference_library_dir: str
+    reference_top_n: int
+    reference_full_file_max_lines: int
+    reference_vector_weight: float
 
     @property
     def ui_default_demo_project_path(self) -> Path:
@@ -64,4 +68,8 @@ def load_config(config_path: Path | None = None) -> AppConfig:
         search_vector_enabled=bool(payload.get('search', {}).get('vector_enabled', True)),
         search_vector_backend=str(payload.get('search', {}).get('vector_backend', 'pgvector')),
         search_vector_weight=float(payload.get('search', {}).get('vector_weight', 4.0)),
+        reference_library_dir=str(payload.get('reference_library', {}).get('dir', 'reference_library')),
+        reference_top_n=int(payload.get('reference_library', {}).get('top_n', 2)),
+        reference_full_file_max_lines=int(payload.get('reference_library', {}).get('full_file_max_lines', 32)),
+        reference_vector_weight=float(payload.get('reference_library', {}).get('vector_weight', 3.0)),
     )

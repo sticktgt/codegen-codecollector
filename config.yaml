@@ -1,6 +1,6 @@
 app:
   name: codecollector
-  version: 0.10.0
+  version: 0.10.3
 
 index:
   overlay_dirname: .codecollector
@@ -40,3 +40,9 @@ search:
   vector_enabled: true
   vector_backend: pgvector
   vector_weight: 4.0
+
+reference_library:
+  dir: reference_library
+  top_n: 2
+  full_file_max_lines: 32
+  vector_weight: 3.0

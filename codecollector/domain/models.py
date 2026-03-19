@@ -92,7 +92,26 @@ class ContextPack:
     knowledge_description: str = ""
     recommended_tests: list[str] = field(default_factory=list)
     relation_confidence_summary: dict[str, dict[str, int]] = field(default_factory=dict)
+    reference_artifacts: list[ReferenceArtifact] = field(default_factory=list)
+    reference_summary: dict[str, Any] = field(default_factory=dict)
 
+
+
+
+@dataclass(slots=True)
+class ReferenceArtifact:
+    artifact_id: str
+    title: str
+    description: str
+    artifact_type: str
+    usage_mode: str
+    language: str
+    relevance_score: float
+    why_selected: str
+    content_mode: str
+    source_path: str
+    content: str
+    selected_span: dict[str, int] | None = None
 
 @dataclass(slots=True)
 class PatchArtifact:

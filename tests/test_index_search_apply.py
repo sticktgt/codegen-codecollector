@@ -141,7 +141,7 @@ def test_pipeline_replay_writes_run_bundle_and_merge_plan() -> None:
 def test_demo_overlay_directory_contains_only_current_schema_files() -> None:
     overlay_dir = PROJECT_ROOT / '.codecollector'
     entries = sorted(path.name for path in overlay_dir.iterdir() if path.is_file())
-    assert entries == ['index.db', 'knowledge.yaml']
+    assert entries == ['knowledge.yaml']
 
 
 def test_search_can_use_vector_description_layer() -> None:

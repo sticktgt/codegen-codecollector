@@ -42,9 +42,10 @@ class PGVectorDescriptionSearchService:
             pre_delete_collection=False,
         )
 
-    def sync_documents(self, documents: list[dict[str, str]]) -> None:
+    def sync_documents(self, documents: list[dict[str, str]], project_key: str | None = None) -> None:
+        project_key = project_key or self.project_key
         store = self._vector_store()
-        self._delete_existing_project_docs()
+        self._delete_existing_project_docs(project_key)
         if not documents:
             return
         try:
@@ -56,7 +57,7 @@ class PGVectorDescriptionSearchService:
             Document(
                 page_content=item['text'],
                 metadata={
-                    'project_root': self.project_key,
+                    'project_root': project_key,
                     'qualname': item['qualname'],
                     'file_path': item['file_path'],
                     'source_kind': item['source_kind'],
@@ -69,26 +70,26 @@ class PGVectorDescriptionSearchService:
         ]
         store.add_documents(docs, ids=[item['doc_id'] for item in documents])
 
-    def _delete_existing_project_docs(self) -> None:
+    def _delete_existing_project_docs(self, project_key: str) -> None:
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 "DELETE FROM langchain_pg_embedding WHERE cmetadata->>'project_root' = %s",
-                (self.project_key,),
+                (project_key,),
             )
             conn.commit()
 
-    def search(self, query: str, limit: int = 10) -> dict[str, float]:
+    def search(self, query: str, limit: int = 10, project_key: str | None = None) -> dict[str, float]:
+        project_key = project_key or self.project_key
         store = self._vector_store()
         results = store.similarity_search_with_score(query, k=limit * 3)
         scores: dict[str, float] = {}
         for doc, score in results:
             metadata = doc.metadata or {}
-            if metadata.get('project_root') != self.project_key:
+            if metadata.get('project_root') != project_key:
                 continue
             qualname = str(metadata.get('qualname', ''))
             if not qualname:
                 continue
-            # Similarity search with score often returns distance-like values; convert to a bounded similarity.
             similarity = 1.0 / (1.0 + float(score))
             if similarity > scores.get(qualname, 0.0):
                 scores[qualname] = similarity
