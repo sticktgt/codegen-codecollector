@@ -1,6 +1,6 @@
 app:
   name: codecollector
-  version: 0.8.0
+  version: 0.10.0
 
 index:
   overlay_dirname: .codecollector
@@ -18,5 +18,25 @@ logging:
 ui:
   default_demo_project: demo_projects/sample_python_app
 
+storage:
+  backend: postgres
+
+postgres:
+  graph_connection: postgresql://postgres:postgres@localhost:5432/vector_db
+  vector_connection: postgresql+psycopg://postgres:postgres@localhost:5432/vector_db
+  schema: public
+  collection_prefix: codecollector
+
+embedding:
+  provider: ollama
+  timeout_sec: 420
+  ollama:
+    base_url: http://192.168.50.165:18081
+    model: nomic-embed-text-v2-moe
+    timeout_sec: 420
+
 search:
   default_limit: 5
+  vector_enabled: true
+  vector_backend: pgvector
+  vector_weight: 4.0

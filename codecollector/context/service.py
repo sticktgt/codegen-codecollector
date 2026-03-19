@@ -4,7 +4,7 @@ from collections import deque
 from pathlib import Path
 
 from codecollector.domain.models import ContextPack, SymbolRecord
-from codecollector.indexing.storage_sqlite import SQLiteIndexStore
+from codecollector.indexing.base import IndexStore
 from codecollector.overlays.service import OverlayService
 from codecollector.logger import get_logger
 
@@ -12,7 +12,7 @@ LOGGER = get_logger(__name__)
 
 
 class ContextService:
-    def __init__(self, project_root: Path, store: SQLiteIndexStore, overlays: OverlayService) -> None:
+    def __init__(self, project_root: Path, store: IndexStore, overlays: OverlayService) -> None:
         self.project_root = project_root.resolve()
         self.project_key = str(self.project_root)
         self.store = store
@@ -33,6 +33,7 @@ class ContextService:
         related_tests = self._collect_related_tests(qualname, inbound)
         requirements = self.overlays.requirement_details_for_symbol(qualname)
         recommended_tests = [item.qualname for item in related_tests]
+        relation_confidence_summary = self._relation_confidence_summary(inbound, outbound)
         return ContextPack(
             target=target,
             neighbors=neighbors[:8],
@@ -44,6 +45,7 @@ class ContextService:
             knowledge_title=self.overlays.symbol_title(qualname),
             knowledge_description=self.overlays.symbol_description(qualname),
             recommended_tests=recommended_tests[:8],
+            relation_confidence_summary=relation_confidence_summary,
         )
 
     def _collect_related_tests(self, target_qualname: str, inbound_relations) -> list[SymbolRecord]:
@@ -81,3 +83,15 @@ class ContextService:
 
     def _is_test_symbol(self, symbol: SymbolRecord) -> bool:
         return '/tests/' in f'/{symbol.file_path}' or symbol.file_path.startswith('tests/')
+
+    def _relation_confidence_summary(self, inbound_relations, outbound_relations) -> dict[str, dict[str, int]]:
+        def summarize(items):
+            summary = {'high': 0, 'medium': 0, 'low': 0}
+            for relation in items:
+                summary[str(relation.relation_confidence)] = summary.get(str(relation.relation_confidence), 0) + 1
+            return summary
+
+        return {
+            'inbound': summarize(inbound_relations),
+            'outbound': summarize(outbound_relations),
+        }

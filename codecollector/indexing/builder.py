@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from codecollector.domain.models import RelationRecord, SymbolRecord
-from codecollector.indexing.storage_sqlite import SQLiteIndexStore
+from codecollector.indexing.base import IndexStore
 from codecollector.logger import get_logger
 
 IGNORE_DIR_NAMES = {'.git', '.venv', '__pycache__', '.mypy_cache', '.pytest_cache', '.codecollector', '.workspaces'}
@@ -21,10 +21,15 @@ class BuildReport:
     full_rebuild: bool
     initial_build: bool = False
     known_files_before_build: int = 0
+    graph_indexing_ms: int = 0
+    search_documents_sync_ms: int = 0
+    vector_index_sync_ms: int = 0
+    search_documents_count: int = 0
+    search_documents_changed: bool = False
 
 
 class PythonIndexBuilder:
-    def __init__(self, project_root: Path, store: SQLiteIndexStore) -> None:
+    def __init__(self, project_root: Path, store: IndexStore) -> None:
         self.project_root = project_root.resolve()
         self.store = store
         self.project_key = str(self.project_root)
@@ -243,7 +248,7 @@ class PythonIndexBuilder:
                 )
             )
 
-        return symbols, relations
+        return symbols, self._dedupe_relations(relations)
 
     def _collect_imports(self, tree: ast.Module, module_name: str) -> dict[str, str]:
         imports: dict[str, str] = {}
@@ -274,7 +279,11 @@ class PythonIndexBuilder:
     def _collect_local_var_types(self, function_node: ast.FunctionDef, imports: dict[str, str], module_name: str) -> dict[str, str]:
         result: dict[str, str] = {}
         for child in ast.walk(function_node):
-            if isinstance(child, ast.Assign) and len(child.targets) == 1 and isinstance(child.targets[0], ast.Name):
+            if isinstance(child, ast.AnnAssign) and isinstance(child.target, ast.Name):
+                resolved = self._resolve_annotation(child.annotation, imports, module_name)
+                if resolved:
+                    result[child.target.id] = resolved
+            elif isinstance(child, ast.Assign) and len(child.targets) == 1 and isinstance(child.targets[0], ast.Name):
                 target_name = child.targets[0].id
                 value = child.value
                 if isinstance(value, ast.Call):
@@ -286,6 +295,8 @@ class PythonIndexBuilder:
                         if dotted and dotted.split('.')[0] in imports:
                             base = dotted.split('.')[0]
                             result[target_name] = dotted.replace(base, imports[base], 1)
+                elif isinstance(value, ast.Name) and value.id in imports:
+                    result[target_name] = imports[value.id]
         return result
 
     def _collect_self_attr_types(self, init_node: ast.FunctionDef, imports: dict[str, str], module_name: str) -> dict[str, str]:
@@ -347,7 +358,7 @@ class PythonIndexBuilder:
 
         for child in ast.walk(node):
             if isinstance(child, ast.Call):
-                target_ref, target_qualname = self._resolve_call_target(
+                target_ref, target_qualname, relation_confidence = self._resolve_call_target(
                     child.func,
                     module_name=module_name,
                     imports=imports,
@@ -364,6 +375,7 @@ class PythonIndexBuilder:
                     target_ref=target_ref,
                     target_qualname=target_qualname,
                     file_path=file_path,
+                    relation_confidence=relation_confidence,
                 ))
                 if is_test_source and target_qualname:
                     relations.append(RelationRecord(
@@ -372,6 +384,7 @@ class PythonIndexBuilder:
                         target_ref=target_ref,
                         target_qualname=target_qualname,
                         file_path=file_path,
+                        relation_confidence=relation_confidence,
                     ))
                 if is_controller_source and target_qualname and '.services.' in target_qualname:
                     relations.append(RelationRecord(
@@ -380,6 +393,7 @@ class PythonIndexBuilder:
                         target_ref=target_ref,
                         target_qualname=target_qualname,
                         file_path=file_path,
+                        relation_confidence=relation_confidence,
                     ))
         return relations
 
@@ -392,41 +406,41 @@ class PythonIndexBuilder:
         class_method_map: dict[str, str],
         self_attr_types: dict[str, str],
         local_var_types: dict[str, str],
-    ) -> tuple[str | None, str | None]:
+    ) -> tuple[str | None, str | None, str]:
         if isinstance(node, ast.Name):
             if node.id in imports:
-                return node.id, imports[node.id]
+                return node.id, imports[node.id], 'high'
             if node.id in module_functions:
-                return node.id, module_functions[node.id]
-            return node.id, None
+                return node.id, module_functions[node.id], 'high'
+            return node.id, None, 'low'
 
         if isinstance(node, ast.Attribute):
             dotted = self._attribute_to_dotted(node)
             if not dotted:
-                return None, None
+                return None, None, 'low'
             parts = dotted.split('.')
             target_ref = parts[-1]
 
             if parts[0] == 'self':
                 if len(parts) == 2 and parts[1] in class_method_map:
-                    return target_ref, class_method_map[parts[1]]
+                    return target_ref, class_method_map[parts[1]], 'high'
                 if len(parts) >= 3:
                     owner_attr = parts[1]
                     owner_type = self_attr_types.get(owner_attr)
                     if owner_type:
-                        return target_ref, f"{owner_type}.{parts[-1]}"
-                return target_ref, None
+                        return target_ref, f"{owner_type}.{parts[-1]}", 'high'
+                return target_ref, None, 'low'
 
             if parts[0] in imports:
                 imported = imports[parts[0]]
-                return target_ref, '.'.join([imported] + parts[1:])
+                return target_ref, '.'.join([imported] + parts[1:]), 'high'
             if parts[0] in local_var_types:
                 owner = local_var_types[parts[0]]
-                return target_ref, '.'.join([owner] + parts[1:])
+                return target_ref, '.'.join([owner] + parts[1:]), 'medium'
 
-            return target_ref, None
+            return target_ref, None, 'low'
 
-        return None, None
+        return None, None, 'low'
 
     def _attribute_to_dotted(self, node: ast.AST) -> str | None:
         parts: list[str] = []
@@ -465,6 +479,23 @@ class PythonIndexBuilder:
             docstring=ast.get_docstring(node) or '',
             source_code=source_code,
         )
+
+    def _dedupe_relations(self, relations: list[RelationRecord]) -> list[RelationRecord]:
+        seen: set[tuple[str, str, str, str | None, str, str]] = set()
+        result: list[RelationRecord] = []
+        for relation in relations:
+            key = (
+                relation.source_qualname,
+                relation.relation_kind,
+                relation.target_ref,
+                relation.target_qualname,
+                relation.relation_source,
+                relation.relation_confidence,
+            )
+            if key not in seen:
+                seen.add(key)
+                result.append(relation)
+        return result
 
     def _sha256(self, path: Path) -> str:
         return hashlib.sha256(path.read_bytes()).hexdigest()

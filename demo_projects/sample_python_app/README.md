@@ -25,8 +25,8 @@
 
 ## Что лежит в `.codecollector/`
 
-- `index.db` — runtime-индекс структурных фактов проекта;
 - `knowledge.yaml` — human-readable knowledge-слой: описания модулей и symbol-ов, requirements, architecture.
+- runtime graph/index хранится в Postgres и не создаёт локальный `index.db` рядом с проектом.
 
 ## Структура demo-проекта
 

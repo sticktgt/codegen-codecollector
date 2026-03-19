@@ -178,6 +178,7 @@ class OverlayService:
                     target_qualname=None,
                     file_path='',
                     relation_source='knowledge',
+                    relation_confidence='high',
                 ))
         for requirement_id, requirement_entry in self.load_knowledge().get('requirements', {}).items():
             linked_symbols = requirement_entry.get('linked_symbols', [])
@@ -191,6 +192,7 @@ class OverlayService:
                     target_qualname=None,
                     file_path='',
                     relation_source='knowledge',
+                    relation_confidence='high',
                 ))
         for qualname, symbol_entry in self.load_knowledge().get('symbols', {}).items():
             if not isinstance(symbol_entry, dict):
@@ -203,5 +205,6 @@ class OverlayService:
                     target_qualname=None,
                     file_path='',
                     relation_source='knowledge',
+                    relation_confidence='high',
                 ))
         return relations

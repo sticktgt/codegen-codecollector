@@ -15,6 +15,7 @@ RelationKind = Literal[
     "exposed_by_controller",
 ]
 RelationSource = Literal["index", "knowledge"]
+RelationConfidence = Literal["high", "medium", "low"]
 Severity = Literal["info", "warning", "error"]
 PatchOperation = Literal["replace_symbol", "insert_after_symbol", "add_symbol"]
 
@@ -60,6 +61,7 @@ class RelationRecord:
     file_path: str
     target_qualname: str | None = None
     relation_source: RelationSource = "index"
+    relation_confidence: RelationConfidence = "medium"
 
 
 @dataclass(slots=True)
@@ -89,6 +91,7 @@ class ContextPack:
     knowledge_title: str = ""
     knowledge_description: str = ""
     recommended_tests: list[str] = field(default_factory=list)
+    relation_confidence_summary: dict[str, dict[str, int]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

@@ -4,14 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codecollector"
-version = "0.8.0"
+version = "0.10.0"
 description = "PoC for indexing, searching, contextualizing, and staging Python code changes"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-  "PyYAML>=6.0",
-  "streamlit>=1.35",
-  "pandas>=2.2",
+  "PyYAML==6.0.3",
+  "streamlit==1.55.0",
+  "pandas==2.3.3",
+  "requests==2.32.5",
+  "langchain-core==1.2.20",
+  "langchain-postgres==0.0.17",
+  "psycopg[binary]==3.3.3",
+  "SQLAlchemy==2.0.48",
 ]
 
 [tool.setuptools.packages.find]

@@ -37,6 +37,7 @@ class PipelineService:
         artifact_file: Path,
         operation: str,
         limit: int,
+        use_vector_search: bool | None = None,
     ) -> PipelineRunResult:
         run_id, run_label, run_dir = self.artifacts_manager.create_run_dir('pipeline')
         steps: list[PipelineStepRecord] = []
@@ -53,7 +54,7 @@ class PipelineService:
             steps,
             'search_primary_target',
             f'Найти shortlist по change request: {change_request.title}',
-            lambda: [asdict(item) for item in self.project_services.search(search_text, limit=limit)],
+            lambda: [asdict(item) for item in self.project_services.search(search_text, limit=limit, use_vector_search=use_vector_search)],
         )
         candidates = [SearchCandidate(**item) for item in candidates_dicts]
         if not any(item.qualname == selected_target for item in candidates):

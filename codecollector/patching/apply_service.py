@@ -3,9 +3,11 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+from codecollector.config import AppConfig, load_config
 from codecollector.domain.models import ApplyResult, ImpactSummary, PatchArtifact, SymbolRecord
 from codecollector.indexing.builder import PythonIndexBuilder
-from codecollector.indexing.storage_sqlite import SQLiteIndexStore
+from codecollector.indexing.base import IndexStore
+from codecollector.indexing.storage_factory import create_index_store
 from codecollector.logger import get_logger
 from codecollector.overlays.service import OverlayService
 from codecollector.validation.service import ValidationService
@@ -16,8 +18,9 @@ LOGGER = get_logger(__name__)
 
 
 class ApplyService:
-    def __init__(self, tool_root: Path, overlay_dirname: str = '.codecollector', workspace_root_dirname: str = '.workspaces') -> None:
+    def __init__(self, tool_root: Path, config: AppConfig | None = None, overlay_dirname: str = '.codecollector', workspace_root_dirname: str = '.workspaces') -> None:
         self.tool_root = tool_root.resolve()
+        self.config = config or load_config()
         self.overlay_dirname = overlay_dirname
         self.staging = StagingManager(self.tool_root, workspace_root_dirname=workspace_root_dirname)
         self.diff_service = DiffService()
@@ -26,7 +29,7 @@ class ApplyService:
         source_project = source_project.resolve()
         workspace = self.staging.create_workspace(source_project)
         project_key = str(workspace)
-        store = SQLiteIndexStore(workspace / self.overlay_dirname / 'index.db')
+        store = create_index_store(workspace, self.config)
         overlays = OverlayService(workspace, overlay_dirname=self.overlay_dirname)
         builder = PythonIndexBuilder(workspace, store)
         builder.build(full_rebuild=True)
@@ -95,7 +98,7 @@ class ApplyService:
     def _build_impact_summary(
         self,
         project_key: str,
-        store: SQLiteIndexStore,
+        store: IndexStore,
         overlays: OverlayService,
         target_qualname: str,
         changed_file_path: str,
@@ -161,7 +164,7 @@ class ApplyService:
             recommended_test_commands=recommended_test_commands,
         )
 
-    def _recommended_test_commands(self, store: SQLiteIndexStore, project_key: str, test_qualnames: list[str]) -> list[str]:
+    def _recommended_test_commands(self, store: IndexStore, project_key: str, test_qualnames: list[str]) -> list[str]:
         commands: list[str] = []
         seen_paths: set[str] = set()
         for qualname in test_qualnames:

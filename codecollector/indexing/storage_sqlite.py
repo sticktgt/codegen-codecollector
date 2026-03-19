@@ -52,12 +52,23 @@ class SQLiteIndexStore:
                     relation_kind TEXT NOT NULL,
                     target_ref TEXT NOT NULL,
                     target_qualname TEXT,
-                    relation_source TEXT NOT NULL DEFAULT 'index'
+                    relation_source TEXT NOT NULL DEFAULT 'index',
+                    relation_confidence TEXT NOT NULL DEFAULT 'medium'
+                );
+                CREATE TABLE IF NOT EXISTS search_documents (
+                    project_root TEXT NOT NULL,
+                    doc_id TEXT NOT NULL PRIMARY KEY,
+                    qualname TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    source_kind TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    text TEXT NOT NULL
                 );
                 """
             )
             self._ensure_relation_column(conn, 'target_qualname', 'TEXT')
             self._ensure_relation_column(conn, 'relation_source', "TEXT NOT NULL DEFAULT 'index'")
+            self._ensure_relation_column(conn, 'relation_confidence', "TEXT NOT NULL DEFAULT 'medium'")
             conn.executescript(
                 """
                 CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(project_root, name);
@@ -66,6 +77,7 @@ class SQLiteIndexStore:
                 CREATE INDEX IF NOT EXISTS idx_relations_target_ref ON relations(project_root, target_ref);
                 CREATE INDEX IF NOT EXISTS idx_relations_target_qualname ON relations(project_root, target_qualname);
                 CREATE INDEX IF NOT EXISTS idx_relations_kind ON relations(project_root, relation_kind);
+                CREATE INDEX IF NOT EXISTS idx_search_documents_qualname ON search_documents(project_root, qualname);
                 """
             )
 
@@ -177,6 +189,38 @@ class SQLiteIndexStore:
                 ],
             )
 
+
+    def replace_search_documents(self, project_root: str, documents: Iterable[dict[str, str]]) -> None:
+        rows = list(documents)
+        with self._connect() as conn:
+            conn.execute("DELETE FROM search_documents WHERE project_root = ?", (project_root,))
+            conn.executemany(
+                """
+                INSERT INTO search_documents(project_root, doc_id, qualname, file_path, source_kind, title, text)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        project_root,
+                        item['doc_id'],
+                        item['qualname'],
+                        item['file_path'],
+                        item['source_kind'],
+                        item['title'],
+                        item['text'],
+                    )
+                    for item in rows
+                ],
+            )
+
+    def list_search_documents(self, project_root: str) -> list[dict[str, str]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT doc_id, qualname, file_path, source_kind, title, text FROM search_documents WHERE project_root = ? ORDER BY qualname",
+                (project_root,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def delete_file(self, project_root: str, file_path: str) -> None:
         with self._connect() as conn:
             conn.execute("DELETE FROM files WHERE project_root = ? AND file_path = ?", (project_root, file_path))
@@ -274,4 +318,5 @@ def _row_to_relation(row: sqlite3.Row) -> RelationRecord:
         target_qualname=row['target_qualname'],
         file_path=row['file_path'],
         relation_source=row['relation_source'],
+        relation_confidence=row['relation_confidence'],
     )

@@ -142,3 +142,27 @@ def test_demo_overlay_directory_contains_only_current_schema_files() -> None:
     overlay_dir = PROJECT_ROOT / '.codecollector'
     entries = sorted(path.name for path in overlay_dir.iterdir() if path.is_file())
     assert entries == ['index.db', 'knowledge.yaml']
+
+
+def test_search_can_use_vector_description_layer() -> None:
+    services = ProjectServices(PROJECT_ROOT)
+    services.build_index(full_rebuild=True)
+
+    candidates = services.search(
+        'Изменить формирование текста уведомления о назначении тикета',
+        limit=3,
+        use_vector_search=True,
+    )
+
+    assert candidates[0].qualname == 'support_app.services.notification_service.build_assignment_message'
+    assert any('векторное сходство' in reason for reason in candidates[0].reasons)
+
+
+def test_context_relations_include_confidence() -> None:
+    services = ProjectServices(PROJECT_ROOT)
+    services.build_index(full_rebuild=True)
+
+    context_pack = services.context('support_app.services.notification_service.build_assignment_message')
+
+    assert context_pack.inbound_relations
+    assert all(relation.relation_confidence in {'high', 'medium', 'low'} for relation in context_pack.inbound_relations)

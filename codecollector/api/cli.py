@@ -33,6 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
     search_parser.add_argument('--project', required=True)
     search_parser.add_argument('--query', required=True)
     search_parser.add_argument('--limit', type=int)
+    search_parser.add_argument('--disable-vector-search', action='store_true')
 
     context_parser = subparsers.add_parser('context')
     context_parser.add_argument('--project', required=True)
@@ -57,6 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
     pipeline_replay.add_argument('--description')
     pipeline_replay.add_argument('--constraint', action='append', default=[])
     pipeline_replay.add_argument('--note', action='append', default=[])
+    pipeline_replay.add_argument('--disable-vector-search', action='store_true')
 
     ui_parser = subparsers.add_parser('ui')
     ui_parser.add_argument('--server-port', type=int)
@@ -84,7 +86,7 @@ def main() -> None:
 
         if args.command == 'search':
             limit = args.limit or config.search_default_limit
-            candidates = services.search(args.query, limit=limit)
+            candidates = services.search(args.query, limit=limit, use_vector_search=not args.disable_vector_search)
             print(json.dumps([asdict(candidate) for candidate in candidates], ensure_ascii=False, indent=2))
             return
 
@@ -131,6 +133,7 @@ def main() -> None:
                 artifact_file=Path(args.artifact_file),
                 operation=args.operation,
                 limit=args.limit,
+                use_vector_search=not args.disable_vector_search,
             )
             print(json.dumps(_pipeline_payload(result), ensure_ascii=False, indent=2))
             return

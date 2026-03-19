@@ -105,12 +105,14 @@ def _render_context(context_pack: dict) -> None:
         st.markdown('**Входящие связи**')
         for relation in context_pack.get('inbound_relations', []):
             target_label = relation.get('target_qualname') or relation['target_ref']
-            st.write(f"- `{relation['source_qualname']}` → `{target_label}` ({relation['relation_kind']})")
+            confidence = relation.get('relation_confidence', 'medium')
+            st.write(f"- `{relation['source_qualname']}` → `{target_label}` ({relation['relation_kind']}, confidence={confidence})")
     with rel_right:
         st.markdown('**Исходящие связи**')
         for relation in context_pack.get('outbound_relations', []):
             target_label = relation.get('target_qualname') or relation['target_ref']
-            st.write(f"- `{relation['source_qualname']}` → `{target_label}` ({relation['relation_kind']})")
+            confidence = relation.get('relation_confidence', 'medium')
+            st.write(f"- `{relation['source_qualname']}` → `{target_label}` ({relation['relation_kind']}, confidence={confidence})")
 
 
 def _render_apply_result(result: dict) -> None:
@@ -210,9 +212,10 @@ tab_search, tab_apply, tab_pipeline = st.tabs(['Поиск и context', 'Apply �
 with tab_search:
     search_query = st.text_input('Текст change request / запроса', 'Изменить формирование текста уведомления о назначении тикета', key='search_query')
     limit = st.slider('Количество кандидатов', min_value=1, max_value=10, value=CONFIG.search_default_limit)
+    use_vector_search = st.checkbox('Использовать векторный поиск по описаниям', value=CONFIG.search_vector_enabled, key='search_vector_enabled')
     if st.button('Найти кандидатов'):
         try:
-            st.session_state['candidates'] = [asdict(item) for item in services.search(search_query, limit=limit)]
+            st.session_state['candidates'] = [asdict(item) for item in services.search(search_query, limit=limit, use_vector_search=use_vector_search)]
         except Exception as exc:
             LOGGER.exception('Search failed: %s', exc)
             st.error(str(exc))
@@ -278,13 +281,14 @@ with tab_pipeline:
     description = st.text_area('Change request: description', 'Сделать текст уведомления русскоязычным и использовать фразу «теперь назначен на».', key='pipeline_description')
     constraints_raw = st.text_area('Constraints (по одной на строку)', 'Не менять внешний контракт API\nИзменить только текст уведомления', key='pipeline_constraints')
     pipeline_limit = st.slider('Размер shortlist для pipeline', min_value=1, max_value=10, value=CONFIG.search_default_limit, key='pipeline_limit')
+    pipeline_use_vector = st.checkbox('Использовать векторный поиск по описаниям в pipeline', value=CONFIG.search_vector_enabled, key='pipeline_vector_enabled')
 
     if st.button('Получить shortlist для change request'):
         try:
             constraints = [line.strip() for line in constraints_raw.splitlines() if line.strip()]
             change_request = ChangeRequest(title=title, description=description, constraints=constraints, project=project_root.name)
             st.session_state['pipeline_change_request'] = asdict(change_request)
-            st.session_state['pipeline_candidates'] = [asdict(item) for item in services.search(change_request.search_text(), limit=pipeline_limit)]
+            st.session_state['pipeline_candidates'] = [asdict(item) for item in services.search(change_request.search_text(), limit=pipeline_limit, use_vector_search=pipeline_use_vector)]
         except Exception as exc:
             LOGGER.exception('Pipeline shortlist failed: %s', exc)
             st.error(str(exc))
@@ -305,6 +309,7 @@ with tab_pipeline:
                     artifact_file=ARTIFACTS_ROOT / selected_pipeline_artifact,
                     operation=pipeline_operation,
                     limit=pipeline_limit,
+                    use_vector_search=pipeline_use_vector,
                 )
                 st.session_state['pipeline_result'] = {
                     'run_id': result.run_id,
