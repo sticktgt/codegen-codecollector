@@ -25,7 +25,7 @@ class ApplyService:
         self.staging = StagingManager(self.tool_root, workspace_root_dirname=workspace_root_dirname)
         self.diff_service = DiffService()
 
-    def apply_artifact(self, source_project: Path, artifact: PatchArtifact) -> ApplyResult:
+    def apply_artifact(self, source_project: Path, artifact: PatchArtifact, generated_tests: list[dict[str, str]] | None = None) -> ApplyResult:
         source_project = source_project.resolve()
         workspace = self.staging.create_workspace(source_project)
         project_key = str(workspace)
@@ -42,12 +42,20 @@ class ApplyService:
         target_path = workspace / symbol.file_path
         before_path = source_project / symbol.file_path
         self._apply_operation_to_file(target_path, symbol, artifact)
-        validation = ValidationService().validate_project(workspace, changed_files=[target_path])
+        changed_files = [target_path]
+        for test_artifact in generated_tests or []:
+            test_path = workspace / str(test_artifact['file_path'])
+            test_path.parent.mkdir(parents=True, exist_ok=True)
+            test_source = str(test_artifact['source_code']).rstrip('\n') + '\n'
+            ast.parse(test_source)
+            test_path.write_text(test_source, encoding='utf-8')
+            changed_files.append(test_path)
+        validation = ValidationService().validate_project(workspace, changed_files=changed_files)
 
         reindexed = False
         if validation.is_valid:
             LOGGER.info('Targeted reindex of changed workspace files after successful validation: %s', workspace)
-            reindex_report = builder.build_changed_files([target_path])
+            reindex_report = builder.build_changed_files(changed_files)
             store.replace_knowledge_relations(project_key, overlays.knowledge_relations())
             reindexed = reindex_report.indexed_files > 0
 

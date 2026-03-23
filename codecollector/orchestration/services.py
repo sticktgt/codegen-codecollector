@@ -16,6 +16,7 @@ from codecollector.reference_library.service import ReferenceLibraryService
 from codecollector.patching.apply_service import ApplyService
 from codecollector.search.service import SearchService
 from codecollector.vector_search.service import DescriptionVectorSearchService
+from codecollector.validation.service import ValidationService
 
 LOGGER = get_logger(__name__)
 
@@ -44,6 +45,7 @@ class ProjectServices:
             overlay_dirname=self.config.overlay_dirname,
             workspace_root_dirname=self.config.workspace_root_dirname,
         )
+        self.validation_service = ValidationService()
         self.run_artifacts = RunArtifactsManager(self.tool_root, runs_root_dirname=self.config.runs_root_dirname)
         self.pipeline_service = PipelineService(self, self.run_artifacts)
 
@@ -89,9 +91,9 @@ class ProjectServices:
         self.overlays.refresh()
         return self.context_service.build_context(qualname)
 
-    def apply(self, artifact: PatchArtifact) -> ApplyResult:
+    def apply(self, artifact: PatchArtifact, generated_tests: list[dict[str, str]] | None = None) -> ApplyResult:
         LOGGER.info('Applying artifact %s (%s) to %s', artifact.target_qualname, artifact.operation, self.project_root)
-        return self.apply_service.apply_artifact(self.project_root, artifact)
+        return self.apply_service.apply_artifact(self.project_root, artifact, generated_tests=generated_tests)
 
     def retrieve_reference_artifacts(self, change_request: ChangeRequest, selected_target: str) -> list:
         target = self.store.get_symbol(str(self.project_root), selected_target)
@@ -120,6 +122,21 @@ class ProjectServices:
             selected_target=selected_target,
             artifact_file=artifact_file.resolve(),
             operation=operation,
+            limit=limit or self.config.search_default_limit,
+            use_vector_search=use_vector_search,
+        )
+
+    def pipeline_generate(
+        self,
+        change_request: ChangeRequest,
+        selected_target: str,
+        limit: int | None = None,
+        use_vector_search: bool | None = None,
+    ) -> PipelineRunResult:
+        LOGGER.info('Running generate pipeline for %s with target %s', self.project_root, selected_target)
+        return self.pipeline_service.run_generate(
+            change_request=change_request,
+            selected_target=selected_target,
             limit=limit or self.config.search_default_limit,
             use_vector_search=use_vector_search,
         )

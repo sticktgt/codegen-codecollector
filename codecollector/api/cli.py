@@ -60,6 +60,17 @@ def build_parser() -> argparse.ArgumentParser:
     pipeline_replay.add_argument('--note', action='append', default=[])
     pipeline_replay.add_argument('--disable-vector-search', action='store_true')
 
+    pipeline_generate = pipeline_sub.add_parser('generate')
+    pipeline_generate.add_argument('--project', required=True)
+    pipeline_generate.add_argument('--selected-qualname', required=True)
+    pipeline_generate.add_argument('--limit', type=int)
+    pipeline_generate.add_argument('--change-request-file')
+    pipeline_generate.add_argument('--title')
+    pipeline_generate.add_argument('--description')
+    pipeline_generate.add_argument('--constraint', action='append', default=[])
+    pipeline_generate.add_argument('--note', action='append', default=[])
+    pipeline_generate.add_argument('--disable-vector-search', action='store_true')
+
     ui_parser = subparsers.add_parser('ui')
     ui_parser.add_argument('--server-port', type=int)
     ui_parser.add_argument('--server-address')
@@ -139,6 +150,17 @@ def main() -> None:
             )
             print(json.dumps(_pipeline_payload(result), ensure_ascii=False, indent=2))
             return
+
+        if args.command == 'pipeline' and args.pipeline_command == 'generate':
+            change_request = _load_change_request(args, Path(args.project).name)
+            result = services.pipeline_generate(
+                change_request=change_request,
+                selected_target=args.selected_qualname,
+                limit=args.limit,
+                use_vector_search=not args.disable_vector_search,
+            )
+            print(json.dumps(_pipeline_payload(result), ensure_ascii=False, indent=2))
+            return
     except Exception as exc:
         LOGGER.exception('CLI command failed: %s', exc)
         print(json.dumps({'error': str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
@@ -200,8 +222,14 @@ def _pipeline_payload(result: PipelineRunResult) -> dict:
             'requirement_ids': result.context_pack.requirement_ids,
             'inbound_relations': [asdict(item) for item in result.context_pack.inbound_relations],
             'outbound_relations': [asdict(item) for item in result.context_pack.outbound_relations],
+            'reference_summary': result.context_pack.reference_summary,
+            'reference_artifacts': [asdict(item) for item in result.context_pack.reference_artifacts],
         },
-        'generation_replay': asdict(result.generation_replay),
+        'generation_replay': asdict(result.generation_replay) if result.generation_replay else None,
+        'external_generation': asdict(result.external_generation) if result.external_generation else None,
+        'generated_test_apply': result.generated_test_apply,
+        'verification_report': result.verification_report,
+        'repair_generation': asdict(result.repair_generation) if result.repair_generation else None,
         'apply_result': {
             'workspace_path': str(result.apply_result.workspace_path),
             'diff': asdict(result.apply_result.diff),

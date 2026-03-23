@@ -175,6 +175,17 @@ class GenerationReplay:
 
 
 @dataclass(slots=True)
+class ExternalGenerationCall:
+    mode: str
+    command: list[str]
+    request_path: str
+    result_path: str
+    trace_path: str | None
+    request_payload: dict[str, Any]
+    result_payload: dict[str, Any]
+
+
+@dataclass(slots=True)
 class MergePlan:
     mode: str
     ready_for_manual_merge_review: bool
@@ -207,7 +218,11 @@ class PipelineRunResult:
     build_report: dict[str, Any]
     search_candidates: list[SearchCandidate]
     context_pack: ContextPack
-    generation_replay: GenerationReplay
     apply_result: ApplyResult
     merge_plan: MergePlan
     steps: list[PipelineStepRecord]
+    generation_replay: GenerationReplay | None = None
+    external_generation: ExternalGenerationCall | None = None
+    generated_test_apply: dict[str, Any] | None = None
+    verification_report: dict[str, Any] | None = None
+    repair_generation: ExternalGenerationCall | None = None

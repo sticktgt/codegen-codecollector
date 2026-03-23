@@ -61,7 +61,7 @@ Pipeline состоит из шагов:
 - primary target search;
 - manual target selection;
 - supporting context build;
-- external code generation step в режиме replay;
+- external code generation step: либо replay по артефакту, либо реальный вызов `codegenerator`;
 - apply в staging workspace;
 - structural validation;
 - impact summary;
@@ -324,6 +324,12 @@ python -m codecollector pipeline replay \
 
 ## Reference Library MVP
 
+### Reference Library lifecycle
+Reference Library is a separate curated artifact and is not updated as part of normal project work.
+During regular `pipeline replay` and `index build`, the system only ensures that reference artifacts are available in the stores. If reference documents are already indexed, resync is skipped.
+A full resync of Reference Library should be done only after explicit changes in `reference_library/`.
+
+
 Структура MVP:
 
 ```text
@@ -359,3 +365,36 @@ Reference-кандидаты ищутся:
 - actual content.
 
 Генератору не нужен прямой доступ к Reference Library.
+
+## Build report timing fields
+- `graph_indexing_ms` — project graph/index update time.
+- `search_documents_sync_ms` — sync time for project search documents.
+- `vector_index_sync_ms` — sync time for project vector index.
+- `reference_sync_ms` — sync time for Reference Library documents when explicit sync happens.
+- `reference_vector_sync_ms` — vector sync time for Reference Library when explicit sync happens.
+
+
+### ADR-007. Внешний генератор вызывается через CLI и файловый request/result contract
+На текущем этапе `codecollector` вызывает `codegenerator` как отдельный процесс (`python -m codegenerator ...`) и передает request/result через JSON/YAML-файлы в run bundle.
+
+Причина:
+- проще отлаживать содержимое generation packet;
+- не нужен отдельный HTTP lifecycle;
+- trace и run artifacts остаются прозрачными и повторяемыми.
+
+## Интеграция с codegenerator
+Команда `pipeline generate` собирает `generation request`, вызывает внешний `codegenerator`, сохраняет request/result в `.runs/`, затем применяет возвращенный `code_artifact` в staging workspace.
+
+
+## Verification and repair
+
+After `external_generate` and `apply_staging`, `codecollector` runs post-apply verification. The current checks are AST parsing, `compileall`, optional `ruff`, recommended pytest targets, and optional full-project pytest. When verification fails and repair is enabled, `codecollector` builds a compact verification summary and calls `codegenerator repair`, then applies the repaired artifact into a fresh staging workspace and reruns verification.
+
+## Context budgeting
+
+Before invoking `codegenerator`, `codecollector` measures and reduces the outgoing generation packet. For small symbol-level edits it prefers the target symbol source and omits `full_file_source`. It also limits related tests and reference artifacts. Final packet size metrics are stored in `context_metrics` inside the run bundle.
+
+
+## Проверки после apply
+
+После применения generated artifact pipeline выполняет: `ast_parse`, `py_compile`, optional `ruff`, `pytest_recommended` и optional full-project pytest. Если apply падает до verification, это считается `apply_failed` и может запускать repair. После repair pipeline повторяет apply и затем повторно запускает проверки. Если repaired artifact не дает итогового diff, результат помечается как потеря intent изменения.

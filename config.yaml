@@ -46,3 +46,23 @@ reference_library:
   top_n: 2
   full_file_max_lines: 32
   vector_weight: 3.0
+
+
+
+codegenerator:
+  root_dir: ../codegenerator
+  config_path: config.yaml
+  python: python
+  request_format: json
+  max_full_file_chars: 0
+  max_related_test_chars: 900
+  max_reference_chars: 900
+  max_request_chars: 5200
+  test_generation_mode: if_missing
+  repair_enabled: true
+  max_repair_attempts: 1
+
+verification:
+  run_ruff: false
+  run_recommended_tests: true
+  run_full_project_tests: false
