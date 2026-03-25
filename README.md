@@ -1,400 +1,292 @@
 # codecollector
 
-`codecollector` — PoC для работы с master-кодом Python-проекта: найти основной фрагмент под изменение, собрать ограниченный context pack, передать его во внешний шаг генерации кода, применить полученный артефакт в staging и подготовить dry-run план merge в master.
+`codecollector` — это инструмент, который готовит изменение кода по change request, подбирает контекст по проекту, вызывает внешний `codegenerator`, применяет результат в staging workspace и запускает проверки.
 
-## Scope
+Проект рассчитан на локальные модели и маленький/средний контекст. Поэтому пайплайн старается передавать в LLM только то, что реально нужно для текущего изменения: target-символ, краткое окружение, связанные тесты и небольшое количество reference-артефактов.
 
-- только Python;
-- один project root за запуск;
-- один основной target на один pipeline run;
-- человек подтверждает target из shortlist;
-- внешний генератор пока работает в режиме replay по заранее подготовленному артефакту;
-- merge в master пока только в режиме dry-run;
-- поддерживаются операции `replace_symbol`, `insert_after_symbol`, `add_symbol`.
+## Что делает инструмент
 
-## Текущая архитектура
+`codecollector` отвечает за весь цикл подготовки и проверки изменения:
 
-### 1. Описания в коде — основной источник смысла
-Runtime использует module/class/function docstring как главный источник human-readable смысла.
+1. читает код проекта и обновляет индекс символов;
+2. использует описание из `knowledge.yaml` как человекочитаемое описание назначения символов и требований;
+3. выполняет поиск target-символа по change request;
+4. собирает контекст для изменения;
+5. при необходимости подбирает примеры из Reference Library;
+6. вызывает внешний `codegenerator` для генерации кода;
+7. применяет результат в staging workspace;
+8. при ошибке применения или проверки может вызвать `repair`;
+9. отдельным шагом может вызвать генерацию теста;
+10. запускает проверки и формирует итоговый отчет `pipeline_run_*.json`.
 
-### 2. Knowledge-слой рядом с проектом
-Рядом с индексируемым проектом хранится `.codecollector/knowledge.yaml`.
-Локальный файл индекса рядом с проектом не используется: runtime graph/index хранится в Postgres.
-Он содержит:
-- описания модулей и symbol-ов;
-- связи с requirement-ами;
-- architecture layers;
-- human-readable knowledge для поиска и explainability.
+## Общая схема работы
 
-### 3. Graph / index backend — Postgres
-Структурные факты runtime хранятся в Postgres в собственных таблицах:
-- `cc_files`
-- `cc_symbols`
-- `cc_relations`
-- `cc_search_documents`
+Для одной операции `pipeline generate` используется такой порядок шагов:
 
-Postgres используется для:
-- incremental indexing по hash файлов;
-- адресных выборок по symbol-ам и relations;
-- хранения graph relations и search documents metadata.
+1. обновление индекса проекта;
+2. обновление search documents / vector index, если изменился код проекта;
+3. поиск кандидатов по change request;
+4. сбор context pack для выбранного target;
+5. подбор reference-артефактов;
+6. отдельный вызов `codegenerator generate`;
+7. применение сгенерированного кода в staging workspace;
+8. при ошибке применения — отдельный вызов `codegenerator repair` и повторное применение;
+9. если для target нет достаточного тестового покрытия — отдельный вызов `codegenerator generate-test`;
+10. применение сгенерированного теста;
+11. проверки проекта;
+12. формирование dry-run merge plan и итогового отчета.
 
-### 4. Semantic search backend — PGVector
-Векторный поиск используется только по **human-readable search documents**:
-- docstring из кода;
-- `knowledge.yaml` descriptions;
-- requirement texts.
+## Основные функциональные блоки
 
-Векторный поиск не заменяет graph retrieval, а помогает semantic retrieval по описаниям и требованиям.
+### 1. Индекс проекта
 
-### 5. Reference Library
-Reference Library — отдельный индексируемый источник reference-кода.
-Он не является частью изменяемого проекта и не участвует в primary target search.
-
-Reference Library используется только для generation context:
-- ищутся релевантные reference artifacts;
-- затем они materialize-ятся в `full_file` или `snippet`;
-- после этого попадают в generation context и run bundle.
-
-### 6. Полный dry-run pipeline
-Pipeline состоит из шагов:
-- build/update index;
-- primary target search;
-- manual target selection;
-- supporting context build;
-- external code generation step: либо replay по артефакту, либо реальный вызов `codegenerator`;
-- apply в staging workspace;
-- structural validation;
-- impact summary;
-- merge to master в режиме dry-run.
-
-## ADR
-
-### ADR-001. Graph / index хранится в Postgres
-Postgres используется для структурных фактов runtime:
-- files;
-- symbols;
-- relations;
-- search documents metadata.
-
-Причина:
-- нужны быстрые выборки по graph relations;
-- нужен incremental update по измененным файлам;
-- нужно единое persistent storage для graph и metadata.
-
-### ADR-002. `knowledge.yaml` хранит curated human-readable knowledge
-YAML используется для того, что должен читать и редактировать человек:
-- project;
-- modules;
-- symbols;
-- requirements;
-- architecture.
-
-Причина:
-- knowledge должен быть reviewable;
-- человеку неудобно редактировать смысловые описания через SQL-таблицы;
-- knowledge должен жить рядом с кодом как проектный артефакт.
-
-### ADR-003. Логическая модель — графовая
-Логическая модель системы — это узлы и связи:
-- узлы: file / module / class / function / method / test / requirement;
-- связи: `contains`, `calls`, `covered_by_test`, `belongs_to_layer`, `implements_requirement`, `exposed_by_controller`.
-
-Postgres здесь — физическое хранилище графа, а не предметной бизнес-БД.
-
-### ADR-004. Semantic retrieval работает только по human-readable текстам
-Vector search индексирует только:
+Индекс проекта хранит техническое представление кода:
+- модули;
+- классы;
+- функции и методы;
+- диапазоны строк;
 - docstring;
-- descriptions из knowledge;
-- тексты требований.
+- связи между символами;
+- search documents для semantic search.
 
-Raw code не индексируется embeddings-ами.
+Индекс хранится в Postgres. Он используется для:
+- поиска target-символов;
+- построения графа входящих и исходящих связей;
+- формирования context pack;
+- impact analysis после применения изменения.
 
-### ADR-005. Project-level validation выполняет текущий PoC
-Генератор изменений может вернуть optional test artifact, но project-level validation и execution тестов — ответственность текущего PoC.
+#### Когда индекс обновляется
 
-### ADR-006. Reference Library индексируется отдельно от project code
-Reference artifacts хранятся отдельно от master-кода проекта.
+Индекс проекта обновляется:
+- в начале `pipeline generate`;
+- после успешного применения изменения в staging workspace;
+- после применения сгенерированного теста в staging workspace.
 
-Причина:
-- target всегда ищется только в коде проекта;
-- reference artifacts нужны как supporting context для генерации;
-- генератор получает materialized content, а не ссылки на файлы.
+Если исходные файлы проекта не изменились, обновление search documents и vector index пропускается.
 
-## Почему одновременно Postgres и YAML
+### 2. `knowledge.yaml`
 
-Они выполняют разные роли.
+`knowledge.yaml` — это человекочитаемый слой описания проекта рядом с кодом.
 
-### Postgres
-Хранит машинные структурные факты runtime:
-- symbols;
-- graph relations;
-- hashes файлов;
-- search documents metadata;
-- адресные выборки для search/context/apply.
-
-### YAML
-Хранит human-readable knowledge:
-- title/description;
+Он содержит:
+- названия и описания важных символов;
 - keywords;
-- requirements;
-- architecture layers.
-
-### Итог
-- **Postgres** — runtime graph/index storage;
-- **YAML** — project knowledge.
-
-## Структура graph/index storage
-
-### `cc_files`
-Хранит:
-- `project_root`
-- `file_path`
-- `file_hash`
-- `module_name`
-
-Используется для incremental indexing.
-
-### `cc_symbols`
-Хранит:
-- `module`, `class`, `function`, `method`;
-- `qualname`, `kind`, `file_path`, `start_line`, `end_line`, `docstring`, `source_code`.
-
-Используется для:
-- shortlist;
-- context pack;
-- patch apply по конкретному symbol.
-
-### `cc_relations`
-Хранит graph relations:
-- `source_qualname`
-- `relation_kind`
-- `target_ref`
-- `target_qualname`
-- `relation_source`
-- `relation_confidence`
-
-`target_ref` — текстовая цель, если нет полного resolution.
-
-`target_qualname` — точная цель, если удалось разрешить.
-
-`relation_confidence` — надежность связи:
-- `high`
-- `medium`
-- `low`
-
-### `cc_search_documents`
-Хранит тексты и metadata для semantic retrieval:
-- `doc_id`
-- `qualname`
-- `file_path`
-- `source_kind`
-- `title`
-- `text`
-
-## Конфигурация
-
-Основные параметры в `config.yaml`:
-
-```yaml
-storage:
-  backend: postgres
-
-postgres:
-  graph_connection: postgresql://postgres:postgres@localhost:5432/vector_db
-  vector_connection: postgresql+psycopg://postgres:postgres@localhost:5432/vector_db
-  schema: public
-  collection_prefix: codecollector
+- связь символов с требованиями;
+- дополнительные понятные для поиска формулировки.
 
-embedding:
-  provider: ollama
-  timeout_sec: 420
-  ollama:
-    base_url: http://192.168.50.165:18081
-    model: nomic-embed-text-v2-moe
-    timeout_sec: 420
+Этот файл не перестраивается автоматически при каждом запуске. Он обновляется человеком или отдельным процессом подготовки проекта.
 
-search:
-  vector_enabled: true
-  vector_backend: pgvector
-  vector_weight: 4.0
-```
+Использование `knowledge.yaml`:
+- помогает semantic search лучше понимать назначение символов;
+- помогает выбирать target по change request;
+- помогает формировать человекочитаемое объяснение причин выбора symbol.
 
-## Запуск pgvector в Docker
+### 3. Semantic search и search documents
 
-Для сохранения данных между перезапусками используйте volume:
+Для поиска по change request `codecollector` использует search documents — короткие текстовые представления символов.
 
-```bash
-docker run --name pgvector \
-  -e POSTGRES_PASSWORD=postgres \
-  -e POSTGRES_USER=postgres \
-  -e POSTGRES_DB=vector_db \
-  -p 5432:5432 \
-  -v pgvector_data:/var/lib/postgresql/data \
-  -d pgvector/pgvector:pg17
-```
+Они включают:
+- имя символа;
+- docstring;
+- описание из `knowledge.yaml`;
+- связанные требования;
+- часть контекста по модулю.
 
-## Примеры команд
+Search documents сохраняются в Postgres и используются для semantic search через pgvector.
 
-### Построить индекс
+#### Когда обновляются search documents и vector index
 
-```bash
-python -m codecollector index build --project demo_projects/sample_python_app
-```
+Они обновляются только когда изменился код проекта и индексатор увидел новые или измененные файлы.
 
-### Найти primary target
+Если код проекта не изменился, `codecollector` пишет в лог, что sync пропущен.
 
-```bash
-python -m codecollector search \
-  --project demo_projects/sample_python_app \
-  --query "Изменить формирование текста уведомления о назначении тикета Сделать текст уведомления русскоязычным и использовать формулировку «теперь назначен на»."
-```
+### 4. Reference Library
 
-Ожидаемый результат: в top-1 должен появляться `support_app.services.notification_service.build_assignment_message`.
+Reference Library — это отдельный набор эталонных примеров и переиспользуемых компонентов.
 
-### Собрать context pack
+Она не является частью проекта пользователя и не синхронизируется на каждом запуске pipeline.
 
-```bash
-python -m codecollector context \
-  --project demo_projects/sample_python_app \
-  --qualname support_app.services.notification_service.build_assignment_message
-```
+В ней можно хранить:
+- шаблоны функций;
+- переиспользуемые компоненты;
+- reference implementation;
+- небольшие полезные сниппеты.
 
-### Прогнать полный dry-run pipeline
+Как она используется:
+1. по change request и target подбираются кандидаты;
+2. выбирается небольшой top-N набор;
+3. каждый артефакт материализуется как `full_file` или `snippet`;
+4. только выбранные артефакты попадают в generation request.
 
-```bash
-python -m codecollector pipeline replay \
-  --project demo_projects/sample_python_app \
-  --title "Изменить формирование текста уведомления о назначении тикета" \
-  --description "Сделать текст уведомления русскоязычным и использовать формулировку «теперь назначен на»." \
-  --constraint "Не менять внешний контракт API" \
-  --constraint "Изменить только текст уведомления" \
-  --selected-qualname support_app.services.notification_service.build_assignment_message \
-  --artifact-file demo_artifacts/build_assignment_message_v2.py \
-  --operation replace_symbol
-```
+Reference Library нужна как источник примеров и как дополнительный контекст для генератора.
 
-## Что дальше
+### 5. Staging workspace
 
-Зафиксированные следующие шаги:
-- optional LLM hooks для rewrite change request и rerank shortlist;
-- контракт генератора изменений: `change packet -> code artifact -> optional test artifact`;
-- запуск рекомендованных тестов и затем более широких project-level тестов в текущем PoC.
+Все применения артефактов выполняются не в исходном проекте, а в отдельном staging workspace.
 
+Это дает возможность:
+- безопасно применить код;
+- проверить синтаксис и тесты;
+- пересчитать индекс по измененным файлам;
+- получить diff и impact summary;
+- подготовить dry-run merge plan.
 
-## Когда обновляются граф, semantic search и knowledge
+## Как формируется контекст для LLM
 
-- `knowledge.yaml` не перестраивается: это исходный human-readable knowledge-слой, который перечитывается сервисами при build/search/context.
-- graph/index в Postgres обновляется при `index build` инкрементально по hash файлов и адресно после `apply` только для измененных файлов.
-- semantic search documents пересчитываются после `index build` из docstring и `knowledge.yaml`. Синхронизация в Postgres/PGVector выполняется только если тексты документов реально изменились.
+### Общий принцип
 
+`codecollector` старается собирать минимально достаточный контекст. Для локальных моделей важны не только абсолютный размер prompt, но и его сложность. Поэтому большие комбинированные запросы разделены на отдельные вызовы.
 
-## Когда обновляются graph, search documents, vector index и `knowledge.yaml`
+Контекст собирается из четырех источников:
+- выбранный target-символ;
+- краткая структура модуля;
+- связанные тесты;
+- выбранные reference-артефакты.
 
-- **Graph / index** обновляется при `index build` инкрементально по hash файлов и после `apply` адресно по измененным файлам в staging.
-- **Search documents** пересчитываются после `index build` из docstring, `knowledge.yaml` и requirement-текстов.
-- **Vector index** синхронизируется только если тексты search documents реально изменились.
-- **`knowledge.yaml`** не перестраивается автоматически: это curated source-of-truth для human-readable knowledge.
+### Контекст для `generate`
 
-### Что происходит при появлении нового symbol
+В `codegenerator generate` передаются:
+- `change_request`;
+- `target`;
+- `project_context.module_outline` — короткий список символов модуля;
+- `project_context.target_symbol` — исходный код target-символа;
+- `project_context.related_tests` — только связанные тесты, если они найдены;
+- `reference_context` — только выбранные reference-артефакты.
 
-- новый публичный или значимый symbol должен иметь docstring;
-- если symbol важен для поиска, requirements или повторного использования, должен формироваться **update/proposal** в `knowledge.yaml`;
-- итоговое решение о сохранении такой записи принимает человек при review.
+В обычном режиме полный файл не передается. Это видно по полю `full_file_included=false` в generation request.
 
-## Что означает `relation_confidence_summary`
+### Контекст для `repair`
 
-`relation_confidence_summary` — это краткая сводка надежности найденных связей в `context_pack`.
-Она показывает, сколько входящих и исходящих relations имеют confidence `high`, `medium` и `low`.
-Это помогает быстро понять, насколько context опирается на точно разрешенные связи, а насколько — на более эвристические.
+`repair` вызывается только когда уже есть артефакт, который нужно исправить:
+- при ошибке применения;
+- при repairable ошибке проверки.
 
-## Модель embeddings
+В `repair` передаются:
+- исходный `change_request`;
+- `previous_artifact`;
+- краткое описание ошибки;
+- тот же target-контекст;
+- reference-контекст в сокращенном виде.
 
-Для semantic search используется embedding-модель `nomic-embed-text-v2-moe` через локальный Ollama endpoint.
-Она выбрана как multilingual-модель для поиска по русскоязычным требованиям и human-readable описаниям.
+`repair` не должен генерировать решение с нуля. Его задача — исправить уже предложенный артефакт, сохранив смысл изменения.
 
+### Контекст для `generate-test`
 
-## Build report
+Генерация теста вынесена в отдельный вызов, чтобы не перегружать основной запрос генерации кода.
 
-`build_report` показывает не только количество переиндексированных файлов, но и время по основным фазам:
-- `graph_indexing_ms` — построение/обновление graph/index по Python-файлам;
-- `search_documents_sync_ms` — запись human-readable search documents в Postgres;
-- `vector_index_sync_ms` — синхронизация embedding/vector index;
-- `search_documents_count` — количество search documents;
-- `search_documents_changed` — изменились ли search documents по сравнению с уже сохраненными.
+В `generate-test` передаются:
+- `change_request`;
+- `target`;
+- target-символ;
+- module outline;
+- текущий reference-контекст;
+- признак отсутствия связанных тестов.
 
-## Reference Library MVP
+Результат — отдельный `test_artifact`, который затем применяется в staging workspace.
 
-### Reference Library lifecycle
-Reference Library is a separate curated artifact and is not updated as part of normal project work.
-During regular `pipeline replay` and `index build`, the system only ensures that reference artifacts are available in the stores. If reference documents are already indexed, resync is skipped.
-A full resync of Reference Library should be done only after explicit changes in `reference_library/`.
+### Где считается размер контекста
 
+Перед каждым внешним вызовом `codecollector` пишет в лог и в request-пayload метрики:
+- `request_chars`;
+- `target_source_chars`;
+- `related_test_chars`;
+- `reference_chars`;
+- `request_chars_limit`.
 
-Структура MVP:
+Это позволяет видеть реальный размер передаваемого контекста и подбирать лимиты для локальной модели.
 
-```text
-reference_library/
-  library.yaml
-  python/
-    templates/
-    reusable/
-```
+### Как контекст уменьшается
 
-### Типы reference artifacts
-- `template` — пример/образец для адаптации;
-- `reusable_component` — почти готовый код для прямого переиспользования.
+Если контекст становится слишком большим, `codecollector` уменьшает его за счет:
+- отказа от передачи полного файла;
+- ограничения числа reference-артефактов;
+- передачи snippet вместо full file;
+- передачи только связанных тестов;
+- усечения длинных reference-артефактов.
 
-### Retrieval stage
-Reference-кандидаты ищутся:
-- по change request;
-- по выбранному target;
-- по knowledge descriptions.
+## Проверки после применения
 
-### Materialization stage
-Перед передачей в generation context reference artifacts materialize-ятся в:
-- `full_file`, если файл небольшой;
-- `snippet`, если файл больше лимита.
+После применения артефакта `codecollector` запускает проверки проекта.
 
-### Что попадает в generation context
-Для каждого reference artifact передается:
-- title;
-- artifact type;
-- usage mode;
-- why selected;
-- content mode;
-- actual content.
+Сейчас используются:
+- `ast_parse` — проверка синтаксической корректности Python-файлов;
+- `py_compile` — запуск `python -m compileall .`;
+- `pytest_recommended` — запуск рекомендованных тестов, если они есть.
 
-Генератору не нужен прямой доступ к Reference Library.
+Если был сгенерирован новый тест, он попадает в список рекомендуемых тестов и прогоняется в verification.
 
-## Build report timing fields
-- `graph_indexing_ms` — project graph/index update time.
-- `search_documents_sync_ms` — sync time for project search documents.
-- `vector_index_sync_ms` — sync time for project vector index.
-- `reference_sync_ms` — sync time for Reference Library documents when explicit sync happens.
-- `reference_vector_sync_ms` — vector sync time for Reference Library when explicit sync happens.
+## Итоговый отчет `pipeline_run_*.json`
 
+Итоговый отчет сохраняется в `.runs/pipeline-.../pipeline_run_....json`.
 
-### ADR-007. Внешний генератор вызывается через CLI и файловый request/result contract
-На текущем этапе `codecollector` вызывает `codegenerator` как отдельный процесс (`python -m codegenerator ...`) и передает request/result через JSON/YAML-файлы в run bundle.
+Основные разделы:
+- `change_request` — исходный запрос;
+- `build_report` — данные об обновлении индекса и semantic search;
+- `steps` — все шаги pipeline с длительностью и статусом;
+- `search_candidates` — shortlist найденных символов;
+- `context_pack` — собранный контекст по target;
+- `external_code_generation` — внешний вызов генерации кода;
+- `external_test_generation` — внешний вызов генерации теста;
+- `repair_generation` — внешний вызов repair, если был;
+- `generated_test_apply` — примененные сгенерированные тесты;
+- `apply_result` — diff, validation и impact summary;
+- `verification_report` — результаты проверок;
+- `merge_plan` — dry-run итог по merge.
 
-Причина:
-- проще отлаживать содержимое generation packet;
-- не нужен отдельный HTTP lifecycle;
-- trace и run artifacts остаются прозрачными и повторяемыми.
+## Структура проекта
 
-## Интеграция с codegenerator
-Команда `pipeline generate` собирает `generation request`, вызывает внешний `codegenerator`, сохраняет request/result в `.runs/`, затем применяет возвращенный `code_artifact` в staging workspace.
+Ниже перечислены основные части `codecollector`.
 
+### `codecollector/indexing/`
+Работа с индексом проекта, search documents и хранилищем Postgres.
 
-## Verification and repair
+### `codecollector/search/`
+Поиск target-символов по change request.
 
-After `external_generate` and `apply_staging`, `codecollector` runs post-apply verification. The current checks are AST parsing, `compileall`, optional `ruff`, recommended pytest targets, and optional full-project pytest. When verification fails and repair is enabled, `codecollector` builds a compact verification summary and calls `codegenerator repair`, then applies the repaired artifact into a fresh staging workspace and reruns verification.
+### `codecollector/context/`
+Сбор context pack для выбранного target.
 
-## Context budgeting
+### `codecollector/reference_library/`
+Подбор и материализация reference-артефактов.
 
-Before invoking `codegenerator`, `codecollector` measures and reduces the outgoing generation packet. For small symbol-level edits it prefers the target symbol source and omits `full_file_source`. It also limits related tests and reference artifacts. Final packet size metrics are stored in `context_metrics` inside the run bundle.
+### `codecollector/external_codegen/`
+Подготовка request-файлов и вызов внешнего `codegenerator`.
 
+### `codecollector/patching/`
+Применение code artifact и generated test artifact в staging workspace.
 
-## Проверки после apply
+### `codecollector/validation/`
+Синтаксические и тестовые проверки после применения.
 
-После применения generated artifact pipeline выполняет: `ast_parse`, `py_compile`, optional `ruff`, `pytest_recommended` и optional full-project pytest. Если apply падает до verification, это считается `apply_failed` и может запускать repair. После repair pipeline повторяет apply и затем повторно запускает проверки. Если repaired artifact не дает итогового diff, результат помечается как потеря intent изменения.
+### `codecollector/workspace/`
+Создание staging workspace и расчет diff.
+
+### `codecollector/orchestration/`
+Главный pipeline и формирование итогового run bundle.
+
+## ADR текущей реализации
+
+### ADR-1. Генерация кода и генерация тестов разделены
+
+Для локальных моделей отдельные короткие вызовы работают устойчивее, чем один большой комбинированный prompt. Поэтому code generation и test generation выполняются разными командами.
+
+### ADR-2. Применение всегда идет через staging workspace
+
+Изменения и тесты сначала применяются в копии проекта. Это позволяет безопасно проверить результат и получить diff до ручного merge.
+
+### ADR-3. Технический индекс и `knowledge.yaml` разделены
+
+Технические данные о коде хранятся в Postgres, а человекочитаемое описание проекта — в `knowledge.yaml` рядом с кодом проекта.
+
+### ADR-4. Reference Library является отдельным артефактом
+
+Reference Library не пересобирается вместе с индексом проекта на каждом запуске. В generation request попадает только небольшой выбранный набор reference-артефактов.
+
+## Возможные следующие шаги
+
+1. Более точный расчет `impact.symbols_in_changed_files` по диапазонам diff.
+2. Более умный выбор, когда нужен `generate-test`, а когда достаточно существующих тестов.
+3. Поддержка нескольких языков и нескольких профилей индексации.
+4. Отдельный сценарий первичной подготовки нового проекта: создание индекса, начальное наполнение `knowledge.yaml`, подготовка search documents.
+5. Более гибкие правила budget control для разных моделей.
+6. Улучшение качества semantic search и ranking причин выбора target.

@@ -60,7 +60,14 @@ class ApplyService:
             reindexed = reindex_report.indexed_files > 0
 
         diff = self.diff_service.summarize_file_change(before_path, target_path)
-        impact = self._build_impact_summary(project_key, store, overlays, artifact.target_qualname, symbol.file_path, validation.is_valid)
+        impact = self._build_impact_summary(
+            project_key,
+            store,
+            overlays,
+            artifact.target_qualname,
+            changed_files=[str(path.relative_to(workspace)) for path in changed_files],
+            validation_ok=validation.is_valid,
+        )
         return ApplyResult(workspace, artifact, diff, validation, reindexed, impact)
 
     def _apply_operation_to_file(self, target_path: Path, symbol: SymbolRecord, artifact: PatchArtifact) -> None:
@@ -109,10 +116,10 @@ class ApplyService:
         store: IndexStore,
         overlays: OverlayService,
         target_qualname: str,
-        changed_file_path: str,
+        changed_files: list[str],
         validation_ok: bool,
     ) -> ImpactSummary:
-        symbols = store.list_symbols_in_file(project_key, changed_file_path)
+        changed_file_path = changed_files[0] if changed_files else ''
         direct_inbound = [
             relation for relation in store.list_inbound_relations_for_qualname(project_key, target_qualname)
             if relation.relation_kind in {'calls', 'exposed_by_controller', 'covered_by_test'}
@@ -160,10 +167,24 @@ class ApplyService:
         if not inbound_callers:
             notes.append('Во входящем графе вызовов не найдено вызывающих символов.')
 
+        symbols_in_changed_files: list[str] = []
+        seen_symbols: set[str] = set()
+        if target_qualname:
+            symbols_in_changed_files.append(target_qualname)
+            seen_symbols.add(target_qualname)
+        for file_path in changed_files:
+            if file_path == changed_file_path:
+                continue
+            for changed_symbol in store.list_symbols_in_file(project_key, file_path):
+                if changed_symbol.kind == 'module' or changed_symbol.qualname in seen_symbols:
+                    continue
+                seen_symbols.add(changed_symbol.qualname)
+                symbols_in_changed_files.append(changed_symbol.qualname)
+
         return ImpactSummary(
             target_qualname=target_qualname,
-            changed_files=[changed_file_path],
-            symbols_in_changed_files=[symbol.qualname for symbol in symbols if symbol.kind != 'module'],
+            changed_files=changed_files,
+            symbols_in_changed_files=symbols_in_changed_files,
             inbound_callers=inbound_callers,
             related_tests=related_tests,
             linked_requirements=linked_requirements,

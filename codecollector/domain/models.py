@@ -222,7 +222,8 @@ class PipelineRunResult:
     merge_plan: MergePlan
     steps: list[PipelineStepRecord]
     generation_replay: GenerationReplay | None = None
-    external_generation: ExternalGenerationCall | None = None
+    external_code_generation: ExternalGenerationCall | None = None
+    external_test_generation: ExternalGenerationCall | None = None
     generated_test_apply: dict[str, Any] | None = None
     verification_report: dict[str, Any] | None = None
     repair_generation: ExternalGenerationCall | None = None

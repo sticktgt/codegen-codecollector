@@ -58,7 +58,7 @@ codegenerator:
   max_related_test_chars: 900
   max_reference_chars: 900
   max_request_chars: 5200
-  test_generation_mode: if_missing
+  test_generation_mode: always
   repair_enabled: true
   max_repair_attempts: 1
 

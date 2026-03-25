@@ -51,6 +51,16 @@ symbols:
       - summary агента
     requirements:
       - REQ-DEMO-002
+
+  support_app.services.report_service.build_priority_label:
+    title: Русскоязычная метка приоритета
+    description: Преобразует системное значение приоритета тикета в человекочитаемую русскоязычную метку для UI и отчетов.
+    keywords:
+      - приоритет тикета
+      - русская метка приоритета
+      - label priority
+    requirements:
+      - REQ-DEMO-003
   support_app.services.notification_service.build_assignment_message:
     title: Текст уведомления о назначении
     description: Формирует короткий текст уведомления после назначения тикета агенту.
@@ -77,6 +87,12 @@ requirements:
       - support_app.services.ticket_service.TicketService.assign_ticket
       - support_app.services.notification_service.build_assignment_message
       - support_app.api.controllers.TicketController.assign_ticket_endpoint
+
+  REQ-DEMO-003:
+    title: Человекочитаемая метка приоритета
+    description: Система должна уметь показывать русскоязычную метку приоритета тикета для UI и отчетных представлений.
+    linked_symbols:
+      - support_app.services.report_service.build_priority_label
   REQ-DEMO-002:
     title: Получение краткой сводки по агенту
     description: Пользователь должен иметь возможность получить краткую сводку по открытым тикетам выбранного агента.

@@ -61,9 +61,11 @@ def build_generation_request(project_root: Path, change_request: ChangeRequest, 
             'truncated': truncated,
         })
         related_test_chars += len(src)
+    selected_reference_items = list(context_pack.reference_artifacts[:1])
+    context_pack.reference_artifacts = selected_reference_items
     reference_artifacts = []
     reference_chars = 0
-    for item in context_pack.reference_artifacts[:1]:
+    for item in selected_reference_items:
         content, truncated = _truncate_text(item.content, config.codegenerator_max_reference_chars)
         reference_artifacts.append({
             'artifact_id': item.artifact_id,
@@ -106,6 +108,7 @@ def build_generation_request(project_root: Path, change_request: ChangeRequest, 
         'content_modes': [item.get('content_mode', '') for item in reference_artifacts],
     }
     context_pack.reference_summary = dict(reference_summary)
+    context_pack.reference_artifacts = list(selected_reference_items[:len(reference_artifacts)])
     reference_context = {
         'reference_summary': reference_summary,
         'reference_artifacts': reference_artifacts,
@@ -215,6 +218,56 @@ def invoke_generate(run_dir: Path, config: AppConfig, request_payload: dict[str,
     )
 
 
+
+
+
+def invoke_generate_test(run_dir: Path, config: AppConfig, request_payload: dict[str, Any]) -> CodeGeneratorCallResult:
+    codegen_root = Path(config.codegenerator_root_dir).resolve()
+    request_format = config.codegenerator_request_format.lower()
+    if request_format not in {'json', 'yaml'}:
+        raise ValueError(f'Unsupported codegenerator request format: {request_format}')
+    request_path = run_dir / f'generation_test_request.{request_format}'
+    result_path = run_dir / 'generation_test_result.json'
+    stdout_path = run_dir / 'codegenerator_test_stdout.txt'
+    stderr_path = run_dir / 'codegenerator_test_stderr.txt'
+    _write_payload(request_path, request_payload, request_format)
+    command = [
+        config.codegenerator_python,
+        '-m',
+        'codegenerator',
+        'generate-test',
+        '--request-file',
+        str(request_path),
+        '--config',
+        str((codegen_root / config.codegenerator_config_path).resolve()),
+    ]
+    LOGGER.info('Invoking codegenerator test generation: %s', ' '.join(command))
+    completed = subprocess.run(command, cwd=str(codegen_root), capture_output=True, text=True)
+    stdout = completed.stdout or ''
+    stderr = completed.stderr or ''
+    stdout_path.write_text(stdout, encoding='utf-8')
+    stderr_path.write_text(stderr, encoding='utf-8')
+    if stderr.strip():
+        LOGGER.info('codegenerator test stderr saved to %s', stderr_path)
+    if completed.returncode != 0:
+        raise RuntimeError(f'codegenerator generate-test failed with exit code {completed.returncode}. stdout={stdout_path} stderr={stderr_path}')
+    if not stdout.strip():
+        raise RuntimeError(f'codegenerator generate-test returned empty stdout. stderr={stderr_path}')
+    try:
+        result_payload = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f'codegenerator generate-test returned invalid JSON on stdout: {exc}. stdout={stdout_path} stderr={stderr_path}') from exc
+    result_path.write_text(json.dumps(result_payload, ensure_ascii=False, indent=2), encoding='utf-8')
+    return CodeGeneratorCallResult(
+        request_path=str(request_path),
+        result_path=str(result_path),
+        command=command,
+        request_payload=request_payload,
+        result_payload=result_payload,
+        trace_path=result_payload.get('trace_path'),
+        stdout_path=str(stdout_path),
+        stderr_path=str(stderr_path),
+    )
 
 def build_repair_request(change_request: ChangeRequest, target_qualname: str, previous_result_payload: dict[str, Any], context_pack: ContextPack, verification_summary: dict[str, Any]) -> dict[str, Any]:
     target = context_pack.target
