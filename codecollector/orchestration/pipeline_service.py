@@ -136,166 +136,242 @@ class PipelineService:
     ) -> PipelineRunResult:
         run_id, run_label, run_dir = self.artifacts_manager.create_run_dir('pipeline')
         steps: list[PipelineStepRecord] = []
+        warnings: list[str] = []
 
-        build_report = self._run_step(
-            steps,
-            'index_build',
-            f'Обновить индекс проекта {self.project_services.project_root.name}',
-            lambda: asdict(self.project_services.build_index(full_rebuild=False)),
-        )
+        build_report: dict[str, Any] | None = None
+        candidates: list[SearchCandidate] = []
+        context_pack: ContextPack | None = None
+        external_code_generation: ExternalGenerationCall | None = None
+        external_test_generation: ExternalGenerationCall | None = None
+        generated_test_apply: dict[str, Any] | None = None
+        verification_report: dict[str, Any] | None = None
+        repair_generation: ExternalGenerationCall | None = None
+        apply_result: ApplyResult | None = None
+        merge_plan: MergePlan | None = None
+        result: PipelineRunResult | None = None
 
-        search_text = change_request.search_text()
-        candidates_dicts = self._run_step(
-            steps,
-            'search_primary_target',
-            f'Найти shortlist по change request: {change_request.title}',
-            lambda: [asdict(item) for item in self.project_services.search(search_text, limit=limit, use_vector_search=use_vector_search)],
-        )
-        candidates = [SearchCandidate(**item) for item in candidates_dicts]
-        if not any(item.qualname == selected_target for item in candidates):
-            raise ValueError(f'Selected qualname {selected_target} is not present in shortlist')
-
-        context_pack = self._run_step(
-            steps,
-            'context_supporting_code',
-            f'Собрать context pack для {selected_target}',
-            lambda: self.project_services.context(selected_target),
-        )
-
-        reference_artifacts = self._run_step(
-            steps,
-            'reference_retrieval',
-            'Подобрать reference artifacts для генерации',
-            lambda: self.project_services.retrieve_reference_artifacts(change_request, selected_target),
-        )
-        context_pack.reference_artifacts = reference_artifacts
-        context_pack.reference_summary = {
-            'count': len(reference_artifacts),
-            'titles': [item.title for item in reference_artifacts],
-            'content_modes': [item.content_mode for item in reference_artifacts],
-        }
-
-        external_code_generation = self._run_step(
-            steps,
-            'external_generate',
-            'Вызвать внешний codegenerator и получить code artifact',
-            lambda: self._external_generate(run_dir, change_request, selected_target, context_pack),
-        )
-        if not self._has_code_artifact(external_code_generation.result_payload):
-            raise RuntimeError(external_code_generation.result_payload.get('message') or 'codegenerator generate did not return code_artifact')
-
-        final_payload = external_code_generation.result_payload
-        generated_tests: list[dict[str, str]] = []
-        external_test_generation = None
-        generated_test_apply = None
-        repair_generation = None
         try:
-            apply_result = self._run_step(
+            build_report = self._run_step(
                 steps,
-                'apply_staging',
-                'Применить сгенерированный артефакт в staging workspace',
-                lambda: self.project_services.apply(patch_artifact_from_result(final_payload, selected_target), generated_tests=[]),
-            )
-        except Exception as exc:
-            apply_failure_report = self._build_apply_failure_report(exc)
-            if not self.project_services.config.codegenerator_repair_enabled or not apply_failure_report['failure_summary'].get('repairable', False):
-                raise
-            repair_generation = self._run_step(
-                steps,
-                'external_repair',
-                'Вызвать внешний codegenerator repair после ошибки apply',
-                lambda: self._external_repair(run_dir, change_request, selected_target, context_pack, external_code_generation.result_payload, apply_failure_report),
-            )
-            if not self._has_code_artifact(repair_generation.result_payload):
-                raise RuntimeError(repair_generation.result_payload.get('message') or 'codegenerator repair did not return code_artifact')
-            final_payload = repair_generation.result_payload
-            apply_result = self._run_step(
-                steps,
-                'apply_repair_staging',
-                'Применить исправленный артефакт в staging workspace',
-                lambda: self.project_services.apply(patch_artifact_from_result(final_payload, selected_target), generated_tests=[]),
+                'index_build',
+                f'Обновить индекс проекта {self.project_services.project_root.name}',
+                lambda: asdict(self.project_services.build_index(full_rebuild=False)),
             )
 
-        if self._should_request_generated_test(context_pack):
-            external_test_generation = self._run_step(
+            search_text = change_request.search_text()
+            candidates_dicts = self._run_step(
                 steps,
-                'external_generate_test',
-                'Вызвать внешний codegenerator для генерации теста',
-                lambda: self._external_generate_test(run_dir, change_request, selected_target, context_pack),
+                'search_primary_target',
+                f'Найти shortlist по change request: {change_request.title}',
+                lambda: [asdict(item) for item in self.project_services.search(search_text, limit=limit, use_vector_search=use_vector_search)],
             )
-            generated_tests = self._extract_generated_tests(external_test_generation.result_payload)
-            if generated_tests:
-                generated_test_apply = {'applied_tests': [item['file_path'] for item in generated_tests], 'count': len(generated_tests)}
+            candidates = [SearchCandidate(**item) for item in candidates_dicts]
+            if not any(item.qualname == selected_target for item in candidates):
+                raise ValueError(f'Selected qualname {selected_target} is not present in shortlist')
+
+            context_pack = self._run_step(
+                steps,
+                'context_supporting_code',
+                f'Собрать context pack для {selected_target}',
+                lambda: self.project_services.context(selected_target),
+            )
+
+            reference_artifacts = self._run_step(
+                steps,
+                'reference_retrieval',
+                'Подобрать reference artifacts для генерации',
+                lambda: self.project_services.retrieve_reference_artifacts(change_request, selected_target),
+            )
+            context_pack.reference_artifacts = reference_artifacts
+            context_pack.reference_summary = {
+                'count': len(reference_artifacts),
+                'titles': [item.title for item in reference_artifacts],
+                'content_modes': [item.content_mode for item in reference_artifacts],
+            }
+
+            external_code_generation = self._run_step(
+                steps,
+                'external_generate',
+                'Вызвать внешний codegenerator и получить code artifact',
+                lambda: self._external_generate(run_dir, change_request, selected_target, context_pack),
+            )
+            if not self._has_code_artifact(external_code_generation.result_payload):
+                raise RuntimeError(external_code_generation.result_payload.get('message') or 'codegenerator generate did not return code_artifact')
+
+            final_payload = external_code_generation.result_payload
+            generated_tests: list[dict[str, str]] = []
+
+            try:
                 apply_result = self._run_step(
                     steps,
-                    'apply_with_generated_tests',
-                    'Повторно применить артефакт вместе с сгенерированными тестами в staging workspace',
-                    lambda: self.project_services.apply(patch_artifact_from_result(final_payload, selected_target), generated_tests=generated_tests),
+                    'apply_staging',
+                    'Применить сгенерированный артефакт в staging workspace',
+                    lambda: self.project_services.apply(
+                        patch_artifact_from_result(final_payload, selected_target),
+                        generated_tests=[],
+                    ),
+                )
+            except Exception as exc:
+                apply_failure_report = self._build_apply_failure_report(exc)
+                if not self.project_services.config.codegenerator_repair_enabled or not apply_failure_report['failure_summary'].get('repairable', False):
+                    raise
+                repair_generation = self._run_step(
+                    steps,
+                    'external_repair',
+                    'Вызвать внешний codegenerator repair после ошибки apply',
+                    lambda: self._external_repair(
+                        run_dir,
+                        change_request,
+                        selected_target,
+                        context_pack,
+                        external_code_generation.result_payload,
+                        apply_failure_report,
+                    ),
+                )
+                if not self._has_code_artifact(repair_generation.result_payload):
+                    raise RuntimeError(repair_generation.result_payload.get('message') or 'codegenerator repair did not return code_artifact')
+                final_payload = repair_generation.result_payload
+                apply_result = self._run_step(
+                    steps,
+                    'apply_repair_staging',
+                    'Применить исправленный артефакт в staging workspace',
+                    lambda: self.project_services.apply(
+                        patch_artifact_from_result(final_payload, selected_target),
+                        generated_tests=[],
+                    ),
                 )
 
-        verification_step_name = 'verification_after_repair' if repair_generation is not None else 'verification'
-        verification_step_summary = 'Повторно запустить проверки проекта после repair' if repair_generation is not None else 'Запустить проверки проекта после apply'
-        verification_report = self._run_step(
-            steps,
-            verification_step_name,
-            verification_step_summary,
-            lambda: self._run_verification(apply_result),
-        )
-        if repair_generation is not None:
-            verification_report = self._mark_noop_repair_if_needed(verification_report, apply_result, repair_generation)
+            if self._should_request_generated_test(context_pack):
+                external_test_generation = self._run_step(
+                    steps,
+                    'external_generate_test',
+                    'Вызвать внешний codegenerator для генерации теста',
+                    lambda: self._external_generate_test(
+                        run_dir,
+                        change_request,
+                        selected_target,
+                        context_pack,
+                        final_payload,
+                    ),
+                )
+                generated_tests = self._extract_generated_tests(external_test_generation.result_payload)
+                if generated_tests:
+                    generated_test_apply = {
+                        'applied_tests': [item['file_path'] for item in generated_tests],
+                        'count': len(generated_tests),
+                    }
+                    apply_result = self._run_step(
+                        steps,
+                        'apply_with_generated_tests',
+                        'Повторно применить артефакт вместе с сгенерированными тестами в staging workspace',
+                        lambda: self.project_services.apply(
+                            patch_artifact_from_result(final_payload, selected_target),
+                            generated_tests=generated_tests,
+                        ),
+                    )
+            else:
+                warning_message = 'Генерация теста пропущена: для target уже есть related_tests или recommended_tests.'
+                warnings.append(warning_message)
+                LOGGER.info(warning_message)
 
-        if (not verification_report.get('passed', False)) and self.project_services.config.codegenerator_repair_enabled and repair_generation is None:
-            repair_generation = self._run_step(
-                steps,
-                'external_repair',
-                'Вызвать внешний codegenerator repair после неуспешной проверки',
-                lambda: self._external_repair(run_dir, change_request, selected_target, context_pack, final_payload, verification_report),
-            )
-            if not self._has_code_artifact(repair_generation.result_payload):
-                raise RuntimeError(repair_generation.result_payload.get('message') or 'codegenerator repair did not return code_artifact')
-            final_payload = repair_generation.result_payload
-            apply_result = self._run_step(
-                steps,
-                'apply_repair_staging',
-                'Применить исправленный артефакт в staging workspace',
-                lambda: self.project_services.apply(patch_artifact_from_result(final_payload, selected_target), generated_tests=generated_tests),
-            )
+            verification_step_name = 'verification_after_repair' if repair_generation is not None else 'verification'
+            verification_step_summary = 'Повторно запустить проверки проекта после repair' if repair_generation is not None else 'Запустить проверки проекта после apply'
             verification_report = self._run_step(
                 steps,
-                'verification_after_repair',
-                'Повторно запустить проверки проекта после repair',
+                verification_step_name,
+                verification_step_summary,
                 lambda: self._run_verification(apply_result),
             )
-            verification_report = self._mark_noop_repair_if_needed(verification_report, apply_result, repair_generation)
+            if repair_generation is not None:
+                verification_report = self._mark_noop_repair_if_needed(verification_report, apply_result, repair_generation)
 
-        merge_plan = self._run_step(
-            steps,
-            'merge_dry_run',
-            'Подготовить dry-run план merge в master',
-            lambda: self._prepare_merge_plan(apply_result, verification_report),
-        )
+            if (not verification_report.get('passed', False)) and self.project_services.config.codegenerator_repair_enabled and repair_generation is None:
+                if self._generated_test_failure_only(verification_report):
+                    warning_message = 'Repair пропущен: упал только сгенерированный тест, основной код не отправляется в repair.'
+                    warnings.append(warning_message)
+                    LOGGER.warning(warning_message)
+                else:
+                    repair_generation = self._run_step(
+                        steps,
+                        'external_repair',
+                        'Вызвать внешний codegenerator repair после неуспешной проверки',
+                        lambda: self._external_repair(run_dir, change_request, selected_target, context_pack, final_payload, verification_report),
+                    )
+                    if not self._has_code_artifact(repair_generation.result_payload):
+                        raise RuntimeError(repair_generation.result_payload.get('message') or 'codegenerator repair did not return code_artifact')
+                    final_payload = repair_generation.result_payload
+                    apply_result = self._run_step(
+                        steps,
+                        'apply_repair_staging',
+                        'Применить исправленный артефакт в staging workspace',
+                        lambda: self.project_services.apply(
+                            patch_artifact_from_result(final_payload, selected_target),
+                            generated_tests=generated_tests,
+                        ),
+                    )
+                    verification_report = self._run_step(
+                        steps,
+                        'verification_after_repair',
+                        'Повторно запустить проверки проекта после repair',
+                        lambda: self._run_verification(apply_result),
+                    )
+                    verification_report = self._mark_noop_repair_if_needed(verification_report, apply_result, repair_generation)
 
-        result = PipelineRunResult(
-            run_id=run_id,
-            run_label=run_label,
-            run_dir=run_dir,
-            change_request=change_request,
-            selected_target=selected_target,
-            build_report=build_report,
-            search_candidates=candidates,
-            context_pack=context_pack,
-            generation_replay=None,
-            external_code_generation=external_code_generation,
-            external_test_generation=external_test_generation,
-            generated_test_apply=generated_test_apply,
-            verification_report=verification_report,
-            repair_generation=repair_generation,
-            apply_result=apply_result,
-            merge_plan=merge_plan,
-            steps=steps,
-        )
-        self.artifacts_manager.write_bundle(run_dir, f'pipeline_run_{run_label}.json', result)
-        return result
+            merge_plan = self._run_step(
+                steps,
+                'merge_dry_run',
+                'Подготовить dry-run план merge в master',
+                lambda: self._prepare_merge_plan(apply_result, verification_report),
+            )
+
+            result = self._build_partial_run_result(
+                run_id=run_id,
+                run_label=run_label,
+                run_dir=run_dir,
+                change_request=change_request,
+                selected_target=selected_target,
+                build_report=build_report,
+                candidates=candidates,
+                context_pack=context_pack,
+                generation_replay=None,
+                external_code_generation=external_code_generation,
+                external_test_generation=external_test_generation,
+                generated_test_apply=generated_test_apply,
+                verification_report=verification_report,
+                repair_generation=repair_generation,
+                apply_result=apply_result,
+                merge_plan=merge_plan,
+                steps=steps,
+                warnings=warnings,
+            )
+            return result
+
+        finally:
+            if result is None:
+                result = self._build_partial_run_result(
+                    run_id=run_id,
+                    run_label=run_label,
+                    run_dir=run_dir,
+                    change_request=change_request,
+                    selected_target=selected_target,
+                    build_report=build_report,
+                    candidates=candidates,
+                    context_pack=context_pack,
+                    generation_replay=None,
+                    external_code_generation=external_code_generation,
+                    external_test_generation=external_test_generation,
+                    generated_test_apply=generated_test_apply,
+                    verification_report=verification_report,
+                    repair_generation=repair_generation,
+                    apply_result=apply_result,
+                    merge_plan=merge_plan,
+                    steps=steps,
+                    warnings=warnings,
+                )
+            try:
+                self.artifacts_manager.write_bundle(run_dir, f'pipeline_run_{run_label}.json', result)
+            except Exception:
+                LOGGER.exception('Failed to write pipeline run bundle in finally: %s', run_dir)
 
     def _has_code_artifact(self, result_payload: dict[str, Any]) -> bool:
         code_artifact = result_payload.get('code_artifact') or {}
@@ -305,12 +381,100 @@ class PipelineService:
         mode = str(self.project_services.config.codegenerator_test_generation_mode).lower()
         if mode == 'never':
             return False
+        if self._has_existing_tests_for_target(context_pack):
+            return False
         if mode == 'always':
             return True
-        return not bool(context_pack.related_tests)
+        return True
+    
+    def _has_existing_tests_for_target(self, context_pack: ContextPack) -> bool:
+        return bool(context_pack.related_tests or context_pack.recommended_tests)
 
-    def _external_generate_test(self, run_dir: Path, change_request: ChangeRequest, selected_target: str, context_pack: ContextPack) -> ExternalGenerationCall:
-        request_payload = build_generation_request(self.project_services.project_root, change_request, selected_target, context_pack, self.project_services.config)
+    def _generated_test_failure_only(self, verification_report: dict[str, Any] | None) -> bool:
+        if not verification_report or verification_report.get('passed', False):
+            return False
+
+        results = verification_report.get('results', {}) or {}
+        failed_results = {
+            name: payload for name, payload in results.items()
+            if not bool((payload or {}).get('ok', False))
+        }
+        if not failed_results:
+            return False
+
+        generated_test_failure = False
+        non_generated_test_failure = False
+
+        for check_name, payload in failed_results.items():
+            payload = payload or {}
+            command = payload.get('command') or []
+            command_text = " ".join(str(item) for item in command)
+
+            if check_name.startswith('pytest') and 'test_generated_' in command_text:
+                generated_test_failure = True
+            else:
+                non_generated_test_failure = True
+
+        return generated_test_failure and not non_generated_test_failure
+
+    def _build_partial_run_result(
+        self,
+        run_id: str,
+        run_label: str,
+        run_dir: Path,
+        change_request: ChangeRequest,
+        selected_target: str,
+        steps: list[PipelineStepRecord],
+        build_report: dict[str, Any] | None = None,
+        candidates: list[SearchCandidate] | None = None,
+        context_pack: ContextPack | None = None,
+        generation_replay: GenerationReplay | None = None,
+        external_code_generation: ExternalGenerationCall | None = None,
+        external_test_generation: ExternalGenerationCall | None = None,
+        generated_test_apply: dict[str, Any] | None = None,
+        verification_report: dict[str, Any] | None = None,
+        repair_generation: ExternalGenerationCall | None = None,
+        apply_result: ApplyResult | None = None,
+        merge_plan: MergePlan | None = None,
+        warnings: list[str] | None = None,
+    ) -> PipelineRunResult:
+        return PipelineRunResult(
+            run_id=run_id,
+            run_label=run_label,
+            run_dir=run_dir,
+            change_request=change_request,
+            selected_target=selected_target,
+            build_report=build_report,
+            search_candidates=candidates or [],
+            context_pack=context_pack,
+            generation_replay=generation_replay,
+            external_code_generation=external_code_generation,
+            external_test_generation=external_test_generation,
+            generated_test_apply=generated_test_apply,
+            verification_report=verification_report,
+            repair_generation=repair_generation,
+            apply_result=apply_result,
+            merge_plan=merge_plan,
+            steps=steps,
+            warnings=warnings or [],
+        )    
+
+    def _external_generate_test(
+        self,
+        run_dir: Path,
+        change_request: ChangeRequest,
+        selected_target: str,
+        context_pack: ContextPack,
+        final_payload: dict[str, Any],
+    ) -> ExternalGenerationCall:
+        request_payload = build_generation_request(
+            self.project_services.project_root,
+            change_request,
+            selected_target,
+            context_pack,
+            self.project_services.config,
+            generated_code_artifact=final_payload.get("code_artifact") or {},
+        )
         request_payload['request_id'] = f'generate-test-{selected_target.split(".")[-1]}'
         request_payload['mode'] = 'generate_test'
         request_payload.setdefault('options', {})['generate_test_mode'] = 'always'

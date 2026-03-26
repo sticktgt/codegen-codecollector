@@ -40,7 +40,14 @@ class CodeGeneratorCallResult:
 
 
 
-def build_generation_request(project_root: Path, change_request: ChangeRequest, target_qualname: str, context_pack: ContextPack, config: AppConfig) -> dict[str, Any]:
+def build_generation_request(
+    project_root: Path,
+    change_request: ChangeRequest,
+    target_qualname: str,
+    context_pack: ContextPack,
+    config: AppConfig,
+    generated_code_artifact: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     target = context_pack.target
     full_file_source = (project_root / target.file_path).read_text(encoding='utf-8')
     full_file_included = target.kind not in {'function', 'method'}
@@ -129,6 +136,7 @@ def build_generation_request(project_root: Path, change_request: ChangeRequest, 
         },
         'project_context': project_context,
         'reference_context': reference_context,
+        'generated_code_artifact': generated_code_artifact or {},
         'options': {
             'generate_test_mode': config.codegenerator_test_generation_mode,
         },

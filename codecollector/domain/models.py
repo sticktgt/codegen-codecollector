@@ -215,15 +215,16 @@ class PipelineRunResult:
     run_dir: Path
     change_request: ChangeRequest
     selected_target: str
-    build_report: dict[str, Any]
-    search_candidates: list[SearchCandidate]
-    context_pack: ContextPack
-    apply_result: ApplyResult
-    merge_plan: MergePlan
-    steps: list[PipelineStepRecord]
+    build_report: dict[str, Any] | None = None
+    search_candidates: list[SearchCandidate] = field(default_factory=list)
+    context_pack: ContextPack | None = None
+    apply_result: ApplyResult | None = None
+    merge_plan: MergePlan | None = None
+    steps: list[PipelineStepRecord] = field(default_factory=list)
     generation_replay: GenerationReplay | None = None
     external_code_generation: ExternalGenerationCall | None = None
     external_test_generation: ExternalGenerationCall | None = None
     generated_test_apply: dict[str, Any] | None = None
     verification_report: dict[str, Any] | None = None
     repair_generation: ExternalGenerationCall | None = None
+    warnings: list[str] = field(default_factory=list)
