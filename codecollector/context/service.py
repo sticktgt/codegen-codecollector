@@ -31,6 +31,10 @@ class ContextService:
         if not inbound:
             inbound = [relation for relation in self.store.list_inbound_relations_for_name(self.project_key, target.name) if relation.relation_kind != 'contains']
         related_tests = self._collect_related_tests(qualname, inbound)
+        file_based_tests = self._collect_file_based_tests(target)
+        for item in file_based_tests:
+            if all(existing.qualname != item.qualname for existing in related_tests):
+                related_tests.append(item)
         requirements = self.overlays.requirement_details_for_symbol(qualname)
         recommended_tests = [item.qualname for item in related_tests]
         relation_confidence_summary = self._relation_confidence_summary(inbound, outbound)
@@ -80,6 +84,33 @@ class ContextService:
 
         related_tests.sort(key=lambda item: (item.file_path, item.qualname))
         return related_tests
+
+    def _collect_file_based_tests(self, target: SymbolRecord) -> list[SymbolRecord]:
+        test_symbols: list[SymbolRecord] = []
+        seen: set[str] = set()
+
+        module_stem = Path(target.file_path).stem
+        expected_test_stems = {f"test_{module_stem}"}
+        target_name = target.name.casefold()
+
+        for symbol in self.store.list_symbols(self.project_key):
+            if not self._is_test_symbol(symbol):
+                continue
+
+            symbol_stem = Path(symbol.file_path).stem
+            qualname_cf = symbol.qualname.casefold()
+            name_cf = symbol.name.casefold()
+            if (
+                symbol_stem in expected_test_stems
+                or target_name in name_cf
+                or target_name in qualname_cf
+            ):
+                if symbol.qualname not in seen:
+                    seen.add(symbol.qualname)
+                    test_symbols.append(symbol)
+
+        test_symbols.sort(key=lambda item: (item.file_path, item.qualname))
+        return test_symbols
 
     def _is_test_symbol(self, symbol: SymbolRecord) -> bool:
         return '/tests/' in f'/{symbol.file_path}' or symbol.file_path.startswith('tests/')

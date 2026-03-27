@@ -107,7 +107,7 @@ class ReferenceLibraryService:
             if descriptor.usage_mode == 'reuse':
                 score += 0.2
             if score > 0:
-                scored.append((score, artifact_id, reasons[:5]))
+                scored.append((score, artifact_id, self._dedupe_reasons(reasons)[:5]))
 
         scored.sort(key=lambda item: (-item[0], item[1]))
         selected: list[ReferenceArtifact] = []
@@ -181,6 +181,15 @@ class ReferenceLibraryService:
             if len(parts) >= 3:
                 return parts[1].strip()
         return ''
+
+    def _dedupe_reasons(self, reasons: list[str]) -> list[str]:
+        seen: set[str] = set()
+        result: list[str] = []
+        for reason in reasons:
+            if reason not in seen:
+                seen.add(reason)
+                result.append(reason)
+        return result
 
     def _terms(self, text: str) -> list[str]:
         import re

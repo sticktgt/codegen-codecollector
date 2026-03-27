@@ -73,7 +73,15 @@ def build_generation_request(
     reference_artifacts = []
     reference_chars = 0
     for item in selected_reference_items:
-        content, truncated = _truncate_text(item.content, config.codegenerator_max_reference_chars)
+        content = item.content
+        if config.codegenerator_max_reference_chars > 0 and len(content) > config.codegenerator_max_reference_chars:
+            LOGGER.info(
+                'Skipping reference artifact %s because content_chars=%s exceeds max_reference_chars=%s',
+                item.artifact_id,
+                len(content),
+                config.codegenerator_max_reference_chars,
+            )
+            continue
         reference_artifacts.append({
             'artifact_id': item.artifact_id,
             'title': item.title,
@@ -84,7 +92,7 @@ def build_generation_request(
             'source_path': item.source_path,
             'content': content,
             'selected_span': item.selected_span,
-            'truncated': truncated,
+            'truncated': False,
         })
         reference_chars += len(content)
     project_context = {
@@ -214,6 +222,9 @@ def invoke_generate(run_dir: Path, config: AppConfig, request_payload: dict[str,
     except json.JSONDecodeError as exc:
         raise RuntimeError(f'codegenerator returned invalid JSON on stdout: {exc}. stdout={stdout_path} stderr={stderr_path}') from exc
     result_path.write_text(json.dumps(result_payload, ensure_ascii=False, indent=2), encoding='utf-8')
+    llm_usage = result_payload.get('llm_usage') or {}
+    if llm_usage:
+        LOGGER.info('codegenerator usage prompt_tokens=%s output_tokens=%s total_tokens=%s calls=%s total_duration=%.2fs', llm_usage.get('prompt_tokens'), llm_usage.get('output_tokens'), llm_usage.get('total_tokens'), llm_usage.get('calls'), float(llm_usage.get('total_duration_sec', 0.0) or 0.0))
     return CodeGeneratorCallResult(
         request_path=str(request_path),
         result_path=str(result_path),
@@ -266,6 +277,9 @@ def invoke_generate_test(run_dir: Path, config: AppConfig, request_payload: dict
     except json.JSONDecodeError as exc:
         raise RuntimeError(f'codegenerator generate-test returned invalid JSON on stdout: {exc}. stdout={stdout_path} stderr={stderr_path}') from exc
     result_path.write_text(json.dumps(result_payload, ensure_ascii=False, indent=2), encoding='utf-8')
+    llm_usage = result_payload.get('llm_usage') or {}
+    if llm_usage:
+        LOGGER.info('codegenerator usage prompt_tokens=%s output_tokens=%s total_tokens=%s calls=%s total_duration=%.2fs', llm_usage.get('prompt_tokens'), llm_usage.get('output_tokens'), llm_usage.get('total_tokens'), llm_usage.get('calls'), float(llm_usage.get('total_duration_sec', 0.0) or 0.0))
     return CodeGeneratorCallResult(
         request_path=str(request_path),
         result_path=str(result_path),
@@ -365,6 +379,9 @@ def invoke_repair(run_dir: Path, config: AppConfig, request_payload: dict[str, A
     except json.JSONDecodeError as exc:
         raise RuntimeError(f'codegenerator repair returned invalid JSON on stdout: {exc}. stdout={stdout_path} stderr={stderr_path}') from exc
     result_path.write_text(json.dumps(result_payload, ensure_ascii=False, indent=2), encoding='utf-8')
+    llm_usage = result_payload.get('llm_usage') or {}
+    if llm_usage:
+        LOGGER.info('codegenerator usage prompt_tokens=%s output_tokens=%s total_tokens=%s calls=%s total_duration=%.2fs', llm_usage.get('prompt_tokens'), llm_usage.get('output_tokens'), llm_usage.get('total_tokens'), llm_usage.get('calls'), float(llm_usage.get('total_duration_sec', 0.0) or 0.0))
     return CodeGeneratorCallResult(request_path=str(request_path), result_path=str(result_path), command=command, request_payload=request_payload, result_payload=result_payload, trace_path=result_payload.get('trace_path'), stdout_path=str(stdout_path), stderr_path=str(stderr_path))
 
 
