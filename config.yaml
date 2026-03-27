@@ -1,32 +1,24 @@
 app:
   name: codecollector
   version: 0.10.3
-
 index:
   overlay_dirname: .codecollector
-
 workspace:
   root_dirname: .workspaces
-
 runs:
   root_dirname: .runs
-
 logging:
   level: INFO
   format: '%(asctime)s | %(levelname)s | %(name)s | %(message)s'
-
 ui:
   default_demo_project: demo_projects/sample_python_app
-
 storage:
   backend: postgres
-
 postgres:
   graph_connection: postgresql://postgres:postgres@localhost:5432/vector_db
   vector_connection: postgresql+psycopg://postgres:postgres@localhost:5432/vector_db
   schema: public
   collection_prefix: codecollector
-
 embedding:
   provider: ollama
   timeout_sec: 420
@@ -34,34 +26,29 @@ embedding:
     base_url: http://192.168.50.165:18081
     model: nomic-embed-text-v2-moe
     timeout_sec: 420
-
 search:
   default_limit: 5
   vector_enabled: true
   vector_backend: pgvector
   vector_weight: 4.0
-
 reference_library:
   dir: reference_library
   top_n: 2
   full_file_max_lines: 32
   vector_weight: 3.0
-
-
-
 codegenerator:
   root_dir: ../codegenerator
   config_path: config.yaml
   python: python
   request_format: json
   max_full_file_chars: 0
-  max_related_test_chars: 900
-  max_reference_chars: 900
+  max_related_test_chars: 1100
+  max_reference_chars: 1100
   max_request_chars: 5200
   test_generation_mode: always
   repair_enabled: true
   max_repair_attempts: 1
-
+  target_context_chars: 5200
 verification:
   run_ruff: false
   run_recommended_tests: true

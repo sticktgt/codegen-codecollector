@@ -27,6 +27,38 @@ def _json_size(payload: dict[str, Any]) -> int:
     return len(json.dumps(payload, ensure_ascii=False))
 
 
+def _select_related_tests(context_pack: ContextPack, max_related_test_chars: int = 0, limit: int = 1) -> tuple[list[dict[str, Any]], int]:
+    selected: list[dict[str, Any]] = []
+    total_chars = 0
+
+    def sort_key(item):
+        source = item.source_code or ''
+        is_module_level = item.qualname == item.file_path.replace('/', '.')[:-3] if item.file_path.endswith('.py') else False
+        return (is_module_level, len(source), item.qualname)
+
+    for item in sorted(context_pack.related_tests, key=sort_key):
+        source = item.source_code or ''
+        if max_related_test_chars > 0 and len(source) > max_related_test_chars:
+            LOGGER.info(
+                'Skipping related test %s because source_chars=%s exceeds max_related_test_chars=%s',
+                item.qualname,
+                len(source),
+                max_related_test_chars,
+            )
+            continue
+        selected.append({
+            'qualname': item.qualname,
+            'file_path': item.file_path,
+            'source': source,
+            'truncated': False,
+        })
+        total_chars += len(source)
+        if len(selected) >= limit:
+            break
+
+    return selected, total_chars
+
+
 @dataclass(slots=True)
 class CodeGeneratorCallResult:
     request_path: str
@@ -40,6 +72,7 @@ class CodeGeneratorCallResult:
 
 
 
+
 def build_generation_request(
     project_root: Path,
     change_request: ChangeRequest,
@@ -47,6 +80,7 @@ def build_generation_request(
     context_pack: ContextPack,
     config: AppConfig,
     generated_code_artifact: dict[str, Any] | None = None,
+    mode: str = 'generate',
 ) -> dict[str, Any]:
     target = context_pack.target
     full_file_source = (project_root / target.file_path).read_text(encoding='utf-8')
@@ -56,45 +90,90 @@ def build_generation_request(
         full_file_included = False
     if not full_file_included:
         full_file_source = ''
-    target_source, target_truncated = _truncate_text(target.source_code, max(800, config.codegenerator_max_full_file_chars // 2))
-    related_tests = []
+
+    target_source, target_truncated = _truncate_text(
+        target.source_code,
+        max(800, config.codegenerator_max_full_file_chars // 2),
+    )
+
+    related_tests: list[dict[str, Any]] = []
     related_test_chars = 0
-    for item in context_pack.related_tests[:1]:
-        src, truncated = _truncate_text(item.source_code, config.codegenerator_max_related_test_chars)
-        related_tests.append({
-            'qualname': item.qualname,
-            'file_path': item.file_path,
-            'source': src,
-            'truncated': truncated,
-        })
-        related_test_chars += len(src)
-    selected_reference_items = list(context_pack.reference_artifacts[:1])
-    context_pack.reference_artifacts = selected_reference_items
-    reference_artifacts = []
+    reference_artifacts: list[dict[str, Any]] = []
     reference_chars = 0
-    for item in selected_reference_items:
-        content = item.content
-        if config.codegenerator_max_reference_chars > 0 and len(content) > config.codegenerator_max_reference_chars:
+
+    soft_target_context_chars = int(getattr(config, 'codegenerator_target_context_chars', 0) or 0)
+
+    if mode in {'generate', 'generate_test'}:
+        related_tests, related_test_chars = _select_related_tests(
+            context_pack,
+            max_related_test_chars=0,
+            limit=1,
+        )
+
+    selected_reference_items = list(context_pack.reference_artifacts[:1])
+    LOGGER.info(
+        'Reference artifact candidates: count=%s items=%s',
+        len(selected_reference_items),
+        [
+            {
+                'artifact_id': item.artifact_id,
+                'title': item.title,
+                'content_chars': len(item.content or ''),
+                'usage_mode': item.usage_mode,
+                'content_mode': item.content_mode,
+            }
+            for item in selected_reference_items
+        ],
+    )
+
+    include_reference = mode == 'generate'
+    if include_reference:
+        for item in selected_reference_items:
+            content = item.content
+            content_chars = len(content)
+            reference_artifacts.append({
+                'artifact_id': item.artifact_id,
+                'title': item.title,
+                'artifact_type': item.artifact_type,
+                'usage_mode': item.usage_mode,
+                'content_mode': item.content_mode,
+                'why_selected': item.why_selected,
+                'source_path': item.source_path,
+                'content': content,
+                'selected_span': item.selected_span,
+                'truncated': False,
+            })
+            reference_chars += content_chars
             LOGGER.info(
-                'Skipping reference artifact %s because content_chars=%s exceeds max_reference_chars=%s',
+                'Selected reference artifact %s content_chars=%s running_total_chars=%s',
                 item.artifact_id,
-                len(content),
-                config.codegenerator_max_reference_chars,
+                content_chars,
+                reference_chars,
             )
-            continue
-        reference_artifacts.append({
-            'artifact_id': item.artifact_id,
-            'title': item.title,
-            'artifact_type': item.artifact_type,
-            'usage_mode': item.usage_mode,
-            'content_mode': item.content_mode,
-            'why_selected': item.why_selected,
-            'source_path': item.source_path,
-            'content': content,
-            'selected_span': item.selected_span,
-            'truncated': False,
-        })
-        reference_chars += len(content)
+    else:
+        if selected_reference_items:
+            LOGGER.info(
+                'Skipping reference artifacts for mode=%s by structural policy',
+                mode,
+            )
+
+    if not reference_artifacts and mode == 'generate':
+        LOGGER.info('No reference artifacts selected for request payload')
+    if not related_tests:
+        LOGGER.info('No related tests selected for request payload')
+
+    estimated_context_chars = len(target_source) + related_test_chars + reference_chars + len(full_file_source)
+    if soft_target_context_chars > 0:
+        LOGGER.info(
+            'Context assembly mode=%s soft_target_context_chars=%s estimated_context_chars=%s related_test_chars=%s reference_chars=%s full_file_chars=%s',
+            mode,
+            soft_target_context_chars,
+            estimated_context_chars,
+            related_test_chars,
+            reference_chars,
+            len(full_file_source),
+        )
+
     project_context = {
         'module_outline': [
             {
@@ -130,7 +209,7 @@ def build_generation_request(
     }
     request = {
         'request_id': f'generate-{target_qualname.split(".")[-1]}',
-        'mode': 'generate',
+        'mode': mode,
         'change_request': {
             'title': change_request.title,
             'description': change_request.description,
@@ -158,29 +237,26 @@ def build_generation_request(
         'related_test_chars': related_test_chars,
         'reference_artifacts_count': len(reference_artifacts),
         'reference_chars': reference_chars,
+        'request_chars': _json_size(request),
+        'request_chars_limit': 0,
+        'estimated_context_chars': estimated_context_chars,
+        'soft_target_context_chars': soft_target_context_chars,
     }
     request['context_metrics'] = metrics
-    current_size = _json_size(request)
-    if current_size > config.codegenerator_max_request_chars and reference_artifacts:
-        # drop the second reference artifact first
-        request['reference_context']['reference_artifacts'] = reference_artifacts[:1]
-        request['reference_context']['reference_summary'] = {
-            'count': 1,
-            'titles': [item.get('title', '') for item in request['reference_context']['reference_artifacts'][:1]],
-            'content_modes': [item.get('content_mode', '') for item in request['reference_context']['reference_artifacts'][:1]],
-        }
-        context_pack.reference_summary = dict(request['reference_context']['reference_summary'])
-        request['context_metrics']['reference_artifacts_count'] = 1
-        request['context_metrics']['reference_chars'] = len(request['reference_context']['reference_artifacts'][0]['content']) if request['reference_context']['reference_artifacts'] else 0
-        current_size = _json_size(request)
-    if current_size > config.codegenerator_max_request_chars and related_tests:
-        request['project_context']['related_tests'] = []
-        request['context_metrics']['related_tests_count'] = 0
-        request['context_metrics']['related_test_chars'] = 0
-        current_size = _json_size(request)
-    request['context_metrics']['request_chars'] = current_size
-    request['context_metrics']['request_chars_limit'] = config.codegenerator_max_request_chars
-    LOGGER.info('Prepared generation request: request_chars=%s target_source_chars=%s full_file_included=%s full_file_chars=%s related_tests=%s related_test_chars=%s reference_artifacts=%s reference_chars=%s', current_size, request['context_metrics']['target_source_chars'], full_file_included, len(full_file_source), len(request['project_context']['related_tests']), request['context_metrics']['related_test_chars'], len(request['reference_context']['reference_artifacts']), request['context_metrics']['reference_chars'])
+    LOGGER.info(
+        'Prepared generation request: mode=%s request_chars=%s target_source_chars=%s full_file_included=%s full_file_chars=%s related_tests=%s related_test_chars=%s reference_artifacts=%s reference_chars=%s soft_target_context_chars=%s estimated_context_chars=%s',
+        mode,
+        metrics['request_chars'],
+        metrics['target_source_chars'],
+        full_file_included,
+        len(full_file_source),
+        len(request['project_context']['related_tests']),
+        metrics['related_test_chars'],
+        len(request['reference_context']['reference_artifacts']),
+        metrics['reference_chars'],
+        soft_target_context_chars,
+        estimated_context_chars,
+    )
     return request
 
 
@@ -327,10 +403,11 @@ def build_repair_request(change_request: ChangeRequest, target_qualname: str, pr
                 'source': target.source_code,
                 'truncated': False,
             },
-            'related_tests': [
-                {'qualname': item.qualname, 'file_path': item.file_path, 'source': item.source_code, 'truncated': False}
-                for item in context_pack.related_tests[:1]
-            ],
+            'related_tests': _select_related_tests(
+                context_pack,
+                max_related_test_chars=350,
+                limit=1,
+            )[0],
             'recommended_tests': list(context_pack.recommended_tests),
         },
         'reference_context': {

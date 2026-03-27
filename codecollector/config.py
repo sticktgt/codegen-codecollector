@@ -45,6 +45,8 @@ class AppConfig:
     codegenerator_config_path: str
     codegenerator_python: str
     codegenerator_request_format: str
+    codegenerator_target_context_chars: int
+    # legacy compatibility fields; may remain unused by newer adapter logic
     codegenerator_max_full_file_chars: int
     codegenerator_max_related_test_chars: int
     codegenerator_max_reference_chars: int
@@ -174,6 +176,7 @@ def load_config(config_path: Path | None = None) -> AppConfig:
         codegenerator_config_path=str(codegen.get('config_path', 'config.yaml')),
         codegenerator_python=str(codegen.get('python', 'python')),
         codegenerator_request_format=str(codegen.get('request_format', 'json')),
+        codegenerator_target_context_chars=int(codegen.get('target_context_chars', 5200)),
         codegenerator_max_full_file_chars=int(codegen.get('max_full_file_chars', 1800)),
         codegenerator_max_related_test_chars=int(codegen.get('max_related_test_chars', 900)),
         codegenerator_max_reference_chars=int(codegen.get('max_reference_chars', 1400)),

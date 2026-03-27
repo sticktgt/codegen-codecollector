@@ -19,7 +19,6 @@ from codecollector.domain.models import (
 from codecollector.logger import get_logger
 from codecollector.orchestration.run_artifacts import RunArtifactsManager
 from codecollector.external_codegen.adapter import build_generation_request, invoke_generate, invoke_generate_test, patch_artifact_from_result, build_repair_request, invoke_repair
-from codecollector.vector_search.ollama_embeddings import reset_embedding_usage
 
 if TYPE_CHECKING:
     from codecollector.domain.models import ApplyResult, ContextPack
@@ -43,7 +42,6 @@ class PipelineService:
         use_vector_search: bool | None = None,
     ) -> PipelineRunResult:
         run_id, run_label, run_dir = self.artifacts_manager.create_run_dir('pipeline')
-        reset_embedding_usage()
         steps: list[PipelineStepRecord] = []
 
         build_report = self._run_step(
@@ -137,7 +135,6 @@ class PipelineService:
         use_vector_search: bool | None = None,
     ) -> PipelineRunResult:
         run_id, run_label, run_dir = self.artifacts_manager.create_run_dir('pipeline')
-        reset_embedding_usage()
         steps: list[PipelineStepRecord] = []
         warnings: list[str] = []
 
@@ -244,7 +241,7 @@ class PipelineService:
                     ),
                 )
 
-            if self._should_request_generated_test(context_pack):
+            if self._should_request_generated_test(context_pack, selected_target):
                 external_test_generation = self._run_step(
                     steps,
                     'external_generate_test',
@@ -273,7 +270,7 @@ class PipelineService:
                         ),
                     )
             else:
-                warning_message = 'Генерация теста пропущена: найден тест, явно связанный с target symbol.'
+                warning_message = 'Генерация теста пропущена: для target уже есть related_tests или recommended_tests.'
                 warnings.append(warning_message)
                 LOGGER.info(warning_message)
 
@@ -283,7 +280,7 @@ class PipelineService:
                 steps,
                 verification_step_name,
                 verification_step_summary,
-                lambda: self._run_verification(apply_result, context_pack.recommended_tests if context_pack else None),
+                lambda: self._run_verification(apply_result),
             )
             if repair_generation is not None:
                 verification_report = self._mark_noop_repair_if_needed(verification_report, apply_result, repair_generation)
@@ -316,7 +313,7 @@ class PipelineService:
                         steps,
                         'verification_after_repair',
                         'Повторно запустить проверки проекта после repair',
-                        lambda: self._run_verification(apply_result, context_pack.recommended_tests if context_pack else None),
+                        lambda: self._run_verification(apply_result),
                     )
                     verification_report = self._mark_noop_repair_if_needed(verification_report, apply_result, repair_generation)
 
@@ -380,30 +377,39 @@ class PipelineService:
         code_artifact = result_payload.get('code_artifact') or {}
         return bool(str(code_artifact.get('code', '') or '').strip())
 
-    def _should_request_generated_test(self, context_pack: ContextPack) -> bool:
+    def _should_request_generated_test(self, context_pack: ContextPack, selected_target: str) -> bool:
         mode = str(self.project_services.config.codegenerator_test_generation_mode).lower()
         if mode == 'never':
             return False
-        if self._has_symbol_specific_tests(context_pack):
+        if self._has_existing_tests_for_target(context_pack, selected_target):
             return False
         if mode == 'always':
             return True
         return True
+    
+    def _has_existing_tests_for_target(self, context_pack: ContextPack, selected_target: str) -> bool:
+        target_name = selected_target.split('.')[-1].lower()
+        target_qualname = selected_target.lower()
 
-    def _has_symbol_specific_tests(self, context_pack: ContextPack) -> bool:
-        target_name = str(context_pack.target.name or '').casefold()
-        if not target_name:
+        def _entry_matches(entry: Any) -> bool:
+            if not isinstance(entry, dict):
+                return False
+            qualname = str(entry.get('qualname', '') or '').lower()
+            file_path = str(entry.get('file_path', '') or '').lower()
+            reasons = [str(item).lower() for item in (entry.get('reasons') or [])]
+            if target_qualname and target_qualname in qualname:
+                return True
+            if target_name and target_name in qualname:
+                return True
+            if target_name and any(target_name in reason for reason in reasons):
+                return True
+            if target_name and target_name in file_path:
+                return True
             return False
-        for item in context_pack.related_tests or []:
-            qualname = str(getattr(item, 'qualname', '') or '').casefold()
-            name = str(getattr(item, 'name', '') or '').casefold()
-            if target_name in qualname or target_name in name:
-                return True
-        for item in context_pack.recommended_tests or []:
-            qualname = str(item or '').casefold()
-            if target_name in qualname:
-                return True
-        return False
+
+        return any(_entry_matches(item) for item in (context_pack.related_tests or [])) or any(
+            _entry_matches(item) for item in (context_pack.recommended_tests or [])
+        )
 
     def _generated_test_failure_only(self, verification_report: dict[str, Any] | None) -> bool:
         if not verification_report or verification_report.get('passed', False):
@@ -541,15 +547,11 @@ class PipelineService:
             return []
         return [{'file_path': file_path, 'source_code': source_code}]
 
-    def _run_verification(self, apply_result: ApplyResult, additional_recommended_tests: list[str] | None = None) -> dict[str, Any]:
+    def _run_verification(self, apply_result: ApplyResult) -> dict[str, Any]:
         config = self.project_services.config
-        recommended_tests = list(apply_result.impact.recommended_tests or [])
-        for item in additional_recommended_tests or []:
-            if item not in recommended_tests:
-                recommended_tests.append(item)
         results = self.project_services.validation_service.run_post_apply_checks(
             apply_result.workspace_path,
-            recommended_tests,
+            apply_result.impact.recommended_tests,
             run_ruff=config.verification_run_ruff,
             run_recommended_tests=config.verification_run_recommended_tests,
             run_full_project_tests=config.verification_run_full_project_tests,

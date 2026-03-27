@@ -69,6 +69,38 @@ class RunRecord:
         return "unknown"
 
 
+    @property
+    def usage_summary(self) -> dict[str, Any]:
+        return self.payload.get("usage_summary", {}) or {}
+
+    @property
+    def overall_total_tokens(self) -> int:
+        usage = self.usage_summary
+        value = usage.get("overall_total_tokens_including_embeddings")
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    @property
+    def llm_total_tokens(self) -> int:
+        usage = self.usage_summary.get("llm_total", {}) or {}
+        value = usage.get("total_tokens")
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    @property
+    def embedding_prompt_tokens(self) -> int:
+        usage = self.usage_summary.get("embedding", {}) or {}
+        value = usage.get("prompt_tokens")
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+
 def _safe_read_json(path: Path) -> dict[str, Any] | None:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -115,6 +147,7 @@ def build_runs_table(runs: list[RunRecord]) -> pd.DataFrame:
                 "Статус": run.status_label,
                 "Repair": "да" if run.had_repair else "нет",
                 "Тест": "да" if run.had_generated_tests else "нет",
+                "Токены всего": run.overall_total_tokens,
                 "Длительность": format_duration(run.total_duration_ms),
             }
             for run in runs
@@ -126,12 +159,14 @@ def render_summary(run: RunRecord) -> None:
     change_request = run.payload.get("change_request", {}) or {}
     generated_test_apply = run.payload.get("generated_test_apply") or {}
 
-    m1, m2, m3, m4, m5 = st.columns([1.5, 0.9, 0.8, 0.9, 1.0])
+    m1, m2, m3, m4, m5, m6, m7 = st.columns([1.5, 0.9, 0.8, 0.9, 1.0, 1.0, 1.0])
     m1.metric("Проект", run.project or "—")
     m2.metric("Проверки", run.status_label)
     m3.metric("Repair", "да" if run.had_repair else "нет")
     m4.metric("Тестов создано", str(generated_test_apply.get("count", 0)))
     m5.metric("Длительность", format_duration(run.total_duration_ms))
+    m6.metric("Токены всего", str(run.overall_total_tokens))
+    m7.metric("Embedding", str(run.embedding_prompt_tokens))
 
     st.caption(f"Run ID: {run.run_id}")
     st.markdown(f"**Target:** `{run.target or '—'}`")
@@ -154,6 +189,36 @@ def render_summary(run: RunRecord) -> None:
             for item in notes:
                 st.markdown(f"- {item}")
 
+
+
+
+def render_usage_summary(run: RunRecord) -> None:
+    usage_summary = run.usage_summary
+    if not usage_summary:
+        st.info("Метрики токенов отсутствуют.")
+        return
+
+    embedding = usage_summary.get("embedding", {}) or {}
+    code_generation = usage_summary.get("code_generation", {}) or {}
+    test_generation = usage_summary.get("test_generation", {}) or {}
+    repair_generation = usage_summary.get("repair_generation", {}) or {}
+    llm_total = usage_summary.get("llm_total", {}) or {}
+
+    cols = st.columns(5)
+    cols[0].metric("Embedding input tokens", str(int(embedding.get("prompt_tokens", 0) or 0)))
+    cols[1].metric("Generate total tokens", str(int(code_generation.get("total_tokens", 0) or 0)))
+    cols[2].metric("Generate-test total tokens", str(int(test_generation.get("total_tokens", 0) or 0)))
+    cols[3].metric("Repair total tokens", str(int(repair_generation.get("total_tokens", 0) or 0)))
+    cols[4].metric("Общий total tokens", str(run.overall_total_tokens))
+
+    cols2 = st.columns(4)
+    cols2[0].metric("LLM prompt tokens", str(int(llm_total.get("prompt_tokens", 0) or 0)))
+    cols2[1].metric("LLM output tokens", str(int(llm_total.get("output_tokens", 0) or 0)))
+    cols2[2].metric("LLM calls", str(int(llm_total.get("calls", 0) or 0)))
+    cols2[3].metric("Embedding calls", str(int(embedding.get("calls", 0) or 0)))
+
+    with st.expander("usage_summary", expanded=False):
+        st.code(compact_json(usage_summary), language="json")
 
 def render_steps(run: RunRecord) -> None:
     steps = run.payload.get("steps", []) or []
@@ -317,6 +382,15 @@ def render_external_block(kind: str, payload: dict[str, Any] | None) -> None:
     with p2:
         st.markdown(f"**Result path:** `{payload.get('result_path', '')}`")
 
+    usage = (payload.get("result_payload", {}) or {}).get("llm_usage", {}) or {}
+    if usage:
+        st.markdown("**LLM usage**")
+        u1, u2, u3, u4 = st.columns(4)
+        u1.metric("prompt_tokens", str(int(usage.get("prompt_tokens", 0) or 0)))
+        u2.metric("output_tokens", str(int(usage.get("output_tokens", 0) or 0)))
+        u3.metric("total_tokens", str(int(usage.get("total_tokens", 0) or 0)))
+        u4.metric("calls", str(int(usage.get("calls", 0) or 0)))
+
     if kind == "code":
         _render_code_result(payload)
     elif kind == "test":
@@ -436,6 +510,7 @@ tab_overview, tab_steps, tab_search, tab_context, tab_codegen, tab_testgen, tab_
 )
 
 with tab_overview:
+    render_usage_summary(run)
     st.code(compact_json({
         "run_id": run.run_id,
         "project": run.project,
@@ -444,6 +519,9 @@ with tab_overview:
         "had_repair": run.had_repair,
         "had_generated_tests": run.had_generated_tests,
         "total_duration_ms": run.total_duration_ms,
+        "overall_total_tokens": run.overall_total_tokens,
+        "llm_total_tokens": run.llm_total_tokens,
+        "embedding_prompt_tokens": run.embedding_prompt_tokens,
     }), language="json")
 
 with tab_steps:
