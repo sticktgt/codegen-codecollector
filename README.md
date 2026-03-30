@@ -2,7 +2,7 @@
 
 `codecollector` — проект для подготовки изменения кода по change request, подбора контекста по проекту, вызова внешнего `codegenerator`, применения результата в staging workspace и запуска проверок.
 
-Проект ориентирован на локальные LLM и ограниченный контекст. Основной сценарий работы — точечное изменение уже существующего кода с контролем объема передаваемого контекста и с сохранением артефактов запуска для отладки.
+Проект ориентирован на локальные LLM и ограниченный контекст. Основной сценарий работы — точечное изменение уже существующего кода с контролем состава передаваемого контекста и с сохранением артефактов запуска для отладки.
 
 ## Текущая реализация
 
@@ -33,7 +33,7 @@
 6. отдельный вызов `codegenerator generate`;
 7. применение сгенерированного кода в staging workspace;
 8. при ошибке применения — отдельный вызов `codegenerator repair` и повторное применение;
-9. если для target нет достаточного тестового покрытия — отдельный вызов `codegenerator generate-test`;
+9. если нужен отдельный тестовый артефакт — отдельный вызов `codegenerator generate-test`;
 10. применение сгенерированного теста;
 11. проверки проекта;
 12. формирование dry-run merge plan и итогового отчета.
@@ -173,8 +173,8 @@ Reference Library — отдельный набор эталонных прим�
 - `target`;
 - `project_context.module_outline` — короткий список символов модуля;
 - `project_context.target_symbol` — исходный код target-символа;
-- `project_context.related_tests` — только связанные тесты, если они найдены;
-- `reference_context` — только выбранные reference-артефакты.
+- `project_context.related_tests` — связанные тесты, если они найдены;
+- `reference_context` — выбранные reference-артефакты.
 
 В обычном режиме полный файл не передается.
 
@@ -201,14 +201,16 @@ Reference Library — отдельный набор эталонных прим�
 
 - `change_request`;
 - `target`;
-- target-символ;
-- module outline;
-- текущий reference-контекст;
-- признак отсутствия связанных тестов.
+- `project_context.module_outline`;
+- `project_context.target_symbol`;
+- `project_context.related_tests`, если они найдены;
+- `generated_code_artifact`.
+
+`reference_context` для `generate-test` по умолчанию не передается.
 
 ### Метрики размера контекста
 
-Перед каждым внешним вызовом `codecollector` пишет в лог и в request-пayload метрики размера контекста.
+Перед каждым внешним вызовом `codecollector` пишет в лог и в request-payload метрики размера контекста.
 
 В текущем формате используются, например:
 
@@ -216,19 +218,32 @@ Reference Library — отдельный набор эталонных прим�
 - `target_source_chars`;
 - `related_test_chars`;
 - `reference_chars`;
-- `request_chars_limit`.
+- `estimated_context_chars`;
+- `soft_target_context_chars`.
 
-Эти поля используются для контроля prompt budget и анализа запусков.
+Также в результатах внешнего вызова доступны агрегированные метрики использования LLM:
 
-### Как контекст уменьшается
+- `prompt_tokens`;
+- `output_tokens`;
+- `total_tokens`;
+- `duration_sec`;
+- `load_duration_sec`;
+- `prompt_eval_duration_sec`;
+- `eval_duration_sec`.
 
-Если контекст становится слишком большим, `codecollector` уменьшает его за счет:
+### Как уменьшается контекст
+
+`codecollector` сам не выполняет сложное prompt trimming. Его задача — принять структурные решения по составу request.
+
+В текущем подходе он уменьшает контекст за счет:
 
 - отказа от передачи полного файла;
-- ограничения числа reference-артефактов;
-- передачи snippet вместо full file;
-- передачи только связанных тестов;
-- усечения длинных reference-артефактов.
+- передачи target-символа вместо полного файла;
+- передачи выбранных related tests;
+- передачи выбранных reference-артефактов;
+- исключения reference-контекста из `generate-test`.
+
+Основное ужатие prompt выполняется внутри `codegenerator`.
 
 ## Проверки после применения
 
@@ -355,6 +370,7 @@ Reference Library — отдельный набор эталонных прим�
 - `planner_result`;
 - `warnings`;
 - `trace_path`;
+- `llm_usage`;
 - `error_type`;
 - `message`.
 

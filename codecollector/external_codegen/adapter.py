@@ -325,6 +325,42 @@ def invoke_generate_test(run_dir: Path, config: AppConfig, request_payload: dict
     result_path = run_dir / 'generation_test_result.json'
     stdout_path = run_dir / 'codegenerator_test_stdout.txt'
     stderr_path = run_dir / 'codegenerator_test_stderr.txt'
+
+    request_payload = dict(request_payload)
+    if request_payload.get('mode') != 'generate_test':
+        LOGGER.info(
+            'Normalizing test-generation request mode from %s to generate_test before sending to codegenerator',
+            request_payload.get('mode'),
+        )
+        request_payload['mode'] = 'generate_test'
+
+    reference_context = dict(request_payload.get('reference_context') or {})
+    if reference_context.get('reference_artifacts'):
+        LOGGER.info('Dropping reference artifacts from generate-test request payload by structural policy')
+        reference_context['reference_artifacts'] = []
+        reference_context['reference_summary'] = {
+            'count': 0,
+            'titles': [],
+            'content_modes': [],
+        }
+        request_payload['reference_context'] = reference_context
+
+    context_metrics = dict(request_payload.get('context_metrics') or {})
+    context_metrics['reference_artifacts_count'] = len(((request_payload.get('reference_context') or {}).get('reference_artifacts') or []))
+    context_metrics['reference_chars'] = 0
+    context_metrics['request_chars'] = _json_size(request_payload)
+    request_payload['context_metrics'] = context_metrics
+
+    LOGGER.info(
+        'Prepared generation request for test generation: mode=%s request_chars=%s related_tests=%s related_test_chars=%s reference_artifacts=%s reference_chars=%s',
+        request_payload.get('mode'),
+        request_payload['context_metrics'].get('request_chars'),
+        len(((request_payload.get('project_context') or {}).get('related_tests') or [])),
+        request_payload['context_metrics'].get('related_test_chars'),
+        len(((request_payload.get('reference_context') or {}).get('reference_artifacts') or [])),
+        request_payload['context_metrics'].get('reference_chars'),
+    )
+
     _write_payload(request_path, request_payload, request_format)
     command = [
         config.codegenerator_python,
