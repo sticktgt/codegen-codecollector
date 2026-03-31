@@ -45,12 +45,13 @@ class AppConfig:
     codegenerator_config_path: str
     codegenerator_python: str
     codegenerator_request_format: str
-    codegenerator_target_context_chars: int
-    # legacy compatibility fields; may remain unused by newer adapter logic
-    codegenerator_max_full_file_chars: int
-    codegenerator_max_related_test_chars: int
-    codegenerator_max_reference_chars: int
-    codegenerator_max_request_chars: int
+    codegenerator_include_full_file_for_non_symbol_targets: bool
+    codegenerator_include_full_file_for_generate_test: bool
+    codegenerator_generate_related_tests_max_items: int
+    codegenerator_generate_test_related_tests_max_items: int
+    codegenerator_repair_related_tests_max_items: int
+    codegenerator_generate_reference_max_items: int
+    codegenerator_repair_reference_max_items: int
     codegenerator_test_generation_mode: str
     codegenerator_repair_enabled: bool
     codegenerator_max_repair_attempts: int
@@ -176,11 +177,13 @@ def load_config(config_path: Path | None = None) -> AppConfig:
         codegenerator_config_path=str(codegen.get('config_path', 'config.yaml')),
         codegenerator_python=str(codegen.get('python', 'python')),
         codegenerator_request_format=str(codegen.get('request_format', 'json')),
-        codegenerator_target_context_chars=int(codegen.get('target_context_chars', 5200)),
-        codegenerator_max_full_file_chars=int(codegen.get('max_full_file_chars', 1800)),
-        codegenerator_max_related_test_chars=int(codegen.get('max_related_test_chars', 900)),
-        codegenerator_max_reference_chars=int(codegen.get('max_reference_chars', 1400)),
-        codegenerator_max_request_chars=int(codegen.get('max_request_chars', 5200)),
+        codegenerator_include_full_file_for_non_symbol_targets=bool(codegen.get('include_full_file_for_non_symbol_targets', True)),
+        codegenerator_include_full_file_for_generate_test=bool(codegen.get('include_full_file_for_generate_test', True)),
+        codegenerator_generate_related_tests_max_items=int(codegen.get('generate_related_tests_max_items', 1)),
+        codegenerator_generate_test_related_tests_max_items=int(codegen.get('generate_test_related_tests_max_items', 1)),
+        codegenerator_repair_related_tests_max_items=int(codegen.get('repair_related_tests_max_items', 1)),
+        codegenerator_generate_reference_max_items=int(codegen.get('generate_reference_max_items', 1)),
+        codegenerator_repair_reference_max_items=int(codegen.get('repair_reference_max_items', 1)),
         codegenerator_test_generation_mode=str(codegen.get('test_generation_mode', 'always')),
         codegenerator_repair_enabled=bool(codegen.get('repair_enabled', True)),
         codegenerator_max_repair_attempts=int(codegen.get('max_repair_attempts', 1)),

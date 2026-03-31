@@ -495,6 +495,7 @@ class PipelineService:
             context_pack,
             self.project_services.config,
             generated_code_artifact=final_payload.get("code_artifact") or {},
+            mode='generate_test',
         )
         request_payload['request_id'] = f'generate-test-{selected_target.split(".")[-1]}'
         request_payload['mode'] = 'generate_test'
@@ -525,7 +526,7 @@ class PipelineService:
         )
 
     def _external_repair(self, run_dir: Path, change_request: ChangeRequest, selected_target: str, context_pack: ContextPack, previous_result_payload: dict[str, Any], verification_report: dict[str, Any]) -> ExternalGenerationCall:
-        request_payload = build_repair_request(change_request, selected_target, previous_result_payload, context_pack, verification_report.get('failure_summary', {}))
+        request_payload = build_repair_request(change_request, selected_target, previous_result_payload, context_pack, verification_report.get('failure_summary', {}), self.project_services.config)
         call_result = invoke_repair(run_dir, self.project_services.config, request_payload)
         return ExternalGenerationCall(
             mode='cli_json',

@@ -41,14 +41,16 @@ codegenerator:
   config_path: config.yaml
   python: python
   request_format: json
-  max_full_file_chars: 0
-  max_related_test_chars: 1100
-  max_reference_chars: 1100
-  max_request_chars: 5200
+  include_full_file_for_non_symbol_targets: true
+  include_full_file_for_generate_test: true
+  generate_related_tests_max_items: 1
+  generate_test_related_tests_max_items: 1
+  repair_related_tests_max_items: 1
+  generate_reference_max_items: 1
+  repair_reference_max_items: 1
   test_generation_mode: always
   repair_enabled: true
   max_repair_attempts: 1
-  target_context_chars: 5200
 verification:
   run_ruff: false
   run_recommended_tests: true

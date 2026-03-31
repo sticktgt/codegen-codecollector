@@ -15,19 +15,12 @@ from codecollector.logger import get_logger
 LOGGER = get_logger(__name__)
 
 
-def _truncate_text(text: str, limit: int) -> tuple[str, bool]:
-    if limit <= 0 or len(text) <= limit:
-        return text, False
-    marker = f'\n\n# ... truncated, original_chars={len(text)}'
-    allowed = max(0, limit - len(marker))
-    return text[:allowed] + marker, True
-
 
 def _json_size(payload: dict[str, Any]) -> int:
     return len(json.dumps(payload, ensure_ascii=False))
 
 
-def _select_related_tests(context_pack: ContextPack, max_related_test_chars: int = 0, limit: int = 1) -> tuple[list[dict[str, Any]], int]:
+def _select_related_tests(context_pack: ContextPack, limit: int = 1) -> tuple[list[dict[str, Any]], int]:
     selected: list[dict[str, Any]] = []
     total_chars = 0
 
@@ -38,14 +31,6 @@ def _select_related_tests(context_pack: ContextPack, max_related_test_chars: int
 
     for item in sorted(context_pack.related_tests, key=sort_key):
         source = item.source_code or ''
-        if max_related_test_chars > 0 and len(source) > max_related_test_chars:
-            LOGGER.info(
-                'Skipping related test %s because source_chars=%s exceeds max_related_test_chars=%s',
-                item.qualname,
-                len(source),
-                max_related_test_chars,
-            )
-            continue
         selected.append({
             'qualname': item.qualname,
             'file_path': item.file_path,
@@ -53,7 +38,7 @@ def _select_related_tests(context_pack: ContextPack, max_related_test_chars: int
             'truncated': False,
         })
         total_chars += len(source)
-        if len(selected) >= limit:
+        if len(selected) >= max(0, limit):
             break
 
     return selected, total_chars
@@ -84,33 +69,41 @@ def build_generation_request(
 ) -> dict[str, Any]:
     target = context_pack.target
     full_file_source = (project_root / target.file_path).read_text(encoding='utf-8')
-    full_file_included = target.kind not in {'function', 'method'}
-    if full_file_included and len(full_file_source) > config.codegenerator_max_full_file_chars:
-        full_file_source = ''
-        full_file_included = False
+    full_file_included = False
+    if mode == 'generate_test':
+        full_file_included = bool(config.codegenerator_include_full_file_for_generate_test)
+    elif target.kind not in {'function', 'method'}:
+        full_file_included = bool(config.codegenerator_include_full_file_for_non_symbol_targets)
     if not full_file_included:
         full_file_source = ''
 
-    target_source, target_truncated = _truncate_text(
-        target.source_code,
-        max(800, config.codegenerator_max_full_file_chars // 2),
-    )
+    target_source = target.source_code
+    target_truncated = False
 
     related_tests: list[dict[str, Any]] = []
     related_test_chars = 0
     reference_artifacts: list[dict[str, Any]] = []
     reference_chars = 0
 
-    soft_target_context_chars = int(getattr(config, 'codegenerator_target_context_chars', 0) or 0)
+    related_test_limits = {
+        'generate': config.codegenerator_generate_related_tests_max_items,
+        'generate_test': config.codegenerator_generate_test_related_tests_max_items,
+        'repair': config.codegenerator_repair_related_tests_max_items,
+    }
+    reference_limits = {
+        'generate': config.codegenerator_generate_reference_max_items,
+        'generate_test': 0,
+        'repair': config.codegenerator_repair_reference_max_items,
+    }
 
-    if mode in {'generate', 'generate_test'}:
+    related_test_limit = max(0, int(related_test_limits.get(mode, 0) or 0))
+    if related_test_limit > 0:
         related_tests, related_test_chars = _select_related_tests(
             context_pack,
-            max_related_test_chars=0,
-            limit=1,
+            limit=related_test_limit,
         )
 
-    selected_reference_items = list(context_pack.reference_artifacts[:1])
+    selected_reference_items = list(context_pack.reference_artifacts[:max(0, int(reference_limits.get(mode, 0) or 0))])
     LOGGER.info(
         'Reference artifact candidates: count=%s items=%s',
         len(selected_reference_items),
@@ -163,16 +156,16 @@ def build_generation_request(
         LOGGER.info('No related tests selected for request payload')
 
     estimated_context_chars = len(target_source) + related_test_chars + reference_chars + len(full_file_source)
-    if soft_target_context_chars > 0:
-        LOGGER.info(
-            'Context assembly mode=%s soft_target_context_chars=%s estimated_context_chars=%s related_test_chars=%s reference_chars=%s full_file_chars=%s',
-            mode,
-            soft_target_context_chars,
-            estimated_context_chars,
-            related_test_chars,
-            reference_chars,
-            len(full_file_source),
-        )
+    LOGGER.info(
+        'Context assembly mode=%s estimated_context_chars=%s related_test_limit=%s reference_limit=%s related_test_chars=%s reference_chars=%s full_file_chars=%s',
+        mode,
+        estimated_context_chars,
+        related_test_limit,
+        max(0, int(reference_limits.get(mode, 0) or 0)),
+        related_test_chars,
+        reference_chars,
+        len(full_file_source),
+    )
 
     project_context = {
         'module_outline': [
@@ -238,13 +231,13 @@ def build_generation_request(
         'reference_artifacts_count': len(reference_artifacts),
         'reference_chars': reference_chars,
         'request_chars': _json_size(request),
-        'request_chars_limit': 0,
         'estimated_context_chars': estimated_context_chars,
-        'soft_target_context_chars': soft_target_context_chars,
+        'related_test_limit': related_test_limit,
+        'reference_limit': max(0, int(reference_limits.get(mode, 0) or 0)),
     }
     request['context_metrics'] = metrics
     LOGGER.info(
-        'Prepared generation request: mode=%s request_chars=%s target_source_chars=%s full_file_included=%s full_file_chars=%s related_tests=%s related_test_chars=%s reference_artifacts=%s reference_chars=%s soft_target_context_chars=%s estimated_context_chars=%s',
+        'Prepared generation request: mode=%s request_chars=%s target_source_chars=%s full_file_included=%s full_file_chars=%s related_tests=%s related_test_chars=%s reference_artifacts=%s reference_chars=%s related_test_limit=%s reference_limit=%s estimated_context_chars=%s',
         mode,
         metrics['request_chars'],
         metrics['target_source_chars'],
@@ -254,7 +247,8 @@ def build_generation_request(
         metrics['related_test_chars'],
         len(request['reference_context']['reference_artifacts']),
         metrics['reference_chars'],
-        soft_target_context_chars,
+        related_test_limit,
+        max(0, int(reference_limits.get(mode, 0) or 0)),
         estimated_context_chars,
     )
     return request
@@ -403,7 +397,7 @@ def invoke_generate_test(run_dir: Path, config: AppConfig, request_payload: dict
         stderr_path=str(stderr_path),
     )
 
-def build_repair_request(change_request: ChangeRequest, target_qualname: str, previous_result_payload: dict[str, Any], context_pack: ContextPack, verification_summary: dict[str, Any]) -> dict[str, Any]:
+def build_repair_request(change_request: ChangeRequest, target_qualname: str, previous_result_payload: dict[str, Any], context_pack: ContextPack, verification_summary: dict[str, Any], config: AppConfig | None = None) -> dict[str, Any]:
     target = context_pack.target
     failure_summary = verification_summary.get('failure_summary', {}) if isinstance(verification_summary, dict) else {}
     stage = str(failure_summary.get('stage', 'verification'))
@@ -441,13 +435,12 @@ def build_repair_request(change_request: ChangeRequest, target_qualname: str, pr
             },
             'related_tests': _select_related_tests(
                 context_pack,
-                max_related_test_chars=350,
-                limit=1,
+                limit=max(0, int((config.codegenerator_repair_related_tests_max_items if config is not None else 1) or 0)),
             )[0],
             'recommended_tests': list(context_pack.recommended_tests),
         },
         'reference_context': {
-            'reference_summary': {'count': min(1, len(context_pack.reference_artifacts)), 'titles': [item.title for item in context_pack.reference_artifacts[:1]], 'content_modes': [item.content_mode for item in context_pack.reference_artifacts[:1]]},
+            'reference_summary': {'count': min(1, len(context_pack.reference_artifacts)), 'titles': [item.title for item in context_pack.reference_artifacts[:max(0, int((config.codegenerator_repair_reference_max_items if config is not None else 1) or 0))]], 'content_modes': [item.content_mode for item in context_pack.reference_artifacts[:max(0, int((config.codegenerator_repair_reference_max_items if config is not None else 1) or 0))]]},
             'reference_artifacts': [
                 {
                     'artifact_id': item.artifact_id,
@@ -461,7 +454,7 @@ def build_repair_request(change_request: ChangeRequest, target_qualname: str, pr
                     'selected_span': item.selected_span,
                     'truncated': False,
                 }
-                for item in context_pack.reference_artifacts[:1]
+                for item in context_pack.reference_artifacts[:max(0, int((config.codegenerator_repair_reference_max_items if config is not None else 1) or 0))]
             ],
         },
         'options': {},
