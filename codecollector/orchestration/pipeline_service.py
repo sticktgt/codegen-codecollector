@@ -133,6 +133,7 @@ class PipelineService:
         selected_target: str,
         limit: int,
         use_vector_search: bool | None = None,
+        skip_search: bool = False,
     ) -> PipelineRunResult:
         run_id, run_label, run_dir = self.artifacts_manager.create_run_dir('pipeline')
         steps: list[PipelineStepRecord] = []
@@ -158,16 +159,24 @@ class PipelineService:
                 lambda: asdict(self.project_services.build_index(full_rebuild=False)),
             )
 
-            search_text = change_request.search_text()
-            candidates_dicts = self._run_step(
-                steps,
-                'search_primary_target',
-                f'Найти shortlist по change request: {change_request.title}',
-                lambda: [asdict(item) for item in self.project_services.search(search_text, limit=limit, use_vector_search=use_vector_search)],
-            )
-            candidates = [SearchCandidate(**item) for item in candidates_dicts]
-            if not any(item.qualname == selected_target for item in candidates):
-                raise ValueError(f'Selected qualname {selected_target} is not present in shortlist')
+            candidates: list[SearchCandidate] = []
+            if skip_search:
+                self._record_skipped_step(
+                    steps,
+                    'search_primary_target',
+                    f'Повторный shortlist пропущен: используется заранее выбранный target {selected_target}',
+                )
+            else:
+                search_text = change_request.search_text()
+                candidates_dicts = self._run_step(
+                    steps,
+                    'search_primary_target',
+                    f'Найти shortlist по change request: {change_request.title}',
+                    lambda: [asdict(item) for item in self.project_services.search(search_text, limit=limit, use_vector_search=use_vector_search)],
+                )
+                candidates = [SearchCandidate(**item) for item in candidates_dicts]
+                if not any(item.qualname == selected_target for item in candidates):
+                    raise ValueError(f'Selected qualname {selected_target} is not present in shortlist')
 
             context_pack = self._run_step(
                 steps,
@@ -202,13 +211,16 @@ class PipelineService:
             generated_tests: list[dict[str, str]] = []
 
             try:
-                apply_result = self._run_step(
-                    steps,
-                    'apply_staging',
-                    'Применить сгенерированный артефакт в staging workspace',
-                    lambda: self.project_services.apply(
-                        patch_artifact_from_result(final_payload, selected_target),
-                        generated_tests=[],
+                apply_result = self._replace_active_apply_result(
+                    apply_result,
+                    self._run_step(
+                        steps,
+                        'apply_staging',
+                        'Применить сгенерированный артефакт в staging workspace',
+                        lambda: self.project_services.apply(
+                            patch_artifact_from_result(final_payload, selected_target),
+                            generated_tests=[],
+                        ),
                     ),
                 )
             except Exception as exc:
@@ -231,13 +243,16 @@ class PipelineService:
                 if not self._has_code_artifact(repair_generation.result_payload):
                     raise RuntimeError(repair_generation.result_payload.get('message') or 'codegenerator repair did not return code_artifact')
                 final_payload = repair_generation.result_payload
-                apply_result = self._run_step(
-                    steps,
-                    'apply_repair_staging',
-                    'Применить исправленный артефакт в staging workspace',
-                    lambda: self.project_services.apply(
-                        patch_artifact_from_result(final_payload, selected_target),
-                        generated_tests=[],
+                apply_result = self._replace_active_apply_result(
+                    apply_result,
+                    self._run_step(
+                        steps,
+                        'apply_repair_staging',
+                        'Применить исправленный артефакт в staging workspace',
+                        lambda: self.project_services.apply(
+                            patch_artifact_from_result(final_payload, selected_target),
+                            generated_tests=[],
+                        ),
                     ),
                 )
 
@@ -260,13 +275,16 @@ class PipelineService:
                         'applied_tests': [item['file_path'] for item in generated_tests],
                         'count': len(generated_tests),
                     }
-                    apply_result = self._run_step(
-                        steps,
-                        'apply_with_generated_tests',
-                        'Повторно применить артефакт вместе с сгенерированными тестами в staging workspace',
-                        lambda: self.project_services.apply(
-                            patch_artifact_from_result(final_payload, selected_target),
-                            generated_tests=generated_tests,
+                    apply_result = self._replace_active_apply_result(
+                        apply_result,
+                        self._run_step(
+                            steps,
+                            'apply_with_generated_tests',
+                            'Повторно применить артефакт вместе с сгенерированными тестами в staging workspace',
+                            lambda: self.project_services.apply(
+                                patch_artifact_from_result(final_payload, selected_target),
+                                generated_tests=generated_tests,
+                            ),
                         ),
                     )
             else:
@@ -300,13 +318,16 @@ class PipelineService:
                     if not self._has_code_artifact(repair_generation.result_payload):
                         raise RuntimeError(repair_generation.result_payload.get('message') or 'codegenerator repair did not return code_artifact')
                     final_payload = repair_generation.result_payload
-                    apply_result = self._run_step(
-                        steps,
-                        'apply_repair_staging',
-                        'Применить исправленный артефакт в staging workspace',
-                        lambda: self.project_services.apply(
-                            patch_artifact_from_result(final_payload, selected_target),
-                            generated_tests=generated_tests,
+                    apply_result = self._replace_active_apply_result(
+                        apply_result,
+                        self._run_step(
+                            steps,
+                            'apply_repair_staging',
+                            'Применить исправленный артефакт в staging workspace',
+                            lambda: self.project_services.apply(
+                                patch_artifact_from_result(final_payload, selected_target),
+                                generated_tests=generated_tests,
+                            ),
                         ),
                     )
                     verification_report = self._run_step(
@@ -372,6 +393,19 @@ class PipelineService:
                 self.artifacts_manager.write_bundle(run_dir, f'pipeline_run_{run_label}.json', result)
             except Exception:
                 LOGGER.exception('Failed to write pipeline run bundle in finally: %s', run_dir)
+
+    def _delete_apply_workspace(self, apply_result: ApplyResult | None) -> None:
+        if apply_result is None:
+            return
+        try:
+            self.project_services.apply_service.staging.delete_workspace(apply_result.workspace_path)
+        except Exception:
+            LOGGER.exception('Failed to delete superseded staging workspace: %s', apply_result.workspace_path)
+
+    def _replace_active_apply_result(self, current: ApplyResult | None, new_result: ApplyResult) -> ApplyResult:
+        if current is not None and current.workspace_path != new_result.workspace_path:
+            self._delete_apply_workspace(current)
+        return new_result
 
     def _has_code_artifact(self, result_payload: dict[str, Any]) -> bool:
         code_artifact = result_payload.get('code_artifact') or {}
@@ -678,6 +712,18 @@ class PipelineService:
             recommended_test_commands=apply_result.impact.recommended_test_commands,
             summary_lines=summary_lines,
         )
+
+
+    def _record_skipped_step(self, steps, step_name: str, summary: str) -> None:
+        now = datetime.now(tz=UTC).isoformat()
+        steps.append(PipelineStepRecord(
+            step_name=step_name,
+            status='ok',
+            started_at=now,
+            finished_at=now,
+            duration_ms=0,
+            summary=summary,
+        ))
 
     def _run_step(self, steps, step_name, summary, func):
         started = datetime.now(tz=UTC)

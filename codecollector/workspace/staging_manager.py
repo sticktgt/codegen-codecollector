@@ -22,3 +22,10 @@ class StagingManager:
         LOGGER.info('Creating staging workspace %s from %s', destination, source_project)
         shutil.copytree(source_project, destination)
         return destination
+
+    def delete_workspace(self, workspace: Path) -> None:
+        workspace = workspace.resolve()
+        if not workspace.exists():
+            return
+        LOGGER.info('Deleting staging workspace %s', workspace)
+        shutil.rmtree(workspace, ignore_errors=False)

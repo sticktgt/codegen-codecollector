@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import argparse
@@ -10,10 +11,15 @@ from typing import Any
 
 import yaml
 
+from codecollector.analysis.analyze_service import AnalyzeService
 from codecollector.config import load_config
 from codecollector.domain.models import ChangeRequest, PatchArtifact, PipelineRunResult
 from codecollector.logger import configure_logging, get_logger
+from codecollector.onboarding.onboarding_service import OnboardingService
 from codecollector.orchestration.services import ProjectServices
+from codecollector.projects.project_service import ProjectService
+from codecollector.sessions.session_service import SessionService
+from codecollector.workspace.workspace_service import WorkspaceService
 
 LOGGER = get_logger(__name__)
 PATCH_OPERATIONS = ('replace_symbol', 'insert_after_symbol', 'add_symbol')
@@ -28,6 +34,75 @@ def build_parser() -> argparse.ArgumentParser:
     index_build = index_sub.add_parser('build')
     index_build.add_argument('--project', required=True)
     index_build.add_argument('--full', action='store_true')
+
+    projects_parser = subparsers.add_parser('projects')
+    projects_sub = projects_parser.add_subparsers(dest='projects_command', required=True)
+
+    project_register = projects_sub.add_parser('register')
+    project_register.add_argument('--project-root', required=True)
+    project_register.add_argument('--project-name')
+    project_register.add_argument('--language', action='append', dest='languages', default=[])
+    project_register.add_argument('--verification-command', action='append', default=[])
+    project_register.add_argument('--index-exclude', action='append', default=[])
+    project_register.add_argument('--reference-library-path', action='append', default=[])
+
+    projects_sub.add_parser('list')
+
+    project_get = projects_sub.add_parser('get')
+    project_get.add_argument('--project-id', required=True)
+
+    project_delete = projects_sub.add_parser('delete')
+    project_delete.add_argument('--project-id', required=True)
+
+    project_onboard = projects_sub.add_parser('onboard')
+    project_onboard.add_argument('--project-id', required=True)
+    project_onboard.add_argument('--full', action='store_true')
+
+    sessions_parser = subparsers.add_parser('sessions')
+    sessions_sub = sessions_parser.add_subparsers(dest='sessions_command', required=True)
+
+    session_analyze = sessions_sub.add_parser('analyze')
+    session_analyze.add_argument('--project-id', required=True)
+    session_analyze.add_argument('--change-request-file')
+    session_analyze.add_argument('--title')
+    session_analyze.add_argument('--description')
+    session_analyze.add_argument('--constraint', action='append', default=[])
+    session_analyze.add_argument('--note', action='append', default=[])
+    session_analyze.add_argument('--limit', type=int)
+
+    sessions_sub.add_parser('list')
+
+    session_finalize = sessions_sub.add_parser('finalize')
+    session_finalize.add_argument('--session-id', required=True)
+    session_finalize.add_argument('--keep-workspace', action='store_true')
+
+    session_get = sessions_sub.add_parser('get')
+    session_get.add_argument('--session-id', required=True)
+
+    session_delete = sessions_sub.add_parser('delete')
+    session_delete.add_argument('--session-id', required=True)
+
+    session_select = sessions_sub.add_parser('select-target')
+    session_select.add_argument('--session-id', required=True)
+    session_select.add_argument('--selected-qualname', required=True)
+
+    session_generate = sessions_sub.add_parser('generate')
+    session_generate.add_argument('--session-id', required=True)
+    session_generate.add_argument('--selected-qualname')
+    session_generate.add_argument('--limit', type=int)
+    session_generate.add_argument('--disable-vector-search', action='store_true')
+
+    workspaces_parser = subparsers.add_parser('workspaces')
+    workspaces_sub = workspaces_parser.add_subparsers(dest='workspaces_command', required=True)
+
+    workspace_get = workspaces_sub.add_parser('get')
+    workspace_get.add_argument('--workspace-id', required=True)
+
+    workspace_diff = workspaces_sub.add_parser('diff')
+    workspace_diff.add_argument('--workspace-id', required=True)
+
+    workspace_apply = workspaces_sub.add_parser('apply')
+    workspace_apply.add_argument('--workspace-id', required=True)
 
     search_parser = subparsers.add_parser('search')
     search_parser.add_argument('--project', required=True)
@@ -84,7 +159,104 @@ def main() -> None:
     config = load_config()
     configure_logging(config.log_level, config.log_format)
 
+    project_service = ProjectService(config.root_path, config)
+    onboarding_service = OnboardingService(config.root_path, config)
+    analyze_service = AnalyzeService(config.root_path, config)
+    session_service = SessionService(config.root_path, config)
+    workspace_service = WorkspaceService(config.root_path, config)
+
     try:
+        if args.command == 'projects' and args.projects_command == 'register':
+            project = project_service.register_project(
+                project_name=args.project_name or Path(args.project_root).resolve().name,
+                project_root=Path(args.project_root),
+                languages=args.languages or ['python'],
+                verification_commands=[str(item) for item in args.verification_command],
+                index_excludes=[str(item) for item in args.index_exclude],
+                reference_library_paths=[str(item) for item in args.reference_library_path],
+            )
+            print(json.dumps(asdict(project), ensure_ascii=False, indent=2))
+            return
+
+        if args.command == 'projects' and args.projects_command == 'list':
+            print(json.dumps([asdict(item) for item in project_service.list_projects()], ensure_ascii=False, indent=2))
+            return
+
+        if args.command == 'projects' and args.projects_command == 'get':
+            print(json.dumps(asdict(project_service.get_project(args.project_id)), ensure_ascii=False, indent=2))
+            return
+
+        if args.command == 'projects' and args.projects_command == 'delete':
+            deleted = project_service.delete_project_registration(args.project_id)
+            print(json.dumps({'project_id': args.project_id, 'deleted': deleted}, ensure_ascii=False, indent=2))
+            return
+
+        if args.command == 'projects' and args.projects_command == 'onboard':
+            result = onboarding_service.onboard_project(args.project_id, full_rebuild=args.full)
+            print(json.dumps(asdict(result), ensure_ascii=False, indent=2))
+            return
+
+        if args.command == 'sessions' and args.sessions_command == 'analyze':
+            project = project_service.get_project(args.project_id)
+            change_request = _load_change_request(args, project.project_name)
+            requirement_payload = {
+                'title': change_request.title,
+                'description': change_request.description,
+                'constraints': list(change_request.constraints),
+            }
+            result = analyze_service.analyze(
+                project_id=args.project_id,
+                input_requirements=[requirement_payload],
+                limit=args.limit or config.search_default_limit,
+            )
+            print(json.dumps(asdict(result), ensure_ascii=False, indent=2))
+            return
+
+        if args.command == 'sessions' and args.sessions_command == 'list':
+            print(json.dumps(session_service.list_sessions(), ensure_ascii=False, indent=2))
+            return
+
+        if args.command == 'sessions' and args.sessions_command == 'get':
+            print(json.dumps(session_service.get_session(args.session_id), ensure_ascii=False, indent=2))
+            return
+
+        if args.command == 'sessions' and args.sessions_command == 'delete':
+            deleted = session_service.delete_session(args.session_id)
+            print(json.dumps({'session_id': args.session_id, 'deleted': deleted}, ensure_ascii=False, indent=2))
+            return
+
+        if args.command == 'sessions' and args.sessions_command == 'finalize':
+            result = session_service.finalize(args.session_id, delete_workspace=not args.keep_workspace)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return
+
+        if args.command == 'sessions' and args.sessions_command == 'select-target':
+            result = session_service.select_target(args.session_id, args.selected_qualname)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return
+
+        if args.command == 'sessions' and args.sessions_command == 'generate':
+            result = session_service.generate(
+                session_id=args.session_id,
+                selected_target=args.selected_qualname,
+                limit=args.limit or config.search_default_limit,
+                use_vector_search=not args.disable_vector_search,
+            )
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return
+
+        if args.command == 'workspaces' and args.workspaces_command == 'get':
+            print(json.dumps(workspace_service.get_workspace(args.workspace_id), ensure_ascii=False, indent=2))
+            return
+
+        if args.command == 'workspaces' and args.workspaces_command == 'diff':
+            print(json.dumps(workspace_service.diff_workspace(args.workspace_id), ensure_ascii=False, indent=2))
+            return
+
+        if args.command == 'workspaces' and args.workspaces_command == 'apply':
+            print(json.dumps(workspace_service.apply_workspace(args.workspace_id), ensure_ascii=False, indent=2))
+            return
+
         if args.command == 'ui':
             launch_streamlit_ui(config.root_path, server_port=args.server_port, server_address=args.server_address)
             return
@@ -239,8 +411,8 @@ def _pipeline_payload(result: PipelineRunResult) -> dict:
                 'issues': [asdict(item) for item in result.apply_result.validation.issues],
             },
             'impact': asdict(result.apply_result.impact),
-        },
-        'merge_plan': asdict(result.merge_plan),
+        } if result.apply_result else None,
+        'merge_plan': asdict(result.merge_plan) if result.merge_plan else None,
     }
 
 

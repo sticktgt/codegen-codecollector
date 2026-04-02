@@ -28,47 +28,54 @@ class ApplyService:
     def apply_artifact(self, source_project: Path, artifact: PatchArtifact, generated_tests: list[dict[str, str]] | None = None) -> ApplyResult:
         source_project = source_project.resolve()
         workspace = self.staging.create_workspace(source_project)
-        project_key = str(workspace)
-        store = create_index_store(workspace, self.config)
-        overlays = OverlayService(workspace, overlay_dirname=self.overlay_dirname)
-        builder = PythonIndexBuilder(workspace, store)
-        builder.build(full_rebuild=True)
-        store.replace_knowledge_relations(project_key, overlays.knowledge_relations())
-
-        symbol = store.get_symbol(project_key, artifact.target_qualname)
-        if symbol is None:
-            raise ValueError(f'Unknown qualname in workspace: {artifact.target_qualname}')
-
-        target_path = workspace / symbol.file_path
-        before_path = source_project / symbol.file_path
-        self._apply_operation_to_file(target_path, symbol, artifact)
-        changed_files = [target_path]
-        for test_artifact in generated_tests or []:
-            test_path = workspace / str(test_artifact['file_path'])
-            test_path.parent.mkdir(parents=True, exist_ok=True)
-            test_source = str(test_artifact['source_code']).rstrip('\n') + '\n'
-            ast.parse(test_source)
-            test_path.write_text(test_source, encoding='utf-8')
-            changed_files.append(test_path)
-        validation = ValidationService().validate_project(workspace, changed_files=changed_files)
-
-        reindexed = False
-        if validation.is_valid:
-            LOGGER.info('Targeted reindex of changed workspace files after successful validation: %s', workspace)
-            reindex_report = builder.build_changed_files(changed_files)
+        try:
+            project_key = str(workspace)
+            store = create_index_store(workspace, self.config)
+            overlays = OverlayService(workspace, overlay_dirname=self.overlay_dirname)
+            builder = PythonIndexBuilder(workspace, store)
+            builder.build(full_rebuild=True)
             store.replace_knowledge_relations(project_key, overlays.knowledge_relations())
-            reindexed = reindex_report.indexed_files > 0
 
-        diff = self.diff_service.summarize_file_change(before_path, target_path)
-        impact = self._build_impact_summary(
-            project_key,
-            store,
-            overlays,
-            artifact.target_qualname,
-            changed_files=[str(path.relative_to(workspace)) for path in changed_files],
-            validation_ok=validation.is_valid,
-        )
-        return ApplyResult(workspace, artifact, diff, validation, reindexed, impact)
+            symbol = store.get_symbol(project_key, artifact.target_qualname)
+            if symbol is None:
+                raise ValueError(f'Unknown qualname in workspace: {artifact.target_qualname}')
+
+            target_path = workspace / symbol.file_path
+            before_path = source_project / symbol.file_path
+            self._apply_operation_to_file(target_path, symbol, artifact)
+            changed_files = [target_path]
+            for test_artifact in generated_tests or []:
+                test_path = workspace / str(test_artifact['file_path'])
+                test_path.parent.mkdir(parents=True, exist_ok=True)
+                test_source = str(test_artifact['source_code']).rstrip('\n') + '\n'
+                ast.parse(test_source)
+                test_path.write_text(test_source, encoding='utf-8')
+                changed_files.append(test_path)
+            validation = ValidationService().validate_project(workspace, changed_files=changed_files)
+
+            reindexed = False
+            if validation.is_valid:
+                LOGGER.info('Targeted reindex of changed workspace files after successful validation: %s', workspace)
+                reindex_report = builder.build_changed_files(changed_files)
+                store.replace_knowledge_relations(project_key, overlays.knowledge_relations())
+                reindexed = reindex_report.indexed_files > 0
+
+            diff = self.diff_service.summarize_file_change(before_path, target_path)
+            impact = self._build_impact_summary(
+                project_key,
+                store,
+                overlays,
+                artifact.target_qualname,
+                changed_files=[str(path.relative_to(workspace)) for path in changed_files],
+                validation_ok=validation.is_valid,
+            )
+            return ApplyResult(workspace, artifact, diff, validation, reindexed, impact)
+        except Exception:
+            try:
+                self.staging.delete_workspace(workspace)
+            except Exception:
+                LOGGER.exception('Failed to delete staging workspace after apply failure: %s', workspace)
+            raise
 
     def _apply_operation_to_file(self, target_path: Path, symbol: SymbolRecord, artifact: PatchArtifact) -> None:
         LOGGER.info('Applying %s for %s in %s', artifact.operation, symbol.qualname, target_path)

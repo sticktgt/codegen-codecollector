@@ -132,6 +132,7 @@ class ProjectServices:
         selected_target: str,
         limit: int | None = None,
         use_vector_search: bool | None = None,
+        skip_search: bool = False,
     ) -> PipelineRunResult:
         LOGGER.info('Running generate pipeline for %s with target %s', self.project_root, selected_target)
         return self.pipeline_service.run_generate(
@@ -139,6 +140,7 @@ class ProjectServices:
             selected_target=selected_target,
             limit=limit or self.config.search_default_limit,
             use_vector_search=use_vector_search,
+            skip_search=skip_search,
         )
 
     def _sync_search_documents(self) -> dict[str, int | bool]:

@@ -24,6 +24,7 @@ class AppConfig:
     log_level: str
     log_format: str
     ui_default_demo_project: str
+    state_root_dirname: str
     storage_backend: str
     postgres_graph_connection: str
     postgres_vector_connection: str
@@ -156,6 +157,7 @@ def load_config(config_path: Path | None = None) -> AppConfig:
         log_level=str(payload.get('logging', {}).get('level', 'INFO')),
         log_format=str(payload.get('logging', {}).get('format', '%(asctime)s | %(levelname)s | %(name)s | %(message)s')),
         ui_default_demo_project=str(payload.get('ui', {}).get('default_demo_project', 'demo_projects/sample_python_app')),
+        state_root_dirname=str(payload.get('state', {}).get('root_dirname', '.state')),
         storage_backend=str(payload.get('storage', {}).get('backend', 'postgres')),
         postgres_graph_connection=str(payload.get('postgres', {}).get('graph_connection', '')),
         postgres_vector_connection=str(payload.get('postgres', {}).get('vector_connection', '')),
