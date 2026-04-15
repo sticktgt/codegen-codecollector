@@ -1,18 +1,10 @@
 # codecollector
 
-`codecollector` — оркестратор пайплайна подготовки и применения точечных изменений кода по change request.
+`codecollector` — оркестратор пайплайна подготовки и проверки точечных изменений кода по change request.
 
-Проект ориентирован на локальные LLM и ограниченный размер контекста. Его задача — не «генерировать код внутри себя», а:
+Проект ориентирован на локальные LLM и ограниченный размер контекста. Его задача — не генерировать код внутри себя, а подготовить проектный контекст, выбрать или подтвердить target для изменения, вызвать внешний `codegenerator`, применить результат в staging workspace, запустить проверки и сохранить артефакты запуска для анализа и отладки.
 
-- проиндексировать проект;
-- найти или подтвердить target для изменения;
-- собрать структурированный контекст;
-- вызвать внешний `codegenerator`;
-- применить результат в staging workspace;
-- запустить проверки;
-- сохранить артефакты запуска для анализа и отладки.
-
-Текущая реализация ориентирована прежде всего на Python-проекты и dry-run сценарий с ручным решением о merge.
+Текущая реализация ориентирована прежде всего на Python-проекты и dry-run сценарий с ручным решением о переносе изменений в основной проект.
 
 ---
 
@@ -20,52 +12,84 @@
 
 `codecollector` нужен как внешний orchestration-слой вокруг LLM-генерации.
 
-Он решает задачи, которые неудобно или опасно перекладывать на модель напрямую:
+Он решает задачи, которые неудобно или рискованно перекладывать на модель напрямую:
 
-- подготовка технического представления проекта;
-- поиск основного места изменения;
-- выбор связанного контекста;
-- подбор reference-артефактов;
-- формирование структурированного request для внешнего генератора;
-- применение результата не в master, а в отдельный staging workspace;
-- запуск автоматических проверок;
-- формирование отчета по шагам пайплайна.
+- строит техническое представление проекта;
+- ищет основное место изменения;
+- собирает связанный контекст;
+- подбирает reference-артефакты;
+- формирует структурированный request для внешнего генератора;
+- применяет результат не в основной проект, а в staging workspace;
+- запускает автоматические проверки;
+- формирует отчет по шагам пайплайна.
 
-`codecollector` **не занимается низкоуровневым prompt trimming по символам**. Его зона ответственности — структурный отбор контекста. Основное budget-ограничение prompt и runtime trimming выполняет `codegenerator`.
+`codecollector` не занимается низкоуровневым trimming prompt по символам. Его зона ответственности — структурный отбор контекста. Основное runtime-ужатие prompt и контроль budget выполняет `codegenerator`.
 
 ---
 
-## Текущая общая схема работы
+## Что считается текущим рабочим сценарием
 
-Типовой сценарий `pipeline generate` выглядит так:
+Текущий рабочий сценарий — dry-run pipeline для точечного изменения Python-кода:
 
-1. обновление индекса проекта;
-2. обновление search documents и vector index, если код изменился;
-3. поиск shortlist кандидатов по change request;
-4. выбор или подтверждение target-символа;
-5. сбор context pack;
-6. подбор reference-артефактов;
-7. формирование `GenerationRequest`;
-8. внешний вызов `codegenerator generate`;
-9. применение полученного артефакта в staging workspace;
-10. при необходимости внешний вызов `codegenerator repair` и повторное применение;
-11. отдельный внешний вызов `codegenerator generate-test`;
-12. применение сгенерированного теста в staging workspace;
-13. verification (`ast_parse`, `py_compile`, `pytest_recommended`);
-14. формирование dry-run merge plan и итогового run-report.
+1. обновить индекс проекта;
+2. при необходимости обновить search documents и vector index;
+3. найти shortlist кандидатов по change request;
+4. выбрать или подтвердить target-символ;
+5. собрать context pack;
+6. подобрать reference-артефакты;
+7. сформировать `GenerationRequest`;
+8. вызвать внешний `codegenerator` в режиме `generate`;
+9. применить артефакт в staging workspace;
+10. при необходимости вызвать `repair` и повторно применить результат;
+11. вызвать `generate-test`;
+12. применить сгенерированный тест в staging workspace;
+13. выполнить verification;
+14. сформировать dry-run merge plan и итоговый run report.
 
-На практике пайплайн может идти по одной из веток:
+На практике пайплайн может проходить по разным веткам:
 
-- **без repair** — если `generate` сразу выдал валидный код;
-- **с repair** — если сгенерированный артефакт не применился или не прошел проверки;
-- **без generated test apply** — если тест не был сгенерирован или был пропущен;
-- **с generated test apply** — если тестовый артефакт успешно получен и применяется вместе с кодом.
+- без `repair`, если `generate` сразу выдал корректный результат;
+- с `repair`, если артефакт не применился или не прошел проверки;
+- без применения сгенерированного теста, если тест не был создан или был пропущен;
+- с применением сгенерированного теста, если тестовый артефакт успешно получен и включен в workspace.
+
+Итоговое решение о переносе изменений в основной проект по-прежнему принимает человек или внешний управляющий слой.
+
+---
+
+## Requested operation
+
+В analyze/generate flow операция изменения передается явно через `requested_operation`.
+
+Сейчас поддерживаются две операции:
+
+- `replace_symbol`
+- `insert_after_symbol`
+
+### Семантика операций
+
+`replace_symbol`:
+- выбранный target — это symbol, который должен быть заменен.
+
+`insert_after_symbol`:
+- выбранный target — это symbol-anchor;
+- новый symbol вставляется после выбранного anchor;
+- shortlist для analyze строится с учетом отдельного профиля ранжирования.
+
+### Operation-aware analyze
+
+Для `insert_after_symbol` анализ предпочитает:
+
+- `class` и другие declaration-style symbol;
+- domain/model модули для запросов на добавление dataclass, model, schema.
+
+Для `replace_symbol` анализ по умолчанию предпочитает symbol, который наиболее прямо соответствует изменяемому поведению.
 
 ---
 
 ## Разделение ответственности между `codecollector` и `codegenerator`
 
-Текущее разграничение такое.
+Текущее разграничение ответственности следующее.
 
 ### `codecollector` отвечает за
 
@@ -78,7 +102,7 @@
   - передавать ли `full_file_source`;
   - сколько related tests передавать;
   - сколько reference artifacts передавать;
-  - передавать ли reference для `generate-test`;
+  - передавать ли reference-контекст для `generate-test`;
 - подготовку `GenerationRequest` и `RepairRequest`;
 - вызов CLI внешнего генератора;
 - применение результата и проверки;
@@ -91,10 +115,10 @@
 - runtime trimming;
 - вызов LLM;
 - разбор ответа модели;
-- нормализацию `code_artifact` / `test_artifact`;
+- нормализацию `code_artifact` и `test_artifact`;
 - trace и метрики вызова модели.
 
-Это текущее разделение является целевым и должно сохраняться при дальнейших изменениях.
+Это разделение является текущей целевой моделью и должно сохраняться при дальнейших изменениях.
 
 ---
 
@@ -116,13 +140,13 @@
 
 Индекс используется для:
 
-- поиска подходящего target по change request;
+- поиска target по change request;
 - построения графа связей;
 - формирования `context pack`;
 - impact analysis после применения изменения;
 - выбора связанных тестов и соседнего контекста.
 
-### `knowledge.yaml`
+### knowledge.yaml
 
 `knowledge.yaml` — человекочитаемый слой описания проекта рядом с кодом.
 
@@ -138,7 +162,7 @@
 В текущем подходе `knowledge.yaml` рассматривается как полуавтоматический артефакт:
 
 - он может быть сгенерирован автоматически;
-- затем может быть уточнен аналитиком вручную.
+- затем может быть уточнен вручную.
 
 ### Semantic search и search documents
 
@@ -152,7 +176,7 @@
 - связанные требования;
 - часть контекста по модулю.
 
-На выходе search дает shortlist кандидатов с объяснением причин выбора.
+На выходе search возвращает shortlist кандидатов с объяснением причин выбора.
 
 ### Context pack
 
@@ -161,16 +185,16 @@
 Обычно включает:
 
 - target-символ со source-кодом;
-- module outline;
+- `module_outline`;
 - соседний модульный контекст;
 - inbound/outbound relations;
 - связанные требования;
-- recommended tests;
-- related tests.
+- `recommended_tests`;
+- `related_tests`.
 
 ### Reference library
 
-`reference_library/` содержит дополнительные reference-артефакты, которые можно добавлять в context.
+`reference_library/` содержит дополнительные reference-артефакты, которые можно добавлять в контекст.
 
 Сейчас они используются как вспомогательный слой для генерации, например:
 
@@ -178,11 +202,11 @@
 - примеры паттернов;
 - reference snippets.
 
-### Вызов внешнего `codegenerator`
+### Вызов внешнего codegenerator
 
-`codecollector` вызывает внешний генератор через файловый request и получает машинно-читаемый JSON-результат.
+`codecollector` вызывает внешний генератор через файловый request и получает машиночитаемый JSON-результат.
 
-Используются три режима:
+Сейчас используются три режима:
 
 - `generate` — генерация production-кода;
 - `generate-test` — генерация тестового файла;
@@ -221,7 +245,7 @@
 - request и result внешних вызовов;
 - stderr внешнего генератора;
 - итоговый `pipeline_run_*.json`;
-- дополнительные метаданные шага.
+- дополнительные метаданные шагов.
 
 Это основной материал для отладки, сравнения запусков и анализа качества пайплайна.
 
@@ -231,17 +255,17 @@
 
 `codecollector` не должен заниматься низкоуровневым символьным trimming.
 
-В текущей реализации он уменьшает контекст **структурно**:
+В текущей реализации он уменьшает контекст структурно:
 
-- отказом от передачи полного файла там, где достаточно target-symbol;
-- выбором числа related tests;
-- выбором числа reference-артефактов;
-- исключением reference-контекста из `generate-test`;
-- включением полного файла для `generate-test`, когда это полезно для import-контекста.
+- не передает полный файл там, где достаточно target-symbol;
+- ограничивает число related tests;
+- ограничивает число reference-артефактов;
+- исключает reference-контекст из `generate-test`;
+- включает полный файл для `generate-test`, когда это полезно для import-контекста.
 
 Основное ужатие prompt выполняется внутри `codegenerator`.
 
-В `request_payload` и логах `codecollector` при этом сохраняются метрики размера контекста, например:
+При этом в `request_payload` и логах `codecollector` сохраняются метрики размера контекста, например:
 
 - `request_chars`;
 - `target_source_chars`;
@@ -252,9 +276,9 @@
 
 ---
 
-## Контракт вызова внешнего `codegenerator`
+## Контракт вызова внешнего codegenerator
 
-### `GenerationRequest`
+### GenerationRequest
 
 Используется для режимов `generate` и `generate-test`.
 
@@ -270,7 +294,7 @@
 - `options`;
 - `context_metrics`.
 
-#### `change_request`
+#### change_request
 
 Поля:
 
@@ -279,7 +303,7 @@
 - `constraints`;
 - `notes`.
 
-#### `target`
+#### target
 
 Поля:
 
@@ -287,7 +311,7 @@
 - `file_path`;
 - `operation`.
 
-#### `project_context`
+#### project_context
 
 Поля:
 
@@ -297,18 +321,18 @@
 - `related_tests`;
 - `recommended_tests`.
 
-#### `reference_context`
+#### reference_context
 
 Поля:
 
 - `reference_summary`;
 - `reference_artifacts`.
 
-#### `generated_code_artifact`
+#### generated_code_artifact
 
 Используется в связанных сценариях, прежде всего в `generate-test`, когда тест строится уже по сгенерированному production-коду.
 
-### `RepairRequest`
+### RepairRequest
 
 Используется для режима `repair`.
 
@@ -324,7 +348,7 @@
 - `reference_context`;
 - `options`.
 
-### `GenerationResult`
+### GenerationResult
 
 В ответ внешний генератор возвращает JSON со следующими основными полями:
 
@@ -341,39 +365,97 @@
 
 ---
 
+## Session, run и workspace
+
+### Session
+
+`session` — логическая единица работы по одному change request или по небольшому набору связанных требований.
+
+Session хранит:
+
+- входные требования;
+- `requested_operation`;
+- историю запусков;
+- историю финальных workspace;
+- текущий выбранный target;
+- ссылки на последний run и последний workspace.
+
+### Run
+
+`run` — один запуск пайплайна внутри session.
+
+Один run соответствует одному внешнему шагу изменения, например:
+
+- `generate`;
+- `repair`;
+- в дальнейшем — отдельным ручным повторным действиям.
+
+Для каждого run снаружи значим только один финальный workspace.
+
+### Workspace
+
+`workspace` — staging-копия проекта для конкретного run.
+
+Внутри run могут создаваться промежуточные workspace, но после завершения run остается только один финальный workspace, который и используется для diff, review и dry-run merge plan.
+
+---
+
 ## CLI
 
-### Основной pipeline generate
+### Session-based flow для замены существующего symbol
 
 ```bash
-python -m codecollector pipeline generate \
-  --project demo_projects/sample_python_app \
-  --title "Изменить текст уведомления о назначении тикета" \
-  --description "Сделать уведомление на русском языке, но использовать формулировку «успешно назначен сотруднику»." \
-  --constraint "Не менять внешний контракт API" \
-  --constraint "Изменить только текст уведомления" \
-  --selected-qualname support_app.services.notification_service.build_assignment_message
+python -m codecollector sessions analyze   --project-id <project_id>   --title "Изменить текст уведомления о назначении тикета"   --description "Сделать уведомление на русском языке, но использовать формулировку «успешно назначен сотруднику»."   --constraint "Не менять внешний контракт API"   --operation replace_symbol
+
+python -m codecollector sessions select-target   --session-id <session_id>   --selected-qualname support_app.services.notification_service.build_assignment_message
+
+python -m codecollector sessions generate   --session-id <session_id>
 ```
 
-### Пример более подробного change request
+### Session-based flow для вставки нового symbol
 
 ```bash
-python -m codecollector pipeline generate \
-  --project demo_projects/sample_python_app \
-  --title "Изменить текст уведомления о назначении тикета на русский язык" \
-  --description "Сделать уведомление полностью русскоязычным и пригодным для UI." \
-  --constraint "Не менять внешний контракт API" \
-  --constraint "Не менять сигнатуру функции" \
-  --constraint "Изменить только текст уведомления" \
-  --constraint "Не использовать англоязычные слова" \
-  --selected-qualname support_app.services.notification_service.build_assignment_message
+python -m codecollector sessions analyze   --project-id <project_id>   --title "Добавить Dataclass модели адреса"   --description "Добавить Dataclass модели адреса с минимальным количеством полей"   --constraint "Добавляем только Dataclass описания модели"   --operation insert_after_symbol
+
+python -m codecollector sessions select-target   --session-id <session_id>   --selected-qualname support_app.domain.models.AgentSummary
+
+python -m codecollector sessions generate   --session-id <session_id>
 ```
 
-### Отдельные режимы
+### Низкоуровневый pipeline generate
 
-В зависимости от текущего CLI проекта могут быть доступны и более низкоуровневые команды для поиска, индексации, контекста и применения.
+```bash
+python -m codecollector pipeline generate   --project demo_projects/sample_python_app   --title "Изменить текст уведомления о назначении тикета"   --description "Сделать уведомление полностью русскоязычным и пригодным для UI."   --constraint "Не менять внешний контракт API"   --constraint "Не менять сигнатуру функции"   --selected-qualname support_app.services.notification_service.build_assignment_message   --operation replace_symbol
+```
 
-README фиксирует только актуальный основной dry-run сценарий, на который сейчас опирается связка `codecollector` + `codegenerator`.
+### Другие команды
+
+В зависимости от сценария доступны и более низкоуровневые команды:
+
+- `projects register`
+- `projects onboard`
+- `projects list`
+- `projects get`
+- `projects delete`
+- `sessions analyze`
+- `sessions select-target`
+- `sessions generate`
+- `sessions repair`
+- `sessions finalize`
+- `sessions get`
+- `sessions list`
+- `sessions delete`
+- `workspaces get`
+- `workspaces diff`
+- `workspaces apply`
+- `pipeline generate`
+- `pipeline replay`
+- `search search`
+- `context context`
+- `index build`
+- `apply apply`
+
+README фиксирует актуальный dry-run сценарий как для `pipeline generate`, так и для session-based flow с явным `requested_operation`.
 
 ---
 
@@ -391,7 +473,7 @@ README фиксирует только актуальный основной dry
 - настройки verification;
 - настройки trace и логирования.
 
-Принцип текущей реализации:
+Базовый принцип текущей реализации:
 
 - проектные и runtime-настройки должны жить в конфиге;
 - в коде не должно оставаться критичных hardcoded runtime-значений, завязанных на конкретную модель.
@@ -480,44 +562,47 @@ Streamlit-приложение для просмотра логов запуск
 
 ---
 
-## Что считается текущим рабочим сценарием
-
-Текущий рабочий сценарий — это dry-run pipeline для точечного изменения Python-кода:
-
-- найти target;
-- собрать контекст;
-- сгенерировать артефакт через внешний `codegenerator`;
-- применить его в staging workspace;
-- при необходимости выполнить `repair`;
-- сгенерировать тест;
-- прогнать verification;
-- подготовить dry-run merge plan.
-
-Итоговое решение о merge по-прежнему принимает человек.
-
----
-
 ## Текущие ограничения
 
 На текущем этапе проект имеет следующие ограничения:
 
 - основная поддержка — Python;
 - основная схема — локальные модели через Ollama;
-- текущий storage/vector stack ориентирован на PostgreSQL/pgvector;
-- merge выполняется как dry-run, без автоматического переноса в master;
+- текущий storage/vector stack ориентирован на PostgreSQL и pgvector;
+- merge выполняется как dry-run, без автоматического переноса изменений в основной проект;
 - часть сценариев `generate` все еще может требовать `repair`;
-- качество `generate-test` зависит от выбранной модели и доступного контекста.
+- качество `generate-test` зависит от выбранной модели и доступного контекста;
+- текущий основной внешний контракт — CLI, а не HTTP API.
 
 ---
 
-## Ближайшие направления развития
+## TODO
 
-Актуальные направления дальнейшего развития:
+Ниже перечислены направления следующих версий, которые важно сохранить в плане развития.
 
-- onboarding нового проекта в работу;
-- автоматическая первичная генерация `knowledge.yaml`;
-- дальнейшее развитие language-agnostic orchestration core;
-- поддержка новых языков через адаптеры;
-- развитие правил структурного отбора контекста;
-- улучшение стабильности `generate` и `generate-test`;
-- постепенный переход от CLI-вызова внешнего генератора к локальному сервису/API с сохранением текущего JSON-контракта.
+### По codecollector
+
+- выделить полноценный HTTP API поверх текущего CLI-контракта;
+- оформить завершенный lifecycle для проектов, session, run и workspace;
+- сделать apply в основной проект отдельной полностью оформленной операцией;
+- добавить повторный onboarding после успешного apply;
+- развить onboarding нового проекта как стандартный входной сценарий;
+- улучшить автоматическую первичную генерацию `knowledge.yaml`;
+- расширить поддержку новых языков через адаптеры;
+- развить language-agnostic orchestration core;
+- продолжить улучшение стабильности `generate` и `generate-test`.
+
+### По связке с codegenerator
+
+- сохранить текущий JSON-контракт между проектами;
+- при переходе с CLI на локальный сервис не менять семантику `GenerationRequest`, `RepairRequest` и `GenerationResult`;
+- продолжить работу над качеством генерации тестов на более мощных моделях;
+- отдельно доработать сценарии работы с дополнительными библиотеками и reference-контекстом в `codegenerator`.
+
+---
+
+## Итог
+
+`codecollector` в текущем состоянии — это orchestration-слой для controlled dry-run изменения кода с явным выбором target, структурным отбором контекста, внешней генерацией через `codegenerator`, применением в staging workspace и обязательной проверкой результата.
+
+Его ключевая роль — не заменить моделью весь процесс изменения кода, а сделать этот процесс управляемым, воспроизводимым и пригодным для анализа.

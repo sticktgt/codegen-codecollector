@@ -9,13 +9,16 @@ from codecollector.domain.models import ChangeRequest, ContextPack, SearchCandid
 from codecollector.orchestration.services import ProjectServices
 from codecollector.projects.project_service import ProjectService
 from codecollector.sessions.session_service import SessionService
+from codecollector.logger import get_logger
 
+LOGGER = get_logger(__name__)
 
 @dataclass(slots=True)
 class AnalyzeSessionResult:
     session_id: str
     project_id: str
     input_requirements: list[dict[str, Any]]
+    requested_operation: str
     candidates: list[SearchCandidate]
     recommended_target: str | None
     context_summary: dict[str, Any] | None
@@ -33,29 +36,59 @@ class AnalyzeService:
         *,
         project_id: str,
         input_requirements: list[dict[str, Any]],
+        requested_operation: str = 'replace_symbol',
         limit: int | None = None,
         use_vector_search: bool | None = None,
     ) -> AnalyzeSessionResult:
         project = self.projects.get_project(project_id)
         if project.status not in ('ready', 'registered'):
             raise ValueError(f'Project {project_id} has unsupported status for analyze: {project.status}')
-        session = self.sessions.create_session(project_id=project_id, input_requirements=input_requirements)
+
+        session = self.sessions.create_session(
+            project_id=project_id,
+            input_requirements=input_requirements,
+            requested_operation=requested_operation,
+        )
+
+        LOGGER.info(
+            "Analyze created session: session_id=%s project_id=%s requested_operation=%s",
+            session["session_id"],
+            project_id,
+            requested_operation,
+        )
+
         query = self._build_query(input_requirements)
         services = ProjectServices(Path(project.project_root), tool_root=self.tool_root, config=self.config)
         candidates = services.search(
             query=query,
             limit=limit or self.config.search_default_limit,
             use_vector_search=use_vector_search,
+            requested_operation=requested_operation,
         )
         recommended_target = candidates[0].qualname if candidates else None
         context_summary = None
         if recommended_target:
             context_summary = self._context_summary(services.context(recommended_target))
-        self.sessions.mark_analyzed(session["session_id"], recommended_target=recommended_target)
+
+        self.sessions.mark_analyzed(
+            session["session_id"],
+            recommended_target=recommended_target,
+            requested_operation=requested_operation,
+        )
+
+        LOGGER.info(
+            "Analyze marked session: session_id=%s recommended_target=%s requested_operation=%s candidates_count=%s",
+            session["session_id"],
+            recommended_target,
+            requested_operation,
+            len(candidates),
+        )
+
         return AnalyzeSessionResult(
             session_id=session["session_id"],
             project_id=project_id,
             input_requirements=input_requirements,
+            requested_operation=requested_operation,
             candidates=candidates,
             recommended_target=recommended_target,
             context_summary=context_summary,

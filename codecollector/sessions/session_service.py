@@ -14,6 +14,10 @@ from codecollector.projects.project_service import ProjectService
 from codecollector.sessions.session_registry import SessionRegistry
 from codecollector.state.ids import new_session_id
 
+from codecollector.orchestration.pipeline_service import PipelineRunFailed
+
+import json
+
 LOGGER = get_logger(__name__)
 
 
@@ -28,8 +32,62 @@ class SessionService:
         self.registry = SessionRegistry(self.tool_root, self.config)
         self.project_service = ProjectService(self.tool_root, self.config)
 
+    def _repair_outcome(self, result: PipelineRunResult) -> str:
+        verification = result.verification_report or {}
+        if verification.get('passed', False):
+            return 'repaired'
+        failure_summary = verification.get('failure_summary') or {}
+        failed_checks = [str(item) for item in failure_summary.get('failed_checks', [])]
+        if 'repair_intent' in failed_checks:
+            return 'no_effective_change'
+        return 'verification_failed'
 
-    def create_session(self, *, project_id: str, input_requirements: list[dict[str, Any]]) -> dict[str, Any]:
+    def _run_bundle_path(self, run_id: str) -> Path:
+        run_dir = (self.tool_root / self.config.runs_root_dirname / run_id).resolve()
+        candidates = sorted(run_dir.glob('pipeline_run_*.json'))
+        if not candidates:
+            raise FileNotFoundError(f'Run bundle not found for run_id={run_id}')
+        return candidates[0]
+
+    def _load_run_bundle(self, run_id: str) -> dict[str, Any]:
+        return json.loads(self._run_bundle_path(run_id).read_text(encoding='utf-8'))
+
+    def _select_previous_result_payload(self, bundle: dict[str, Any]) -> dict[str, Any]:
+        repair_generation = bundle.get('repair_generation') or {}
+        repair_payload = repair_generation.get('result_payload') or {}
+        if (repair_payload.get('code_artifact') or {}).get('code'):
+            return repair_payload
+        external = bundle.get('external_code_generation') or {}
+        external_payload = external.get('result_payload') or {}
+        if (external_payload.get('code_artifact') or {}).get('code'):
+            return external_payload
+        raise ValueError('Previous run does not contain a reusable code artifact for repair')
+
+    def _build_manual_repair_report(self, note: str | None = None) -> dict[str, Any]:
+        message = (note or 'Пользователь запросил дополнительный repair после review.').strip()
+        return {
+            'passed': False,
+            'results': {
+                'manual_repair_request': {
+                    'ok': False,
+                    'message': message,
+                }
+            },
+            'failure_summary': {
+                'failed_checks': ['manual_repair_request'],
+                'repairable': True,
+                'messages': [message],
+                'stage': 'verification',
+            },
+        }
+
+    def create_session(
+        self,
+        *,
+        project_id: str,
+        input_requirements: list[dict[str, Any]],
+        requested_operation: str = 'replace_symbol',
+    ) -> dict[str, Any]:
         self.project_service.get_project(project_id)
         session_id = new_session_id()
         now = _utc_now()
@@ -37,6 +95,7 @@ class SessionService:
             "session_id": session_id,
             "project_id": project_id,
             "input_requirements": input_requirements,
+            "requested_operation": requested_operation,
             "status": "created",
             "created_at": now,
             "updated_at": now,
@@ -48,9 +107,17 @@ class SessionService:
         self.registry.save(payload)
         return payload
 
-    def mark_analyzed(self, session_id: str, *, recommended_target: str | None) -> dict[str, Any]:
+    def mark_analyzed(
+        self,
+        session_id: str,
+        *,
+        recommended_target: str | None,
+        requested_operation: str | None = None,
+    ) -> dict[str, Any]:
         payload = self.registry.get(session_id)
         payload["recommended_target"] = recommended_target
+        if requested_operation:
+            payload["requested_operation"] = requested_operation
         payload["status"] = "analyzed"
         payload["updated_at"] = _utc_now()
         self.registry.save(payload)
@@ -91,10 +158,39 @@ class SessionService:
         selected_target: str | None = None,
         limit: int | None = None,
         use_vector_search: bool | None = None,
+        requested_operation: str | None = None,
     ) -> dict[str, Any]:
         session_payload = self.registry.get(session_id)
         project = self.project_service.get_project(str(session_payload['project_id']))
         resolved_target, target_source = self.resolve_target(session_id, selected_target)
+
+        incoming_requested_operation = requested_operation
+        stored_requested_operation = str(session_payload.get('requested_operation') or '').strip()
+
+        LOGGER.info(
+            "Session generate input: session_id=%s selected_target=%s target_source=%s incoming_requested_operation=%s stored_requested_operation=%s",
+            session_id,
+            resolved_target,
+            target_source,
+            incoming_requested_operation,
+            stored_requested_operation,
+        )
+
+        requested_operation = (
+            incoming_requested_operation
+            or stored_requested_operation
+            or 'replace_symbol'
+        )
+
+        LOGGER.info(
+            "Session generate resolved operation: session_id=%s effective_requested_operation=%s",
+            session_id,
+            requested_operation,
+        )
+
+        run_id = ""
+        workspace_path = ""
+        workspace_id = ""
 
         requirements = session_payload.get('input_requirements') or []
         if not requirements:
@@ -111,13 +207,63 @@ class SessionService:
             raise ValueError(f'Session {session_id} contains invalid change request payload')
 
         services = ProjectServices(Path(project.project_root), config=self.config)
-        result = services.pipeline_generate(
-            change_request=change_request,
-            selected_target=resolved_target,
-            limit=limit or self.config.search_default_limit,
-            use_vector_search=use_vector_search,
-            skip_search=target_source in {'request', 'session_selected'},
+
+        LOGGER.info(
+            "Session generate calling pipeline_generate: session_id=%s selected_target=%s requested_operation=%s skip_search=%s",
+            session_id,
+            resolved_target,
+            requested_operation,
+            target_source in {'request', 'session_selected'},
         )
+        
+        try:
+            result = services.pipeline_generate(
+                change_request=change_request,
+                selected_target=resolved_target,
+                limit=limit or self.config.search_default_limit,
+                use_vector_search=use_vector_search,
+                skip_search=target_source in {'request', 'session_selected'},
+                requested_operation=requested_operation,
+           )
+        except PipelineRunFailed as exc:
+            result = exc.result
+            run_id = result.run_id if result else ""
+            workspace_path = str(result.apply_result.workspace_path) if result and result.apply_result else ""
+            workspace_id = Path(workspace_path).name if workspace_path else ""
+
+            run_ids = [str(item) for item in session_payload.get('run_ids', [])]
+            if run_id and run_id not in run_ids:
+                run_ids.append(run_id)
+
+            workspace_ids = [str(item) for item in session_payload.get('workspace_ids', [])]
+            if workspace_id and workspace_id not in workspace_ids:
+                workspace_ids.append(workspace_id)
+
+            session_payload['selected_target'] = resolved_target
+            session_payload['requested_operation'] = requested_operation
+            session_payload['status'] = 'generate_failed'
+            session_payload['updated_at'] = _utc_now()
+            session_payload['run_ids'] = run_ids
+            session_payload['workspace_ids'] = workspace_ids
+            session_payload['last_run_id'] = run_id or session_payload.get('last_run_id')
+            if workspace_id:
+                session_payload['last_workspace_id'] = workspace_id
+            self.registry.save(session_payload)
+
+            return {
+                'status': 'failed',
+                'message': str(exc),
+                'session_id': session_id,
+                'project_id': session_payload['project_id'],
+                'selected_target': resolved_target,
+                'selected_target_source': target_source,
+                'run_id': run_id or None,
+                'workspace_id': workspace_id or None,
+                'workspace_path': workspace_path or None,
+                'session': session_payload,
+                'pipeline_result': self._pipeline_payload(result) if result else None,
+                'requested_operation': requested_operation,
+            }
 
         run_id = result.run_id
         workspace_path = str(result.apply_result.workspace_path) if result.apply_result else ''
@@ -131,6 +277,7 @@ class SessionService:
             workspace_ids.append(workspace_id)
 
         session_payload['selected_target'] = resolved_target
+        session_payload['requested_operation'] = requested_operation
         session_payload['status'] = 'generated'
         session_payload['updated_at'] = _utc_now()
         session_payload['run_ids'] = run_ids
@@ -150,8 +297,170 @@ class SessionService:
             'workspace_path': workspace_path or None,
             'session': session_payload,
             'pipeline_result': self._pipeline_payload(result),
+            'requested_operation': requested_operation,
         }
 
+    def repair(
+        self,
+        session_id: str,
+        selected_target: str | None = None,
+        note: str | None = None,
+        use_vector_search: bool | None = None,
+    ) -> dict[str, Any]:
+        session_payload = self.registry.get(session_id)
+        project = self.project_service.get_project(str(session_payload['project_id']))
+        resolved_target, target_source = self.resolve_target(session_id, selected_target)
+
+        requested_operation = (
+            str(session_payload.get('requested_operation') or '').strip()
+            or 'replace_symbol'
+        )       
+
+        workspace_id = str(session_payload.get('last_workspace_id') or '').strip()
+        if not workspace_id:
+            raise ValueError(f'Session {session_id} does not have an active workspace for repair')
+        previous_run_id = str(session_payload.get('last_run_id') or '').strip()
+        if not previous_run_id:
+            raise ValueError(f'Session {session_id} does not have a previous run for repair')
+
+        requirements = session_payload.get('input_requirements') or []
+        if not requirements:
+            raise ValueError(f'Session {session_id} does not contain input requirements')
+        first_req = requirements[0]
+        notes = [str(item) for item in first_req.get('notes', []) or []]
+        if note:
+            notes.append(str(note))
+        change_request = ChangeRequest(
+            title=str(first_req.get('title', '')).strip(),
+            description=str(first_req.get('description', '')).strip(),
+            constraints=[str(item) for item in first_req.get('constraints', []) or []],
+            notes=notes,
+            project=str(project.project_name),
+        )
+        if not change_request.title or not change_request.description:
+            raise ValueError(f'Session {session_id} contains invalid change request payload')
+
+        previous_bundle = self._load_run_bundle(previous_run_id)
+        previous_result_payload = self._select_previous_result_payload(previous_bundle)
+        verification_report = self._build_manual_repair_report(note)
+
+        workspace_path = self.tool_root / self.config.workspace_root_dirname / workspace_id
+        services = ProjectServices(workspace_path, config=self.config)
+        result = services.pipeline_repair(
+            change_request=change_request,
+            selected_target=resolved_target,
+            previous_result_payload=previous_result_payload,
+            verification_report=verification_report,
+            requested_operation=requested_operation,
+        )
+
+        run_id = result.run_id
+        new_workspace_path = str(result.apply_result.workspace_path) if result.apply_result else ''
+        new_workspace_id = Path(new_workspace_path).name if new_workspace_path else ''
+
+        run_ids = [str(item) for item in session_payload.get('run_ids', [])]
+        if run_id not in run_ids:
+            run_ids.append(run_id)
+
+        workspace_ids = [str(item) for item in session_payload.get('workspace_ids', [])]
+        if new_workspace_id and new_workspace_id not in workspace_ids:
+            workspace_ids.append(new_workspace_id)
+
+        outcome = self._repair_outcome(result)
+        repair_effective = outcome != 'no_effective_change'
+
+        from codecollector.workspace.workspace_service import WorkspaceService
+        workspace_service = WorkspaceService(self.tool_root, self.config)
+
+        old_workspace_id = workspace_id
+
+        if outcome == 'no_effective_change':
+            if new_workspace_id:
+                try:
+                    workspace_service.delete_workspace(new_workspace_id)
+                except FileNotFoundError:
+                    pass
+            workspace_ids = [item for item in workspace_ids if item != new_workspace_id]
+
+            session_payload['selected_target'] = resolved_target
+            session_payload['status'] = 'repair_no_effective_change'
+            session_payload['updated_at'] = _utc_now()
+            session_payload['run_ids'] = run_ids
+            session_payload['workspace_ids'] = workspace_ids
+            session_payload['last_run_id'] = run_id
+            session_payload['last_workspace_id'] = old_workspace_id
+            self.registry.save(session_payload)
+
+            return {
+                'session_id': session_id,
+                'project_id': session_payload['project_id'],
+                'selected_target': resolved_target,
+                'selected_target_source': target_source,
+                'run_id': run_id,
+                'workspace_id': old_workspace_id or None,
+                'workspace_path': str(self.tool_root / self.config.workspace_root_dirname / old_workspace_id) if old_workspace_id else None,
+                'repair_outcome': 'no_effective_change',
+                'repair_effective': False,
+                'message': 'Repair was executed but produced no effective change.',
+                'session': session_payload,
+                'pipeline_result': self._pipeline_payload(result),
+            }
+
+        if outcome == 'verification_failed':
+            session_payload['selected_target'] = resolved_target
+            session_payload['status'] = 'repair_verification_failed'
+            session_payload['updated_at'] = _utc_now()
+            session_payload['run_ids'] = run_ids
+            session_payload['workspace_ids'] = workspace_ids
+            session_payload['last_run_id'] = run_id
+            session_payload['last_workspace_id'] = new_workspace_id or session_payload.get('last_workspace_id')
+            self.registry.save(session_payload)
+
+            return {
+                'session_id': session_id,
+                'project_id': session_payload['project_id'],
+                'selected_target': resolved_target,
+                'selected_target_source': target_source,
+                'run_id': run_id,
+                'workspace_id': new_workspace_id or None,
+                'workspace_path': new_workspace_path or None,
+                'repair_outcome': 'verification_failed',
+                'repair_effective': True,
+                'message': 'Repair changed the workspace, but verification failed.',
+                'session': session_payload,
+                'pipeline_result': self._pipeline_payload(result),
+            }
+
+        if new_workspace_id and old_workspace_id and new_workspace_id != old_workspace_id:
+            try:
+                workspace_service.delete_workspace(old_workspace_id)
+            except FileNotFoundError:
+                pass
+            workspace_ids = [item for item in workspace_ids if item != old_workspace_id]
+
+        session_payload['selected_target'] = resolved_target
+        session_payload['status'] = 'repaired'
+        session_payload['updated_at'] = _utc_now()
+        session_payload['run_ids'] = run_ids
+        session_payload['workspace_ids'] = workspace_ids
+        session_payload['last_run_id'] = run_id
+        session_payload['last_workspace_id'] = new_workspace_id or session_payload.get('last_workspace_id')
+        self.registry.save(session_payload)
+
+        return {
+            'session_id': session_id,
+            'project_id': session_payload['project_id'],
+            'selected_target': resolved_target,
+            'selected_target_source': target_source,
+            'run_id': run_id,
+            'workspace_id': new_workspace_id or None,
+            'workspace_path': new_workspace_path or None,
+            'repair_outcome': 'repaired',
+            'repair_effective': True,
+            'message': 'Repair completed successfully.',
+            'session': session_payload,
+            'pipeline_result': self._pipeline_payload(result),
+        }
 
     def finalize(self, session_id: str, *, delete_workspace: bool = True) -> dict[str, Any]:
         session_payload = self.registry.get(session_id)

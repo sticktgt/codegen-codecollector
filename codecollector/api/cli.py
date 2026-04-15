@@ -20,6 +20,7 @@ from codecollector.orchestration.services import ProjectServices
 from codecollector.projects.project_service import ProjectService
 from codecollector.sessions.session_service import SessionService
 from codecollector.workspace.workspace_service import WorkspaceService
+from codecollector.orchestration.pipeline_service import PipelineRunFailed
 
 LOGGER = get_logger(__name__)
 PATCH_OPERATIONS = ('replace_symbol', 'insert_after_symbol', 'add_symbol')
@@ -69,6 +70,7 @@ def build_parser() -> argparse.ArgumentParser:
     session_analyze.add_argument('--constraint', action='append', default=[])
     session_analyze.add_argument('--note', action='append', default=[])
     session_analyze.add_argument('--limit', type=int)
+    session_analyze.add_argument('--operation', choices=PATCH_OPERATIONS, default='replace_symbol')
 
     sessions_sub.add_parser('list')
 
@@ -89,8 +91,15 @@ def build_parser() -> argparse.ArgumentParser:
     session_generate = sessions_sub.add_parser('generate')
     session_generate.add_argument('--session-id', required=True)
     session_generate.add_argument('--selected-qualname')
+    session_generate.add_argument('--operation', choices=PATCH_OPERATIONS, default=None)
     session_generate.add_argument('--limit', type=int)
     session_generate.add_argument('--disable-vector-search', action='store_true')
+
+    session_repair = sessions_sub.add_parser('repair')
+    session_repair.add_argument('--session-id', required=True)
+    session_repair.add_argument('--selected-qualname')
+    session_repair.add_argument('--note')
+    session_repair.add_argument('--disable-vector-search', action='store_true')
 
     workspaces_parser = subparsers.add_parser('workspaces')
     workspaces_sub = workspaces_parser.add_subparsers(dest='workspaces_command', required=True)
@@ -138,6 +147,7 @@ def build_parser() -> argparse.ArgumentParser:
     pipeline_generate = pipeline_sub.add_parser('generate')
     pipeline_generate.add_argument('--project', required=True)
     pipeline_generate.add_argument('--selected-qualname', required=True)
+    pipeline_generate.add_argument('--operation', choices=PATCH_OPERATIONS, default='replace_symbol')
     pipeline_generate.add_argument('--limit', type=int)
     pipeline_generate.add_argument('--change-request-file')
     pipeline_generate.add_argument('--title')
@@ -207,6 +217,7 @@ def main() -> None:
             result = analyze_service.analyze(
                 project_id=args.project_id,
                 input_requirements=[requirement_payload],
+                requested_operation=args.operation,
                 limit=args.limit or config.search_default_limit,
             )
             print(json.dumps(asdict(result), ensure_ascii=False, indent=2))
@@ -236,10 +247,27 @@ def main() -> None:
             return
 
         if args.command == 'sessions' and args.sessions_command == 'generate':
+            LOGGER.info(
+                "CLI sessions generate: session_id=%s selected_qualname=%s operation=%s",
+                args.session_id,
+                args.selected_qualname,
+                args.operation,
+            )
             result = session_service.generate(
                 session_id=args.session_id,
                 selected_target=args.selected_qualname,
+                requested_operation=args.operation,
                 limit=args.limit or config.search_default_limit,
+                use_vector_search=not args.disable_vector_search,
+            )
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return
+
+        if args.command == 'sessions' and args.sessions_command == 'repair':
+            result = session_service.repair(
+                session_id=args.session_id,
+                selected_target=args.selected_qualname,
+                note=args.note,
                 use_vector_search=not args.disable_vector_search,
             )
             print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -322,17 +350,27 @@ def main() -> None:
             )
             print(json.dumps(_pipeline_payload(result), ensure_ascii=False, indent=2))
             return
-
+       
         if args.command == 'pipeline' and args.pipeline_command == 'generate':
             change_request = _load_change_request(args, Path(args.project).name)
-            result = services.pipeline_generate(
-                change_request=change_request,
-                selected_target=args.selected_qualname,
-                limit=args.limit,
-                use_vector_search=not args.disable_vector_search,
-            )
-            print(json.dumps(_pipeline_payload(result), ensure_ascii=False, indent=2))
+            try:
+                result = services.pipeline_generate(
+                    change_request=change_request,
+                    selected_target=args.selected_qualname,
+                    requested_operation=args.operation,
+                    limit=args.limit,
+                    use_vector_search=not args.disable_vector_search,
+                )
+                print(json.dumps(_pipeline_payload(result), ensure_ascii=False, indent=2))
+            except PipelineRunFailed as exc:
+                print(json.dumps({
+                    'status': 'failed',
+                    'message': str(exc),
+                    'pipeline_result': _pipeline_payload(exc.result),
+                }, ensure_ascii=False, indent=2))
+                raise SystemExit(1) from exc
             return
+
     except Exception as exc:
         LOGGER.exception('CLI command failed: %s', exc)
         print(json.dumps({'error': str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
@@ -374,46 +412,51 @@ def _load_structured_payload(path: Path) -> dict[str, Any]:
         raise ValueError(f'Unsupported structured payload in {path}')
     return payload
 
+def _json_ready(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _json_ready(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(item) for item in value]
+    return value
 
 def _pipeline_payload(result: PipelineRunResult) -> dict:
-    return {
+    context_pack_payload = None
+    if result.context_pack is not None:
+        context_pack_payload = {
+            'target': asdict(result.context_pack.target) if result.context_pack.target is not None else None,
+            'related_tests': [asdict(item) for item in (result.context_pack.related_tests or [])],
+            'recommended_tests': list(result.context_pack.recommended_tests or []),
+            'knowledge_title': result.context_pack.knowledge_title,
+            'knowledge_description': result.context_pack.knowledge_description,
+            'requirement_ids': list(result.context_pack.requirement_ids or []),
+            'requirement_titles': list(result.context_pack.requirement_titles or []),
+            'reference_summary': result.context_pack.reference_summary or {},
+            'reference_artifacts': [asdict(item) for item in (result.context_pack.reference_artifacts or [])],
+        }
+
+    payload = {
         'run_id': result.run_id,
         'run_label': result.run_label,
         'run_dir': str(result.run_dir),
         'change_request': asdict(result.change_request),
         'selected_target': result.selected_target,
         'build_report': result.build_report,
-        'steps': [asdict(item) for item in result.steps],
-        'search_candidates': [asdict(item) for item in result.search_candidates],
-        'context_pack': {
-            'target': asdict(result.context_pack.target),
-            'related_tests': [asdict(item) for item in result.context_pack.related_tests],
-            'recommended_tests': result.context_pack.recommended_tests,
-            'knowledge_title': result.context_pack.knowledge_title,
-            'knowledge_description': result.context_pack.knowledge_description,
-            'requirement_ids': result.context_pack.requirement_ids,
-            'inbound_relations': [asdict(item) for item in result.context_pack.inbound_relations],
-            'outbound_relations': [asdict(item) for item in result.context_pack.outbound_relations],
-            'reference_summary': result.context_pack.reference_summary,
-            'reference_artifacts': [asdict(item) for item in result.context_pack.reference_artifacts],
-        },
+        'steps': [asdict(step) for step in result.steps],
+        'search_candidates': [asdict(item) for item in (result.search_candidates or [])],
+        'context_pack': context_pack_payload,
         'generation_replay': asdict(result.generation_replay) if result.generation_replay else None,
         'external_code_generation': asdict(result.external_code_generation) if result.external_code_generation else None,
         'external_test_generation': asdict(result.external_test_generation) if result.external_test_generation else None,
         'generated_test_apply': result.generated_test_apply,
         'verification_report': result.verification_report,
         'repair_generation': asdict(result.repair_generation) if result.repair_generation else None,
-        'apply_result': {
-            'workspace_path': str(result.apply_result.workspace_path),
-            'diff': asdict(result.apply_result.diff),
-            'validation': {
-                'is_valid': result.apply_result.validation.is_valid,
-                'issues': [asdict(item) for item in result.apply_result.validation.issues],
-            },
-            'impact': asdict(result.apply_result.impact),
-        } if result.apply_result else None,
+        'apply_result': asdict(result.apply_result) if result.apply_result else None,
         'merge_plan': asdict(result.merge_plan) if result.merge_plan else None,
+        'warnings': list(result.warnings or []),
     }
+    return _json_ready(payload)
 
 
 def launch_streamlit_ui(root_path: Path, server_port: int | None = None, server_address: str | None = None) -> None:

@@ -22,6 +22,7 @@ venv/
 *.log
 .runs/
 .workspaces/
+.state/
 *.tmp
 *.bak
 *.swp

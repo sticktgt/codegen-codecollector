@@ -24,3 +24,4 @@ Dockerfile
 docker-compose.yml
 .runs/
 .workspaces/
+.state/

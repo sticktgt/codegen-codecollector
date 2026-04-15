@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import time
+from typing import Any
 
 from codecollector.config import AppConfig, load_config
 from codecollector.context.service import ContextService
@@ -81,10 +82,21 @@ class ProjectServices:
         )
         return report
 
-    def search(self, query: str, limit: int = 5, use_vector_search: bool | None = None) -> list[SearchCandidate]:
+    def search(
+        self,
+        query: str,
+        limit: int = 5,
+        use_vector_search: bool | None = None,
+        requested_operation: str = 'replace_symbol',
+    ) -> list[SearchCandidate]:
         LOGGER.info('Searching in %s for query=%r limit=%s', self.project_root, query, limit)
         self.overlays.refresh()
-        return self.search_service.search(query=query, limit=limit, use_vector_search=use_vector_search)
+        return self.search_service.search(
+            query=query,
+            limit=limit,
+            use_vector_search=use_vector_search,
+            requested_operation=requested_operation,
+        )
 
     def context(self, qualname: str) -> ContextPack:
         LOGGER.info('Building context for %s in %s', qualname, self.project_root)
@@ -130,6 +142,7 @@ class ProjectServices:
         self,
         change_request: ChangeRequest,
         selected_target: str,
+        requested_operation: str = 'replace_symbol',
         limit: int | None = None,
         use_vector_search: bool | None = None,
         skip_search: bool = False,
@@ -138,9 +151,28 @@ class ProjectServices:
         return self.pipeline_service.run_generate(
             change_request=change_request,
             selected_target=selected_target,
+            requested_operation=requested_operation,
             limit=limit or self.config.search_default_limit,
             use_vector_search=use_vector_search,
             skip_search=skip_search,
+        )
+
+
+    def pipeline_repair(
+        self,
+        change_request: ChangeRequest,
+        selected_target: str,
+        previous_result_payload: dict[str, Any],
+        verification_report: dict[str, Any],
+        requested_operation: str = 'replace_symbol',
+    ) -> PipelineRunResult:
+        LOGGER.info('Running repair pipeline for %s with target %s', self.project_root, selected_target)
+        return self.pipeline_service.run_repair(
+            change_request=change_request,
+            selected_target=selected_target,
+            previous_result_payload=previous_result_payload,
+            verification_report=verification_report,
+            requested_operation=requested_operation,
         )
 
     def _sync_search_documents(self) -> dict[str, int | bool]:

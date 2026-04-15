@@ -66,6 +66,7 @@ def build_generation_request(
     config: AppConfig,
     generated_code_artifact: dict[str, Any] | None = None,
     mode: str = 'generate',
+    operation: str = 'replace_symbol',
 ) -> dict[str, Any]:
     target = context_pack.target
     full_file_source = (project_root / target.file_path).read_text(encoding='utf-8')
@@ -200,6 +201,8 @@ def build_generation_request(
         'reference_summary': reference_summary,
         'reference_artifacts': reference_artifacts,
     }
+    normalized_operation = _normalize_operation(operation)
+
     request = {
         'request_id': f'generate-{target_qualname.split(".")[-1]}',
         'mode': mode,
@@ -212,7 +215,7 @@ def build_generation_request(
         'target': {
             'qualname': target_qualname,
             'file_path': target.file_path,
-            'operation': 'replace_symbol',
+            'operation': _normalize_operation(operation),
         },
         'project_context': project_context,
         'reference_context': reference_context,
@@ -220,6 +223,7 @@ def build_generation_request(
         'options': {
             'generate_test_mode': config.codegenerator_test_generation_mode,
         },
+        'requested_operation': normalized_operation,
     }
     metrics = {
         'target_source_chars': len(target_source),
@@ -518,6 +522,18 @@ def _normalize_operation(operation: str) -> str:
     }
     return mapping.get(value, value)
 
+def ensure_expected_operation(
+    result_payload: dict[str, Any],
+    expected_operation: str,
+) -> str:
+    artifact = result_payload.get('code_artifact') or {}
+    actual_operation = _normalize_operation(str(artifact.get('operation', 'replace_symbol')))
+    normalized_expected = _normalize_operation(expected_operation)
+    if actual_operation != normalized_expected:
+        raise ValueError(
+            f'Generator returned operation {actual_operation}, expected {normalized_expected}'
+        )
+    return actual_operation
 
 def _write_payload(path: Path, payload: dict[str, Any], request_format: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)

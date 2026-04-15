@@ -30,7 +30,13 @@ class SearchService:
         self.vector_search = vector_search
         self.config = config or load_config()
 
-    def search(self, query: str, limit: int = 5, use_vector_search: bool | None = None) -> list[SearchCandidate]:
+    def search(
+        self,
+        query: str,
+        limit: int = 5,
+        use_vector_search: bool | None = None,
+        requested_operation: str = 'replace_symbol',
+    ) -> list[SearchCandidate]:
         LOGGER.info("Executing search query=%r limit=%s for %s", query, limit, self.project_root)
         normalized_query = self._normalize_text(query)
         query_terms = self._expand_terms(normalized_query)
@@ -40,9 +46,15 @@ class SearchService:
         symbols = [item for item in self.store.list_symbols(self.project_key) if item.kind != 'module']
         candidates: list[SearchCandidate] = []
         for symbol in symbols:
-            candidate = self._score_symbol(symbol, query_terms, query, vector_scores.get(symbol.qualname, 0.0))
+            candidate = self._score_symbol(
+                symbol,
+                query_terms,
+                query,
+                vector_scores.get(symbol.qualname, 0.0),
+                requested_operation=requested_operation,
+            )
             if candidate.score > 0:
-                candidates.append(candidate)
+                candidates.append(candidate)            
 
         candidates.sort(key=lambda item: (-item.score, -item.confidence, item.file_path, item.qualname))
         return candidates[:limit]
@@ -58,7 +70,15 @@ class SearchService:
         stems = {self._rough_stem(term) for term in term_list if len(term) >= 4}
         return sorted(set(term_list) | {item for item in stems if item})
 
-    def _score_symbol(self, symbol: SymbolRecord, query_terms: list[str], raw_query: str, vector_score: float) -> SearchCandidate:
+    def _score_symbol(
+        self,
+        symbol: SymbolRecord,
+        query_terms: list[str],
+        raw_query: str,
+        vector_score: float,
+        *,
+        requested_operation: str = 'replace_symbol',
+    ) -> SearchCandidate:
         bundle = self.overlays.candidate_text_bundle(symbol.module_name, symbol.qualname)
         knowledge_title = str(bundle.get('symbol_title', ''))
         field_bag = {
@@ -137,9 +157,22 @@ class SearchService:
             if requirement_rank == 0:
                 score += 0.45
                 reasons.append('symbol указан как первичная точка реализации требования')
+
         if len(matched_terms) >= 2:
             score += min(len(matched_terms), 5) * 0.2
-        score += self._change_request_intent_adjustment(raw_query, symbol, bundle)
+
+        score += self._change_request_intent_adjustment(
+            raw_query,
+            symbol,
+            bundle,
+            requested_operation=requested_operation,
+        )
+        score += self._operation_adjustment(
+            symbol,
+            bundle,
+            requested_operation=requested_operation,
+        )
+
         confidence = min(1.0, round(0.12 + score / 22.0, 2)) if score > 0 else 0.0
         relevance_category = self._relevance_category(score, confidence)
         return SearchCandidate(
@@ -156,7 +189,14 @@ class SearchService:
             requirements=requirements,
         )
 
-    def _change_request_intent_adjustment(self, query: str, symbol: SymbolRecord, bundle: dict) -> float:
+    def _change_request_intent_adjustment(
+        self,
+        query: str,
+        symbol: SymbolRecord,
+        bundle: dict,
+        *,
+        requested_operation: str = 'replace_symbol',
+    ) -> float:
         normalized_query = self._normalize_text(query)
         adjustment = 0.0
         symbol_text = ' '.join(
@@ -172,6 +212,44 @@ class SearchService:
                 adjustment -= 1.6
             if '.notification_service.' in symbol.qualname:
                 adjustment += 1.2
+        return adjustment
+
+    def _operation_adjustment(self, symbol: SymbolRecord, bundle: dict, *, requested_operation: str) -> float:
+        if requested_operation != 'insert_after_symbol':
+            return 0.0
+
+        adjustment = 0.0
+        layer = str(bundle.get('layer', ''))
+        file_path = symbol.file_path.casefold()
+        name = symbol.name.casefold()
+        kind = symbol.kind
+
+        # Для insert_after_symbol лучше якоря-объявления, чем исполняемые точки.
+        if kind == 'class':
+            adjustment += 1.8
+        elif kind in {'function', 'method'}:
+            adjustment -= 0.35
+
+        # Для вставки новой модели/структуры обычно лучше не service-layer.
+        if layer == 'services':
+            adjustment -= 0.8
+        elif layer in {'domain', 'api'}:
+            adjustment += 0.45
+
+        # Сильный буст для domain/models.py
+        if '/domain/' in file_path or file_path.startswith('support_app/domain/'):
+            adjustment += 0.9
+        if '/models.py' in file_path or file_path.endswith('models.py'):
+            adjustment += 1.2
+
+        # Часто вставка новых dataclass/model идет рядом с похожими классами.
+        if kind == 'class' and any(token in name for token in ('summary', 'model', 'dto', 'schema', 'entity')):
+            adjustment += 0.6
+
+        # Вставка "после метода" обычно реже желаема для такого рода задач.
+        if kind == 'method' and any(token in name for token in ('build_', 'create_', 'update_', 'assign_')):
+            adjustment -= 0.4
+
         return adjustment
 
     def _reason_for_field(self, term: str, field_name: str, match_type: str) -> str:

@@ -18,7 +18,15 @@ from codecollector.domain.models import (
 )
 from codecollector.logger import get_logger
 from codecollector.orchestration.run_artifacts import RunArtifactsManager
-from codecollector.external_codegen.adapter import build_generation_request, invoke_generate, invoke_generate_test, patch_artifact_from_result, build_repair_request, invoke_repair
+from codecollector.external_codegen.adapter import (
+    build_generation_request,
+    invoke_generate,
+    invoke_generate_test,
+    patch_artifact_from_result,
+    build_repair_request,
+    invoke_repair,
+    ensure_expected_operation,
+)
 
 if TYPE_CHECKING:
     from codecollector.domain.models import ApplyResult, ContextPack
@@ -26,7 +34,11 @@ if TYPE_CHECKING:
 
 LOGGER = get_logger(__name__)
 
-
+class PipelineRunFailed(RuntimeError):
+    def __init__(self, message: str, result: PipelineRunResult) -> None:
+        super().__init__(message)
+        self.result = result
+        
 class PipelineService:
     def __init__(self, project_services: "ProjectServices", artifacts_manager: RunArtifactsManager) -> None:
         self.project_services = project_services
@@ -127,6 +139,152 @@ class PipelineService:
         return result
 
 
+    def run_repair(
+        self,
+        change_request: ChangeRequest,
+        selected_target: str,
+        previous_result_payload: dict[str, Any],
+        verification_report: dict[str, Any],
+        requested_operation: str = 'replace_symbol',
+    ) -> PipelineRunResult:
+        run_id, run_label, run_dir = self.artifacts_manager.create_run_dir('pipeline')
+        steps: list[PipelineStepRecord] = []
+
+        build_report: dict[str, Any] | None = None
+        context_pack: ContextPack | None = None
+        repair_generation: ExternalGenerationCall | None = None
+        apply_result: ApplyResult | None = None
+        verification_result: dict[str, Any] | None = None
+        merge_plan: MergePlan | None = None
+        result: PipelineRunResult | None = None
+
+        try:
+            build_report = self._run_step(
+                steps,
+                'index_build',
+                f'Обновить индекс проекта {self.project_services.project_root.name}',
+                lambda: asdict(self.project_services.build_index(full_rebuild=False)),
+            )
+
+            self._record_skipped_step(
+                steps,
+                'search_primary_target',
+                f'Повторный shortlist пропущен: repair использует выбранный target {selected_target}',
+            )
+
+            context_pack = self._run_step(
+                steps,
+                'context_supporting_code',
+                f'Собрать context pack для {selected_target}',
+                lambda: self.project_services.context(selected_target),
+            )
+
+            reference_artifacts = self._run_step(
+                steps,
+                'reference_retrieval',
+                'Подобрать reference artifacts для repair',
+                lambda: self.project_services.retrieve_reference_artifacts(change_request, selected_target),
+            )
+            context_pack.reference_artifacts = reference_artifacts
+            context_pack.reference_summary = {
+                'count': len(reference_artifacts),
+                'titles': [item.title for item in reference_artifacts],
+                'content_modes': [item.content_mode for item in reference_artifacts],
+            }
+
+            repair_generation = self._run_step(
+                steps,
+                'external_repair',
+                'Вызвать внешний codegenerator repair по запросу пользователя',
+                lambda: self._external_repair(
+                    run_dir,
+                    change_request,
+                    selected_target,
+                    context_pack,
+                    previous_result_payload,
+                    verification_report,
+                    requested_operation=requested_operation,
+                ),
+            )
+            if not self._has_code_artifact(repair_generation.result_payload):
+                raise RuntimeError(repair_generation.result_payload.get('message') or 'codegenerator repair did not return code_artifact')
+
+            apply_result = self._replace_active_apply_result(
+                apply_result,
+                self._run_step(
+                    steps,
+                    'apply_repair_staging',
+                    'Применить исправленный артефакт в staging workspace',
+                    lambda: self.project_services.apply(
+                        patch_artifact_from_result(repair_generation.result_payload, selected_target),
+                        generated_tests=[],
+                    ),
+                ),
+            )
+
+            verification_result = self._run_step(
+                steps,
+                'verification_after_repair',
+                'Запустить проверки проекта после ручного repair',
+                lambda: self._run_verification(apply_result),
+            )
+            verification_result = self._mark_noop_repair_if_needed(verification_result, apply_result, repair_generation)
+
+            merge_plan = self._run_step(
+                steps,
+                'merge_dry_run',
+                'Подготовить dry-run план merge в master',
+                lambda: self._prepare_merge_plan(apply_result, verification_result),
+            )
+
+            result = self._build_partial_run_result(
+                run_id=run_id,
+                run_label=run_label,
+                run_dir=run_dir,
+                change_request=change_request,
+                selected_target=selected_target,
+                build_report=build_report,
+                candidates=[],
+                context_pack=context_pack,
+                generation_replay=None,
+                external_code_generation=None,
+                external_test_generation=None,
+                generated_test_apply=None,
+                verification_report=verification_result,
+                repair_generation=repair_generation,
+                apply_result=apply_result,
+                merge_plan=merge_plan,
+                steps=steps,
+                warnings=[],
+            )
+            return result
+        finally:
+            if result is None:
+                result = self._build_partial_run_result(
+                    run_id=run_id,
+                    run_label=run_label,
+                    run_dir=run_dir,
+                    change_request=change_request,
+                    selected_target=selected_target,
+                    build_report=build_report,
+                    candidates=[],
+                    context_pack=context_pack,
+                    generation_replay=None,
+                    external_code_generation=None,
+                    external_test_generation=None,
+                    generated_test_apply=None,
+                    verification_report=verification_result,
+                    repair_generation=repair_generation,
+                    apply_result=apply_result,
+                    merge_plan=merge_plan,
+                    steps=steps,
+                    warnings=[],
+                )
+            try:
+                self.artifacts_manager.write_bundle(run_dir, f'pipeline_run_{run_label}.json', result)
+            except Exception:
+                LOGGER.exception('Failed to write repair pipeline run bundle in finally: %s', run_dir)
+
     def run_generate(
         self,
         change_request: ChangeRequest,
@@ -134,6 +292,7 @@ class PipelineService:
         limit: int,
         use_vector_search: bool | None = None,
         skip_search: bool = False,
+        requested_operation: str = 'replace_symbol',
     ) -> PipelineRunResult:
         run_id, run_label, run_dir = self.artifacts_manager.create_run_dir('pipeline')
         steps: list[PipelineStepRecord] = []
@@ -150,6 +309,7 @@ class PipelineService:
         apply_result: ApplyResult | None = None
         merge_plan: MergePlan | None = None
         result: PipelineRunResult | None = None
+        caught_exc: Exception | None = None
 
         try:
             build_report = self._run_step(
@@ -176,7 +336,12 @@ class PipelineService:
                 )
                 candidates = [SearchCandidate(**item) for item in candidates_dicts]
                 if not any(item.qualname == selected_target for item in candidates):
-                    raise ValueError(f'Selected qualname {selected_target} is not present in shortlist')
+                    warning_message = (
+                        f'Selected qualname {selected_target} отсутствует в shortlist; '
+                        'продолжаем по явно указанному selected_target.'
+                    )
+                    warnings.append(warning_message)
+                    LOGGER.warning(warning_message)
 
             context_pack = self._run_step(
                 steps,
@@ -184,6 +349,8 @@ class PipelineService:
                 f'Собрать context pack для {selected_target}',
                 lambda: self.project_services.context(selected_target),
             )
+            if context_pack is None or context_pack.target is None:
+                raise ValueError(f'Не удалось собрать context pack для {selected_target}')
 
             reference_artifacts = self._run_step(
                 steps,
@@ -202,10 +369,18 @@ class PipelineService:
                 steps,
                 'external_generate',
                 'Вызвать внешний codegenerator и получить code artifact',
-                lambda: self._external_generate(run_dir, change_request, selected_target, context_pack),
+                lambda: self._external_generate(
+                    run_dir,
+                    change_request,
+                    selected_target,
+                    context_pack,
+                    requested_operation,
+                ),
             )
             if not self._has_code_artifact(external_code_generation.result_payload):
                 raise RuntimeError(external_code_generation.result_payload.get('message') or 'codegenerator generate did not return code_artifact')
+            
+            ensure_expected_operation(external_code_generation.result_payload, requested_operation)
 
             final_payload = external_code_generation.result_payload
             generated_tests: list[dict[str, str]] = []
@@ -238,6 +413,7 @@ class PipelineService:
                         context_pack,
                         external_code_generation.result_payload,
                         apply_failure_report,
+                        requested_operation=requested_operation,
                     ),
                 )
                 if not self._has_code_artifact(repair_generation.result_payload):
@@ -267,6 +443,7 @@ class PipelineService:
                         selected_target,
                         context_pack,
                         final_payload,
+                        requested_operation=requested_operation,
                     ),
                 )
                 generated_tests = self._extract_generated_tests(external_test_generation.result_payload)
@@ -313,7 +490,15 @@ class PipelineService:
                         steps,
                         'external_repair',
                         'Вызвать внешний codegenerator repair после неуспешной проверки',
-                        lambda: self._external_repair(run_dir, change_request, selected_target, context_pack, final_payload, verification_report),
+                        lambda: self._external_repair(
+                            run_dir, 
+                            change_request, 
+                            selected_target, 
+                            context_pack, 
+                            final_payload, 
+                            verification_report,
+                            requested_operation=requested_operation,
+                        ),
                     )
                     if not self._has_code_artifact(repair_generation.result_payload):
                         raise RuntimeError(repair_generation.result_payload.get('message') or 'codegenerator repair did not return code_artifact')
@@ -367,6 +552,8 @@ class PipelineService:
             )
             return result
 
+        except Exception as exc:
+            caught_exc = exc
         finally:
             if result is None:
                 result = self._build_partial_run_result(
@@ -393,6 +580,12 @@ class PipelineService:
                 self.artifacts_manager.write_bundle(run_dir, f'pipeline_run_{run_label}.json', result)
             except Exception:
                 LOGGER.exception('Failed to write pipeline run bundle in finally: %s', run_dir)
+        if caught_exc is not None:
+            assert result is not None
+            raise PipelineRunFailed(str(caught_exc), result) from caught_exc
+
+        assert result is not None
+        return result        
 
     def _delete_apply_workspace(self, apply_result: ApplyResult | None) -> None:
         if apply_result is None:
@@ -521,6 +714,7 @@ class PipelineService:
         selected_target: str,
         context_pack: ContextPack,
         final_payload: dict[str, Any],
+        requested_operation: str = 'replace_symbol',
     ) -> ExternalGenerationCall:
         request_payload = build_generation_request(
             self.project_services.project_root,
@@ -530,6 +724,7 @@ class PipelineService:
             self.project_services.config,
             generated_code_artifact=final_payload.get("code_artifact") or {},
             mode='generate_test',
+            operation=requested_operation,
         )
         request_payload['request_id'] = f'generate-test-{selected_target.split(".")[-1]}'
         request_payload['mode'] = 'generate_test'
@@ -545,8 +740,22 @@ class PipelineService:
             result_payload=call_result.result_payload,
         )
 
-    def _external_generate(self, run_dir: Path, change_request: ChangeRequest, selected_target: str, context_pack: ContextPack) -> ExternalGenerationCall:
-        request_payload = build_generation_request(self.project_services.project_root, change_request, selected_target, context_pack, self.project_services.config)
+    def _external_generate(
+        self,
+        run_dir: Path,
+        change_request: ChangeRequest,
+        selected_target: str,
+        context_pack: ContextPack,
+        operation: str = 'replace_symbol',
+    ) -> ExternalGenerationCall:
+        request_payload = build_generation_request(
+            self.project_services.project_root,
+            change_request,
+            selected_target,
+            context_pack,
+            self.project_services.config,
+            operation=operation,
+        )
         request_payload.setdefault('options', {})['generate_test_mode'] = 'never'
         call_result = invoke_generate(run_dir, self.project_services.config, request_payload)
         return ExternalGenerationCall(
@@ -559,8 +768,25 @@ class PipelineService:
             result_payload=call_result.result_payload,
         )
 
-    def _external_repair(self, run_dir: Path, change_request: ChangeRequest, selected_target: str, context_pack: ContextPack, previous_result_payload: dict[str, Any], verification_report: dict[str, Any]) -> ExternalGenerationCall:
-        request_payload = build_repair_request(change_request, selected_target, previous_result_payload, context_pack, verification_report.get('failure_summary', {}), self.project_services.config)
+    def _external_repair(
+        self,
+        run_dir: Path,
+        change_request: ChangeRequest,
+        selected_target: str,
+        context_pack: ContextPack,
+        previous_result_payload: dict[str, Any],
+        verification_report: dict[str, Any],
+        requested_operation: str = 'replace_symbol',
+    ) -> ExternalGenerationCall:
+        request_payload = build_repair_request(
+            change_request,
+            selected_target,
+            previous_result_payload,
+            context_pack,
+            verification_report.get('failure_summary', {}),
+            self.project_services.config,
+            requested_operation=requested_operation,
+        )
         call_result = invoke_repair(run_dir, self.project_services.config, request_payload)
         return ExternalGenerationCall(
             mode='cli_json',
