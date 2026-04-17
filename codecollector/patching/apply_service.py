@@ -68,6 +68,10 @@ class ApplyService:
                 artifact.target_qualname,
                 changed_files=[str(path.relative_to(workspace)) for path in changed_files],
                 validation_ok=validation.is_valid,
+                before_primary_file=before_path,
+                after_primary_file=target_path,
+                target_module_name=symbol.module_name,
+                operation=artifact.operation,
             )
             return ApplyResult(workspace, artifact, diff, validation, reindexed, impact)
         except Exception:
@@ -110,6 +114,18 @@ class ApplyService:
         if insert_at < len(lines) and lines[insert_at].strip():
             result = result + ['']
         return result
+    
+    def _list_symbol_qualnames_from_source(self, file_path: Path, module_name: str) -> list[str]:
+        source = file_path.read_text(encoding='utf-8')
+        tree = ast.parse(source)
+
+        qualnames: list[str] = []
+
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                qualnames.append(f'{module_name}.{node.name}')
+
+        return qualnames    
 
     def _build_impact_summary(
         self,
@@ -119,6 +135,10 @@ class ApplyService:
         target_qualname: str,
         changed_files: list[str],
         validation_ok: bool,
+        before_primary_file: Path,
+        after_primary_file: Path,
+        target_module_name: str,
+        operation: str,
     ) -> ImpactSummary:
         changed_file_path = changed_files[0] if changed_files else ''
         direct_inbound = [
@@ -170,9 +190,32 @@ class ApplyService:
 
         symbols_in_changed_files: list[str] = []
         seen_symbols: set[str] = set()
-        if target_qualname:
-            symbols_in_changed_files.append(target_qualname)
-            seen_symbols.add(target_qualname)
+
+        primary_symbols_before = set(
+            self._list_symbol_qualnames_from_source(before_primary_file, target_module_name)
+        )
+        primary_symbols_after = self._list_symbol_qualnames_from_source(after_primary_file, target_module_name)
+
+        primary_added_symbols = [
+            qualname
+            for qualname in primary_symbols_after
+            if qualname not in primary_symbols_before
+        ]
+
+        if operation == 'insert_after_symbol':
+            if primary_added_symbols:
+                for qualname in primary_added_symbols:
+                    if qualname not in seen_symbols:
+                        seen_symbols.add(qualname)
+                        symbols_in_changed_files.append(qualname)
+            elif target_qualname:
+                seen_symbols.add(target_qualname)
+                symbols_in_changed_files.append(target_qualname)
+        else:
+            if target_qualname:
+                seen_symbols.add(target_qualname)
+                symbols_in_changed_files.append(target_qualname)
+
         for file_path in changed_files:
             if file_path == changed_file_path:
                 continue

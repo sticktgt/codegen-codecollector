@@ -7,7 +7,12 @@ from pathlib import Path
 from typing import Any
 
 from codecollector.config import AppConfig
-from codecollector.domain.models import ChangeRequest, GenerateApiResultSummary, PipelineRunResult
+from codecollector.domain.models import (
+    ChangeRequest,
+    GenerateApiResultSummary,
+    PipelineRunResult,
+    SelectTargetApiResultSummary,
+)
 from codecollector.logger import get_logger
 from codecollector.orchestration.services import ProjectServices
 from codecollector.projects.project_service import ProjectService
@@ -134,11 +139,28 @@ class SessionService:
 
     def select_target(self, session_id: str, selected_qualname: str) -> dict[str, Any]:
         payload = self.registry.get(session_id)
+        previous_selected_target = str(payload.get('selected_target') or '').strip() or None
+        recommended_target = str(payload.get('recommended_target') or '').strip() or None
+        new_selected_target = str(selected_qualname or '').strip() or None
+
+        effective_previous_target = previous_selected_target or recommended_target
+        selection_changed = new_selected_target != effective_previous_target
+
         payload['selected_target'] = selected_qualname
         payload['status'] = 'target_selected'
         payload['updated_at'] = _utc_now()
         self.registry.save(payload)
-        return payload
+
+        return {
+            'session_id': session_id,
+            'project_id': payload['project_id'],
+            'selected_target': payload['selected_target'],
+            'session': payload,
+            'result_summary': self._select_target_result_summary_payload(
+                payload,
+                selection_changed=selection_changed,
+            ),
+        }
 
     def resolve_target(self, session_id: str, selected_target: str | None = None) -> tuple[str, str]:
         payload = self.registry.get(session_id)
@@ -277,9 +299,16 @@ class SessionService:
         if workspace_id and workspace_id not in workspace_ids:
             workspace_ids.append(workspace_id)
 
+        result_summary = self._result_summary_payload(result)
+        result_status = str((result_summary or {}).get('status') or '').strip()
+
+        if not result_status:
+            verification_passed = bool((result.verification_report or {}).get('passed', False))
+            result_status = 'generated' if verification_passed else 'verification_failed'            
+
         session_payload['selected_target'] = resolved_target
         session_payload['requested_operation'] = requested_operation
-        session_payload['status'] = 'generated'
+        session_payload['status'] = result_status
         session_payload['updated_at'] = _utc_now()
         session_payload['run_ids'] = run_ids
         session_payload['workspace_ids'] = workspace_ids
@@ -298,7 +327,7 @@ class SessionService:
             'workspace_path': workspace_path or None,
             'session': session_payload,
             'pipeline_result': self._pipeline_payload(result),
-            'result_summary': self._result_summary_payload(result),
+            'result_summary': result_summary,
             'requested_operation': requested_operation,
         }
 
@@ -551,5 +580,23 @@ class SessionService:
             linked_requirements=list(execution.linked_requirements),
             recommended_tests=list(execution.recommended_tests),
             recommended_test_commands=list(execution.recommended_test_commands),
+        )
+        return asdict(summary)
+    
+    def _select_target_result_summary_payload(
+        self,
+        session_payload: dict[str, Any],
+    selection_changed: bool,
+    ) -> dict[str, Any]:
+        selected_target = str(session_payload.get('selected_target') or '').strip() or None
+        recommended = str(session_payload.get('recommended_target') or '').strip() or None
+
+        summary = SelectTargetApiResultSummary(
+            status=str(session_payload.get('status') or ''),
+            project_id=str(session_payload.get('project_id') or ''),
+            requested_operation=str(session_payload.get('requested_operation') or '').strip() or None,
+            recommended_target=recommended,
+            selected_target=selected_target,
+            selection_changed=selection_changed,
         )
         return asdict(summary)

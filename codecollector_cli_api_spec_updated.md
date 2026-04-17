@@ -117,7 +117,7 @@ python -m codecollector sessions generate --session-id <session_id> [--selected-
 | `--limit` | int | no | Лимит для внутреннего shortlist, если он используется |
 | `--disable-vector-search` | flag | no | Отключает vector search при поиске |
 
-Основной JSON-ответ: wrapper-объект: metadata session + `pipeline_result` + `requested_operation`.
+Основной JSON-ответ: wrapper-объект: metadata session + `pipeline_result` + `result_summary` + `requested_operation`.
 
 ---
 
@@ -136,7 +136,7 @@ python -m codecollector sessions repair --session-id <session_id> [--selected-qu
 | `--note` | string | no | Причина repair после review |
 | `--disable-vector-search` | flag | no | Для совместимости CLI; в repair обычно не критично |
 
-Основной JSON-ответ: wrapper-объект с полями `repair_outcome` / `repair_effective` и `pipeline_result`.
+Основной JSON-ответ: wrapper-объект с полями `repair_outcome` / `repair_effective`, `pipeline_result`, `result_summary` и обновленной `session`.
 
 ---
 
@@ -344,7 +344,7 @@ python -m codecollector index build ...
 | `project_id` | string | yes | Связанный проект |
 | `input_requirements` | Requirement[] | yes | Исходные требования пользователя |
 | `requested_operation` | string | yes | Операция по умолчанию для generate |
-| `status` | string | yes | `analyzed` / `target_selected` / `generated` / `repaired` / `applied` / `finalized` / ... |
+| `status` | string | yes | `analyzed` / `target_selected` / `generated` / `generated_test_verification_failed` / `repair_verification_failed` / `repair_no_effective_change` / `repaired` / `finalized` / ... |
 | `created_at` | ISO datetime | yes | Время создания session |
 | `updated_at` | ISO datetime | yes | Время последнего изменения |
 | `run_ids` | string[] | yes | История pipeline run ids |
@@ -385,6 +385,21 @@ python -m codecollector index build ...
   "last_workspace_id": "sample_python_app-20260403T155644.397413Z-125c02"
 }
 ```
+
+#### Практическая семантика `session.status`
+
+`session.status` отражает текущее состояние пользовательского сценария.
+
+Используются, в частности, следующие значения:
+
+- `analyzed` — создана session и построен shortlist;
+- `target_selected` — target подтвержден;
+- `generated` — generate завершен успешно и verification пройден;
+- `generated_test_verification_failed` — основной код применен, но verification не пройден из-за ошибки только в сгенерированном тесте;
+- `repair_verification_failed` — repair изменил workspace, но verification не пройден;
+- `repair_no_effective_change` — repair был выполнен, но не дал эффективного изменения;
+- `repaired` — repair завершился успешно;
+- `finalized` — session завершена.
 
 ---
 
@@ -442,6 +457,38 @@ python -m codecollector index build ...
   }
 }
 ```
+### 4.5.1 `ResultSummary`
+
+`result_summary` — краткий API-friendly summary итогового состояния run.
+
+Он нужен как компактный объект для CLI, UI и будущего REST API без необходимости сразу читать весь `pipeline_result`.
+
+| Field | Type | Required | Description |
+|---|---|---:|---|
+| `status` | string | yes | Итоговый статус сценария |
+| `selected_target` | string | yes | Финальный target |
+| `requested_operation` | string | yes | Операция, запрошенная пользователем |
+| `final_operation` | string | yes | Операция, реально использованная в run |
+| `workspace_path` | string\|null | yes | Финальный workspace |
+| `changed_files` | string[] | yes | Измененные файлы |
+| `symbols_in_changed_files` | string[] | yes | Символы в измененных файлах |
+| `verification_passed` | boolean | yes | Итог verification |
+| `merge_mode` | string\|null | yes | Режим merge plan |
+| `merge_ready` | boolean | yes | Готовность к ручному review |
+| `has_generated_test` | boolean | yes | Был ли добавлен generated test |
+| `generated_test_files` | string[] | yes | Список generated test файлов |
+| `repair_used` | boolean | yes | Использовался ли repair |
+| `linked_requirements` | string[] | yes | Связанные requirement ids |
+| `recommended_tests` | string[] | yes | Рекомендуемые тесты |
+| `recommended_test_commands` | string[] | yes | Команды запуска рекомендуемых тестов |
+
+Значения `status` в `result_summary` должны явно различать:
+
+- `ready_for_merge_review`
+- `verification_failed`
+- `generated_test_verification_failed`
+- `repair_verification_failed`
+- `repair_no_effective_change`
 
 ---
 
@@ -509,10 +556,15 @@ python -m codecollector index build ...
 | `results.py_compile` | object | no | Результат `compileall` |
 | `results.pytest_recommended` | object | no | Результат рекомендованных тестов |
 | `results.repair_intent` | object | no | Спецпроверка `no-op repair` |
-| `failure_summary.failed_checks` | string[] | yes | Список проваленных checks |
+| `failure_summary.failed_checks` | object[] | yes | Детализация проваленных checks |
 | `failure_summary.repairable` | boolean | yes | Можно ли пытаться repair повторно |
-| `failure_summary.messages` | string[] | no | Краткие сообщения об ошибках |
-| `failure_summary.stage` | string | no | Этап, где возникла проблема |
+
+Если verification не пройден, итоговый внешний статус run определяется отдельно.
+
+Используются два разных сценария:
+
+- `verification_failed` — ошибка относится к общему результату изменения;
+- `generated_test_verification_failed` — упал только сгенерированный тест, основной код не отправляется в `repair`.
 
 ---
 
@@ -562,6 +614,8 @@ python -m codecollector index build ...
 - `PipelineRunResult` — основной диагностический объект;
 - `merge_plan` всегда имеет смысл dry-run оценки, а не автоматического merge;
 - внешний `codegenerator` является частью рабочего контура и его request/result входят в run payload как first-class данные.
+- `result_summary` является обязательным кратким итоговым объектом для session-based сценариев generate и repair;
+- `generated_test_verification_failed` отдельно отражает случай, когда основной код корректен, но verification упал только на сгенерированном тесте.
 
 ---
 

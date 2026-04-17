@@ -253,6 +253,26 @@ class GenerateApiResultSummary:
     recommended_test_commands: list[str] = field(default_factory=list)
 
 @dataclass(slots=True)
+class AnalyzeApiResultSummary:
+    status: str
+    project_id: str
+    requested_operation: str | None = None
+    recommended_target: str | None = None
+    candidates_count: int = 0
+    top_candidates: list[str] = field(default_factory=list)
+    has_context_summary: bool = False
+
+
+@dataclass(slots=True)
+class SelectTargetApiResultSummary:
+    status: str
+    project_id: str
+    requested_operation: str | None = None
+    recommended_target: str | None = None
+    selected_target: str | None = None
+    selection_changed: bool = False    
+
+@dataclass(slots=True)
 class PipelineRunResult:
     run_id: str
     run_label: str

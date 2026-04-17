@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from codecollector.config import AppConfig
-from codecollector.domain.models import ChangeRequest, ContextPack, SearchCandidate
+from codecollector.domain.models import AnalyzeApiResultSummary, ChangeRequest, ContextPack, SearchCandidate
 from codecollector.orchestration.services import ProjectServices
 from codecollector.projects.project_service import ProjectService
 from codecollector.sessions.session_service import SessionService
@@ -22,6 +22,7 @@ class AnalyzeSessionResult:
     candidates: list[SearchCandidate]
     recommended_target: str | None
     context_summary: dict[str, Any] | None
+    result_summary: AnalyzeApiResultSummary | None = None
 
 
 class AnalyzeService:
@@ -92,6 +93,13 @@ class AnalyzeService:
             candidates=candidates,
             recommended_target=recommended_target,
             context_summary=context_summary,
+            result_summary=self._build_result_summary(
+                project_id=project_id,
+                requested_operation=requested_operation,
+                recommended_target=recommended_target,
+                candidates=candidates,
+                context_summary=context_summary,
+            ),
         )
 
     def _build_query(self, requirements: list[dict[str, Any]]) -> str:
@@ -137,6 +145,24 @@ class AnalyzeService:
             'outbound_relations_count': len(context.outbound_relations),
         }
 
+    def _build_result_summary(
+        self,
+        *,
+        project_id: str,
+        requested_operation: str,
+        recommended_target: str | None,
+        candidates: list[SearchCandidate],
+        context_summary: dict[str, Any] | None,
+    ) -> AnalyzeApiResultSummary:
+        return AnalyzeApiResultSummary(
+            status='analyzed',
+            project_id=project_id,
+            requested_operation=requested_operation,
+            recommended_target=recommended_target,
+            candidates_count=len(candidates),
+            top_candidates=[item.qualname for item in candidates[:3]],
+            has_context_summary=context_summary is not None,
+        )
 
 def build_single_requirement_payload(
     *,

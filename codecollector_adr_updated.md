@@ -154,6 +154,23 @@ Session хранит:
 - `last_run_id`
 - `last_workspace_id`
 
+## Текущая семантика статусов session
+
+`session.status` должен отражать актуальное пользовательское состояние, а не только факт последнего запуска.
+
+Используются, в частности, следующие состояния:
+
+- `analyzed`
+- `target_selected`
+- `generated`
+- `generated_test_verification_failed`
+- `repair_verification_failed`
+- `repair_no_effective_change`
+- `repaired`
+- `finalized`
+
+Особый случай `generated_test_verification_failed` нужен для ситуации, когда основной код применен успешно, но verification не пройден только из-за ошибки в сгенерированном тесте.
+
 ## Семантика session
 - `sessions analyze` создает session и предлагает `recommended_target`;
 - `sessions select-target` фиксирует пользовательский выбор;
@@ -561,6 +578,15 @@ Reference library рассматриваются как отдельный вх�
 - `apply_result`
 - `merge_plan`
 
+Дополнительно рядом с полным `PipelineRunResult` используется отдельный краткий объект `ResultSummary`.
+
+Он нужен для:
+- CLI-ответов верхнего уровня;
+- session-based flow;
+- будущего UI и HTTP API.
+
+`ResultSummary` содержит компактное итоговое состояние run без необходимости сразу читать весь подробный payload.
+
 ## Почему это важно
 Именно этот объект позволяет:
 - показать пользователю, что происходило в pipeline;
@@ -597,6 +623,13 @@ Reference library рассматриваются как отдельный вх�
 - что именно упало;
 - repairable ли этот результат.
 
+При этом итоговый внешний статус run должен различать:
+
+- общий сбой verification;
+- сбой только сгенерированного теста.
+
+Если verification не пройден только из-за generated test, используется отдельный статус `generated_test_verification_failed`.
+
 ## Текущее состояние
 Реализовано и уже используется в generate flow.
 
@@ -617,8 +650,9 @@ Reference library рассматриваются как отдельный вх�
 Генерация тестов остается рабочей частью pipeline, но архитектурно система не завязана на то, что сгенерированный тест всегда будет корректным.
 
 Важно следующее:
-- основной код и generated tests должны рассматриваться отдельно в verification;
-- падение только generated test не должно ломать архитектурную модель run;
+- основной код и generated tests рассматриваются отдельно в verification;
+- падение только generated test фиксируется отдельным статусом `generated_test_verification_failed`;
+- основной код в этом случае не отправляется в `repair`;
 - сборка test prompt должна оставаться простой и поддерживаемой;
 - оптимизация prompt не должна превращаться в сложную многоступенчатую систему.
 

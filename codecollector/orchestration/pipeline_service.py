@@ -673,6 +673,18 @@ class PipelineService:
                 non_generated_test_failure = True
 
         return generated_test_failure and not non_generated_test_failure
+    
+    def _resolve_verification_status(
+        self,
+        verification_report: dict[str, Any] | None,
+    ) -> str | None:
+        if verification_report is None:
+            return None
+        if bool(verification_report.get('passed')):
+            return 'passed'
+        if self._generated_test_failure_only(verification_report):
+            return 'generated_test_verification_failed'
+        return 'verification_failed'    
 
     def _build_partial_run_result(
         self,
@@ -1004,15 +1016,18 @@ class PipelineService:
             recommended_test_commands = list(apply_result.impact.recommended_test_commands)
 
         verification_passed = None if verification_report is None else bool(verification_report.get('passed', False))
+        verification_status = self._resolve_verification_status(verification_report)
         has_generated_test = bool((generated_test_apply or {}).get('count', 0))
         generated_test_files = list((generated_test_apply or {}).get('applied_tests') or [])
         repair_used = repair_generation is not None
         merge_mode = None if merge_plan is None else merge_plan.mode
         merge_ready = None if merge_plan is None else bool(merge_plan.ready_for_manual_merge_review)
 
-        if merge_ready is True:
+        if merge_ready:
             status = 'ready_for_merge_review'
-        elif verification_passed is False:
+        elif verification_status == 'generated_test_verification_failed':
+            status = 'generated_test_verification_failed'
+        elif verification_status == 'verification_failed':
             status = 'verification_failed'
         elif apply_result is not None:
             status = 'applied'
