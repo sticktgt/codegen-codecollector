@@ -5,6 +5,7 @@ from pathlib import Path
 from codecollector.config import AppConfig
 from codecollector.indexing.base import IndexStore
 from codecollector.logger import get_logger
+from codecollector.vector_search.ollama_embeddings import snapshot_embedding_usage
 from codecollector.vector_search.pgvector_service import PGVectorDescriptionSearchService
 
 LOGGER = get_logger(__name__)
@@ -23,3 +24,6 @@ class DescriptionVectorSearchService:
 
     def search(self, query: str, limit: int = 10, project_key: str | None = None) -> dict[str, float]:
         return self.backend.search(query, limit=limit, project_key=project_key or self.project_key)
+    
+    def get_embedding_usage_summary(self) -> dict[str, object]:
+        return snapshot_embedding_usage()

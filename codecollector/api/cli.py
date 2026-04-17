@@ -23,7 +23,7 @@ from codecollector.workspace.workspace_service import WorkspaceService
 from codecollector.orchestration.pipeline_service import PipelineRunFailed
 
 LOGGER = get_logger(__name__)
-PATCH_OPERATIONS = ('replace_symbol', 'insert_after_symbol', 'add_symbol')
+PATCH_OPERATIONS = ('replace_symbol', 'insert_after_symbol')
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -8,7 +8,6 @@ from typing import Any
 from uuid import uuid4
 
 from codecollector.logger import get_logger
-from codecollector.vector_search.ollama_embeddings import snapshot_embedding_usage
 
 LOGGER = get_logger(__name__)
 
@@ -37,10 +36,7 @@ class RunArtifactsManager:
 
     def _serialize(self, value: Any) -> Any:
         if is_dataclass(value):
-            serialized = {key: self._serialize(item) for key, item in asdict(value).items()}
-            if value.__class__.__name__ == 'PipelineRunResult':
-                serialized['usage_summary'] = self._build_usage_summary(serialized)
-            return serialized
+            return {key: self._serialize(item) for key, item in asdict(value).items()}
         if isinstance(value, Path):
             return str(value)
         if isinstance(value, dict):
@@ -48,55 +44,3 @@ class RunArtifactsManager:
         if isinstance(value, (list, tuple, set)):
             return [self._serialize(item) for item in value]
         return value
-
-
-    def _build_usage_summary(self, serialized_run: dict[str, Any]) -> dict[str, Any]:
-        def usage_from(payload: dict[str, Any] | None) -> dict[str, Any] | None:
-            if not payload:
-                return None
-            usage = payload.get('result_payload', {}).get('llm_usage')
-            return usage if isinstance(usage, dict) else None
-
-        def merge_usage(items: list[dict[str, Any] | None]) -> dict[str, Any]:
-            merged: dict[str, Any] = {
-                'calls': 0,
-                'prompt_tokens': 0.0,
-                'output_tokens': 0.0,
-                'total_tokens': 0.0,
-                'duration_sec': 0.0,
-                'total_duration_sec': 0.0,
-                'load_duration_sec': 0.0,
-                'prompt_eval_duration_sec': 0.0,
-                'eval_duration_sec': 0.0,
-            }
-            for item in items:
-                if not item:
-                    continue
-                merged['calls'] += int(item.get('calls', 0) or 0)
-                for key in (
-                    'prompt_tokens',
-                    'output_tokens',
-                    'total_tokens',
-                    'duration_sec',
-                    'total_duration_sec',
-                    'load_duration_sec',
-                    'prompt_eval_duration_sec',
-                    'eval_duration_sec',
-                ):
-                    merged[key] = round(float(merged.get(key, 0.0)) + float(item.get(key, 0.0) or 0.0), 6)
-            return merged
-
-        code_generation = usage_from(serialized_run.get('external_code_generation'))
-        test_generation = usage_from(serialized_run.get('external_test_generation'))
-        repair_generation = usage_from(serialized_run.get('repair_generation'))
-        embedding = snapshot_embedding_usage()
-        llm_total = merge_usage([code_generation, test_generation, repair_generation])
-        overall_total_tokens = round(float(llm_total.get('total_tokens', 0.0)) + float(embedding.get('prompt_tokens', 0) or 0.0), 6)
-        return {
-            'embedding': embedding,
-            'code_generation': code_generation,
-            'test_generation': test_generation,
-            'repair_generation': repair_generation,
-            'llm_total': llm_total,
-            'overall_total_tokens_including_embeddings': overall_total_tokens,
-        }

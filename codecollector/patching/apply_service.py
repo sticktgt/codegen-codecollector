@@ -90,18 +90,12 @@ class ApplyService:
         elif artifact.operation == 'insert_after_symbol':
             insert_at = symbol.end_line
             lines[insert_at:insert_at] = self._with_spacing_before_insert(lines, insert_at, payload_lines)
-        elif artifact.operation == 'add_symbol':
-            insert_at = self._compute_add_symbol_line(symbol)
-            lines[insert_at:insert_at] = self._with_spacing_before_insert(lines, insert_at, payload_lines)
         else:
             raise ValueError(f'Unsupported patch operation: {artifact.operation}')
 
         updated_source = '\n'.join(lines).rstrip('\n') + '\n'
         ast.parse(updated_source)
         target_path.write_text(updated_source, encoding='utf-8')
-
-    def _compute_add_symbol_line(self, symbol: SymbolRecord) -> int:
-        return symbol.end_line
 
     def _normalize_payload_lines(self, payload: str) -> list[str]:
         stripped = payload.rstrip('\n')

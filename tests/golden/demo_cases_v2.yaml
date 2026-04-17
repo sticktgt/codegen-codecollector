@@ -35,7 +35,7 @@ cases:
       - support_app.services.ticket_service.TicketService.assign_ticket
   - id: apply_add_service_method_v2
     kind: apply
-    operation: add_symbol
+    operation: insert_after_symbol
     qualname: support_app.services.ticket_service.TicketService
     artifact_file: demo_artifacts/reopen_ticket_method.py
     expected_new_symbol: support_app.services.ticket_service.TicketService.reopen_ticket

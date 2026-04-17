@@ -81,7 +81,7 @@ def test_apply_insert_after_symbol_adds_helper_function() -> None:
     assert 'def build_assignment_audit_line' in content
 
 
-def test_apply_add_symbol_appends_method_to_class() -> None:
+def test_apply_insert_after_symbol_appends_method_to_class() -> None:
     services = ProjectServices(PROJECT_ROOT)
     services.build_index(full_rebuild=True)
 
@@ -90,7 +90,7 @@ def test_apply_add_symbol_appends_method_to_class() -> None:
         PatchArtifact(
             target_qualname='support_app.services.ticket_service.TicketService',
             replacement_code=artifact_code,
-            operation='add_symbol',
+            operation='insert_after_symbol',
         )
     )
 

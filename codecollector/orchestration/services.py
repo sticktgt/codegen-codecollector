@@ -18,6 +18,7 @@ from codecollector.patching.apply_service import ApplyService
 from codecollector.search.service import SearchService
 from codecollector.vector_search.service import DescriptionVectorSearchService
 from codecollector.validation.service import ValidationService
+from codecollector.vector_search.ollama_embeddings import reset_embedding_usage
 
 LOGGER = get_logger(__name__)
 
@@ -174,6 +175,16 @@ class ProjectServices:
             verification_report=verification_report,
             requested_operation=requested_operation,
         )
+    
+    def reset_embedding_usage(self) -> None:
+        reset_embedding_usage()    
+    
+    def get_embedding_usage_summary(self) -> dict[str, Any] | None:
+        try:
+            return self.vector_search_service.get_embedding_usage_summary()
+        except Exception:
+            LOGGER.exception('Failed to read embedding usage summary from vector_search_service')
+            return None 
 
     def _sync_search_documents(self) -> dict[str, int | bool]:
         documents: list[dict[str, str]] = []

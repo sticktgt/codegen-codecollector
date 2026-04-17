@@ -76,6 +76,8 @@
 - новый symbol вставляется после выбранного anchor;
 - shortlist для analyze строится с учетом отдельного профиля ранжирования.
 
+Для добавления нового метода в существующий класс используется `insert_after_symbol` с target на symbol класса. 
+
 ### Operation-aware analyze
 
 Для `insert_after_symbol` анализ предпочитает:

@@ -17,7 +17,7 @@ RelationKind = Literal[
 RelationSource = Literal["index", "knowledge"]
 RelationConfidence = Literal["high", "medium", "low"]
 Severity = Literal["info", "warning", "error"]
-PatchOperation = Literal["replace_symbol", "insert_after_symbol", "add_symbol"]
+PatchOperation = Literal["replace_symbol", "insert_after_symbol"]
 
 
 @dataclass(slots=True)
@@ -181,8 +181,8 @@ class ExternalGenerationCall:
     request_path: str
     result_path: str
     trace_path: str | None
-    request_payload: dict[str, Any]
-    result_payload: dict[str, Any]
+    request_summary: dict[str, Any] = field(default_factory=dict)
+    result_summary: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -206,7 +206,51 @@ class PipelineStepRecord:
     finished_at: str
     duration_ms: int
     summary: str
+    error_type: str | None = None
+    error_message: str | None = None
+    exception_class: str | None = None
 
+@dataclass(slots=True)
+class PipelineExecutionSummary:
+    status: str
+    selected_target: str
+    requested_operation: str | None = None
+    final_operation: str | None = None
+    changed_files: list[str] = field(default_factory=list)
+    symbols_in_changed_files: list[str] = field(default_factory=list)
+    workspace_path: str | None = None
+    verification_passed: bool | None = None
+    has_generated_test: bool = False
+    generated_test_files: list[str] = field(default_factory=list)
+    repair_used: bool = False
+    merge_mode: str | None = None
+    merge_ready: bool | None = None
+    linked_requirements: list[str] = field(default_factory=list)
+    recommended_tests: list[str] = field(default_factory=list)
+    recommended_test_commands: list[str] = field(default_factory=list)
+    code_generation_usage: dict[str, Any] | None = None
+    test_generation_usage: dict[str, Any] | None = None
+    repair_generation_usage: dict[str, Any] | None = None
+    embedding_usage: dict[str, Any] | None = None
+
+@dataclass(slots=True)
+class GenerateApiResultSummary:
+    status: str
+    selected_target: str
+    requested_operation: str | None = None
+    final_operation: str | None = None
+    workspace_path: str | None = None
+    changed_files: list[str] = field(default_factory=list)
+    symbols_in_changed_files: list[str] = field(default_factory=list)
+    verification_passed: bool | None = None
+    merge_mode: str | None = None
+    merge_ready: bool | None = None
+    has_generated_test: bool = False
+    generated_test_files: list[str] = field(default_factory=list)
+    repair_used: bool = False
+    linked_requirements: list[str] = field(default_factory=list)
+    recommended_tests: list[str] = field(default_factory=list)
+    recommended_test_commands: list[str] = field(default_factory=list)
 
 @dataclass(slots=True)
 class PipelineRunResult:
@@ -228,3 +272,4 @@ class PipelineRunResult:
     verification_report: dict[str, Any] | None = None
     repair_generation: ExternalGenerationCall | None = None
     warnings: list[str] = field(default_factory=list)
+    execution_summary: PipelineExecutionSummary | None = None

@@ -270,7 +270,7 @@ with tab_search:
 
 with tab_apply:
     apply_target = st.text_input('Target qualname для apply', st.session_state.get('selected_qualname', 'support_app.services.notification_service.build_assignment_message'))
-    apply_operation = st.selectbox('Операция', ['replace_symbol', 'insert_after_symbol', 'add_symbol'])
+    apply_operation = st.selectbox('Операция', ['replace_symbol', 'insert_after_symbol'])
     selected_artifact = st.selectbox('Demo artifact', demo_artifact_options, index=max(demo_artifact_options.index('build_assignment_message_v2.py'), 0) if 'build_assignment_message_v2.py' in demo_artifact_options else 0)
     if st.button('Применить в staging'):
         try:
@@ -320,7 +320,7 @@ with tab_pipeline:
         _render_candidates(pipeline_candidates)
         selected_pipeline_target = st.selectbox('Подтвердить target для pipeline', [item['qualname'] for item in pipeline_candidates], key='pipeline_selected_target')
         selected_pipeline_artifact = st.selectbox('Replay artifact для pipeline', demo_artifact_options, key='pipeline_selected_artifact')
-        pipeline_operation = st.selectbox('Операция pipeline', ['replace_symbol', 'insert_after_symbol', 'add_symbol'], key='pipeline_operation')
+        pipeline_operation = st.selectbox('Операция pipeline', ['replace_symbol', 'insert_after_symbol'], key='pipeline_operation')
         if st.button('Запустить полный dry-run pipeline'):
             try:
                 constraints = [line.strip() for line in constraints_raw.splitlines() if line.strip()]

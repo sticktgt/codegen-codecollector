@@ -12,6 +12,7 @@ from codecollector.domain.models import (
     GenerationReplay,
     MergePlan,
     PatchArtifact,
+    PipelineExecutionSummary,
     PipelineRunResult,
     PipelineStepRecord,
     SearchCandidate,
@@ -53,6 +54,7 @@ class PipelineService:
         limit: int,
         use_vector_search: bool | None = None,
     ) -> PipelineRunResult:
+        self.project_services.reset_embedding_usage()
         run_id, run_label, run_dir = self.artifacts_manager.create_run_dir('pipeline')
         steps: list[PipelineStepRecord] = []
 
@@ -147,6 +149,7 @@ class PipelineService:
         verification_report: dict[str, Any],
         requested_operation: str = 'replace_symbol',
     ) -> PipelineRunResult:
+        self.project_services.reset_embedding_usage()
         run_id, run_label, run_dir = self.artifacts_manager.create_run_dir('pipeline')
         steps: list[PipelineStepRecord] = []
 
@@ -192,7 +195,7 @@ class PipelineService:
                 'content_modes': [item.content_mode for item in reference_artifacts],
             }
 
-            repair_generation = self._run_step(
+            repair_generation, repair_result_payload = self._run_step(
                 steps,
                 'external_repair',
                 'Вызвать внешний codegenerator repair по запросу пользователя',
@@ -206,8 +209,8 @@ class PipelineService:
                     requested_operation=requested_operation,
                 ),
             )
-            if not self._has_code_artifact(repair_generation.result_payload):
-                raise RuntimeError(repair_generation.result_payload.get('message') or 'codegenerator repair did not return code_artifact')
+            if not self._has_code_artifact(repair_result_payload):
+                raise RuntimeError(repair_result_payload.get('message') or 'codegenerator repair did not return code_artifact')
 
             apply_result = self._replace_active_apply_result(
                 apply_result,
@@ -216,7 +219,7 @@ class PipelineService:
                     'apply_repair_staging',
                     'Применить исправленный артефакт в staging workspace',
                     lambda: self.project_services.apply(
-                        patch_artifact_from_result(repair_generation.result_payload, selected_target),
+                        patch_artifact_from_result(repair_result_payload, selected_target),
                         generated_tests=[],
                     ),
                 ),
@@ -294,6 +297,7 @@ class PipelineService:
         skip_search: bool = False,
         requested_operation: str = 'replace_symbol',
     ) -> PipelineRunResult:
+        self.project_services.reset_embedding_usage()
         run_id, run_label, run_dir = self.artifacts_manager.create_run_dir('pipeline')
         steps: list[PipelineStepRecord] = []
         warnings: list[str] = []
@@ -365,7 +369,7 @@ class PipelineService:
                 'content_modes': [item.content_mode for item in reference_artifacts],
             }
 
-            external_code_generation = self._run_step(
+            external_code_generation, external_code_result_payload = self._run_step(
                 steps,
                 'external_generate',
                 'Вызвать внешний codegenerator и получить code artifact',
@@ -377,12 +381,12 @@ class PipelineService:
                     requested_operation,
                 ),
             )
-            if not self._has_code_artifact(external_code_generation.result_payload):
-                raise RuntimeError(external_code_generation.result_payload.get('message') or 'codegenerator generate did not return code_artifact')
+            if not self._has_code_artifact(external_code_result_payload):
+                raise RuntimeError(external_code_result_payload.get('message') or 'codegenerator generate did not return code_artifact')
             
-            ensure_expected_operation(external_code_generation.result_payload, requested_operation)
+            ensure_expected_operation(external_code_result_payload, requested_operation)
 
-            final_payload = external_code_generation.result_payload
+            final_payload = external_code_result_payload
             generated_tests: list[dict[str, str]] = []
 
             try:
@@ -402,7 +406,7 @@ class PipelineService:
                 apply_failure_report = self._build_apply_failure_report(exc)
                 if not self.project_services.config.codegenerator_repair_enabled or not apply_failure_report['failure_summary'].get('repairable', False):
                     raise
-                repair_generation = self._run_step(
+                repair_generation, repair_result_payload = self._run_step(
                     steps,
                     'external_repair',
                     'Вызвать внешний codegenerator repair после ошибки apply',
@@ -411,14 +415,14 @@ class PipelineService:
                         change_request,
                         selected_target,
                         context_pack,
-                        external_code_generation.result_payload,
+                        external_code_result_payload,
                         apply_failure_report,
                         requested_operation=requested_operation,
                     ),
                 )
-                if not self._has_code_artifact(repair_generation.result_payload):
-                    raise RuntimeError(repair_generation.result_payload.get('message') or 'codegenerator repair did not return code_artifact')
-                final_payload = repair_generation.result_payload
+                if not self._has_code_artifact(repair_result_payload):
+                    raise RuntimeError(repair_result_payload.get('message') or 'codegenerator repair did not return code_artifact')
+                final_payload = repair_result_payload
                 apply_result = self._replace_active_apply_result(
                     apply_result,
                     self._run_step(
@@ -433,7 +437,7 @@ class PipelineService:
                 )
 
             if self._should_request_generated_test(context_pack, selected_target):
-                external_test_generation = self._run_step(
+                external_test_generation, external_test_result_payload = self._run_step(
                     steps,
                     'external_generate_test',
                     'Вызвать внешний codegenerator для генерации теста',
@@ -446,7 +450,7 @@ class PipelineService:
                         requested_operation=requested_operation,
                     ),
                 )
-                generated_tests = self._extract_generated_tests(external_test_generation.result_payload)
+                generated_tests = self._extract_generated_tests(external_test_result_payload)
                 if generated_tests:
                     generated_test_apply = {
                         'applied_tests': [item['file_path'] for item in generated_tests],
@@ -486,7 +490,7 @@ class PipelineService:
                     warnings.append(warning_message)
                     LOGGER.warning(warning_message)
                 else:
-                    repair_generation = self._run_step(
+                    repair_generation, repair_result_payload = self._run_step(
                         steps,
                         'external_repair',
                         'Вызвать внешний codegenerator repair после неуспешной проверки',
@@ -500,9 +504,9 @@ class PipelineService:
                             requested_operation=requested_operation,
                         ),
                     )
-                    if not self._has_code_artifact(repair_generation.result_payload):
-                        raise RuntimeError(repair_generation.result_payload.get('message') or 'codegenerator repair did not return code_artifact')
-                    final_payload = repair_generation.result_payload
+                    if not self._has_code_artifact(repair_result_payload):
+                        raise RuntimeError(repair_result_payload.get('message') or 'codegenerator repair did not return code_artifact')
+                    final_payload = repair_result_payload
                     apply_result = self._replace_active_apply_result(
                         apply_result,
                         self._run_step(
@@ -582,7 +586,12 @@ class PipelineService:
                 LOGGER.exception('Failed to write pipeline run bundle in finally: %s', run_dir)
         if caught_exc is not None:
             assert result is not None
-            raise PipelineRunFailed(str(caught_exc), result) from caught_exc
+            failed_step = next((step for step in reversed(steps) if step.status == 'error'), None)
+            if failed_step is not None:
+                message = f'{failed_step.step_name} failed: {caught_exc}'
+            else:
+                message = str(caught_exc)
+            raise PipelineRunFailed(message, result) from caught_exc
 
         assert result is not None
         return result        
@@ -686,6 +695,26 @@ class PipelineService:
         merge_plan: MergePlan | None = None,
         warnings: list[str] | None = None,
     ) -> PipelineRunResult:
+        usage_summary = self._build_usage_summary(
+            external_code_generation,
+            external_test_generation,
+            repair_generation,
+        )
+        execution_summary = self._build_execution_summary(
+            selected_target=selected_target,
+            requested_operation=(
+                external_code_generation.request_summary.get('target', {}).get('operation')
+                if external_code_generation is not None else None
+            ),
+            apply_result=apply_result,
+            verification_report=verification_report,
+            merge_plan=merge_plan,
+            generated_test_apply=generated_test_apply,
+            external_code_generation=external_code_generation,
+            external_test_generation=external_test_generation,
+            repair_generation=repair_generation,
+            usage_summary=usage_summary,
+        )     
         return PipelineRunResult(
             run_id=run_id,
             run_label=run_label,
@@ -705,7 +734,8 @@ class PipelineService:
             merge_plan=merge_plan,
             steps=steps,
             warnings=warnings or [],
-        )    
+            execution_summary=execution_summary,
+        )
 
     def _external_generate_test(
         self,
@@ -715,7 +745,7 @@ class PipelineService:
         context_pack: ContextPack,
         final_payload: dict[str, Any],
         requested_operation: str = 'replace_symbol',
-    ) -> ExternalGenerationCall:
+    ) -> tuple[ExternalGenerationCall, dict[str, Any]]:
         request_payload = build_generation_request(
             self.project_services.project_root,
             change_request,
@@ -730,15 +760,16 @@ class PipelineService:
         request_payload['mode'] = 'generate_test'
         request_payload.setdefault('options', {})['generate_test_mode'] = 'always'
         call_result = invoke_generate_test(run_dir, self.project_services.config, request_payload)
-        return ExternalGenerationCall(
+        external_call = ExternalGenerationCall(
             mode='cli_json',
             command=call_result.command,
             request_path=call_result.request_path,
             result_path=call_result.result_path,
             trace_path=call_result.trace_path,
-            request_payload=call_result.request_payload,
-            result_payload=call_result.result_payload,
+            request_summary=self._summarize_external_request(call_result.request_payload),
+            result_summary=self._summarize_external_result(call_result.result_payload),
         )
+        return external_call, call_result.result_payload
 
     def _external_generate(
         self,
@@ -747,7 +778,7 @@ class PipelineService:
         selected_target: str,
         context_pack: ContextPack,
         operation: str = 'replace_symbol',
-    ) -> ExternalGenerationCall:
+    ) -> tuple[ExternalGenerationCall, dict[str, Any]]:
         request_payload = build_generation_request(
             self.project_services.project_root,
             change_request,
@@ -758,15 +789,16 @@ class PipelineService:
         )
         request_payload.setdefault('options', {})['generate_test_mode'] = 'never'
         call_result = invoke_generate(run_dir, self.project_services.config, request_payload)
-        return ExternalGenerationCall(
+        external_call = ExternalGenerationCall(
             mode='cli_json',
             command=call_result.command,
             request_path=call_result.request_path,
             result_path=call_result.result_path,
             trace_path=call_result.trace_path,
-            request_payload=call_result.request_payload,
-            result_payload=call_result.result_payload,
+            request_summary=self._summarize_external_request(call_result.request_payload),
+            result_summary=self._summarize_external_result(call_result.result_payload),
         )
+        return external_call, call_result.result_payload
 
     def _external_repair(
         self,
@@ -777,7 +809,7 @@ class PipelineService:
         previous_result_payload: dict[str, Any],
         verification_report: dict[str, Any],
         requested_operation: str = 'replace_symbol',
-    ) -> ExternalGenerationCall:
+    ) -> tuple[ExternalGenerationCall, dict[str, Any]]:
         request_payload = build_repair_request(
             change_request,
             selected_target,
@@ -788,15 +820,16 @@ class PipelineService:
             requested_operation=requested_operation,
         )
         call_result = invoke_repair(run_dir, self.project_services.config, request_payload)
-        return ExternalGenerationCall(
+        external_call = ExternalGenerationCall(
             mode='cli_json',
             command=call_result.command,
             request_path=call_result.request_path,
             result_path=call_result.result_path,
             trace_path=call_result.trace_path,
-            request_payload=call_result.request_payload,
-            result_payload=call_result.result_payload,
+            request_summary=self._summarize_external_request(call_result.request_payload),
+            result_summary=self._summarize_external_result(call_result.result_payload),
         )
+        return external_call, call_result.result_payload
 
     def _extract_generated_tests(self, result_payload: dict[str, Any]) -> list[dict[str, str]]:
         test_artifact = result_payload.get('test_artifact') or {}
@@ -807,6 +840,209 @@ class PipelineService:
         if not file_path or not source_code:
             return []
         return [{'file_path': file_path, 'source_code': source_code}]
+    
+    def _summarize_external_request(self, request_payload: dict[str, Any]) -> dict[str, Any]:
+        target = dict(request_payload.get('target') or {})
+        project_context = dict(request_payload.get('project_context') or {})
+        reference_context = dict(request_payload.get('reference_context') or {})
+        generated_code_artifact = dict(request_payload.get('generated_code_artifact') or {})
+
+        return {
+            'request_id': request_payload.get('request_id'),
+            'mode': request_payload.get('mode'),
+            'target': {
+                'qualname': target.get('qualname'),
+                'file_path': target.get('file_path'),
+                'operation': target.get('operation'),
+            },
+            'project_context_summary': {
+                'module_outline_count': len(project_context.get('module_outline') or []),
+                'full_file_included': bool(project_context.get('full_file_source')),
+                'target_symbol_qualname': (project_context.get('target_symbol') or {}).get('qualname'),
+                'related_tests_count': len(project_context.get('related_tests') or []),
+                'recommended_tests_count': len(project_context.get('recommended_tests') or []),
+            },
+            'reference_context_summary': {
+                'reference_artifacts_count': len(reference_context.get('reference_artifacts') or []),
+            },
+            'has_generated_code_artifact': bool(generated_code_artifact),
+            'options': dict(request_payload.get('options') or {}),
+        }    
+
+    def _summarize_external_result(self, result_payload: dict[str, Any]) -> dict[str, Any]:
+        code_artifact = dict(result_payload.get('code_artifact') or {})
+        test_artifact = dict(result_payload.get('test_artifact') or {})
+        llm_usage = dict(result_payload.get('llm_usage') or {})
+
+        return {
+            'request_id': result_payload.get('request_id'),
+            'status': result_payload.get('status'),
+            'has_code_artifact': bool(code_artifact.get('code')),
+            'code_artifact_summary': {
+                'operation': code_artifact.get('operation'),
+                'target_qualname': code_artifact.get('target_qualname'),
+                'target_file': code_artifact.get('target_file'),
+                'insert_after': code_artifact.get('insert_after'),
+                'code_chars': len(str(code_artifact.get('code') or '')),
+            } if code_artifact else {},
+            'has_test_artifact': bool(test_artifact.get('source_code')),
+            'test_artifact_summary': {
+                'file_path': test_artifact.get('file_path'),
+                'source_code_chars': len(str(test_artifact.get('source_code') or '')),
+            } if test_artifact else {},
+            'warnings_count': len(result_payload.get('warnings') or []),
+            'trace_path': result_payload.get('trace_path'),
+            'llm_usage': llm_usage,
+            'error_type': result_payload.get('error_type'),
+            'message': result_payload.get('message'),
+        }
+
+    def _extract_external_llm_usage(self, call: ExternalGenerationCall | None) -> dict[str, Any] | None:
+        if call is None:
+            return None
+        result_summary = getattr(call, 'result_summary', None) or {}
+        llm_usage = result_summary.get('llm_usage') or {}
+        if not llm_usage:
+            return None
+        return dict(llm_usage)
+    
+    def _sum_usage_dicts(self, *usage_items: dict[str, Any] | None) -> dict[str, Any]:
+        totals = {
+            'calls': 0,
+            'prompt_tokens': 0.0,
+            'output_tokens': 0.0,
+            'total_tokens': 0.0,
+            'duration_sec': 0.0,
+            'total_duration_sec': 0.0,
+            'load_duration_sec': 0.0,
+            'prompt_eval_duration_sec': 0.0,
+            'eval_duration_sec': 0.0,
+        }
+        for usage in usage_items:
+            if not usage:
+                continue
+            totals['calls'] += int(usage.get('calls', 0) or 0)
+            totals['prompt_tokens'] += float(usage.get('prompt_tokens', 0.0) or 0.0)
+            totals['output_tokens'] += float(usage.get('output_tokens', 0.0) or 0.0)
+            totals['total_tokens'] += float(usage.get('total_tokens', 0.0) or 0.0)
+            totals['duration_sec'] += float(usage.get('duration_sec', 0.0) or 0.0)
+            totals['total_duration_sec'] += float(usage.get('total_duration_sec', 0.0) or 0.0)
+            totals['load_duration_sec'] += float(usage.get('load_duration_sec', 0.0) or 0.0)
+            totals['prompt_eval_duration_sec'] += float(usage.get('prompt_eval_duration_sec', 0.0) or 0.0)
+            totals['eval_duration_sec'] += float(usage.get('eval_duration_sec', 0.0) or 0.0)
+        return totals
+
+    def _build_usage_summary(
+        self,
+        external_code_generation: ExternalGenerationCall | None,
+        external_test_generation: ExternalGenerationCall | None,
+        repair_generation: ExternalGenerationCall | None,
+    ) -> dict[str, Any]:
+        embedding_usage = None
+        if hasattr(self.project_services, 'get_embedding_usage_summary'):
+            try:
+                embedding_usage = self.project_services.get_embedding_usage_summary()
+            except Exception:
+                LOGGER.exception('Failed to collect embedding usage summary')
+                embedding_usage = None
+
+        code_generation_usage = self._extract_external_llm_usage(external_code_generation)
+        test_generation_usage = self._extract_external_llm_usage(external_test_generation)
+        repair_generation_usage = self._extract_external_llm_usage(repair_generation)
+
+        llm_total = self._sum_usage_dicts(
+            code_generation_usage,
+            test_generation_usage,
+            repair_generation_usage,
+        )
+
+        overall_total_tokens = (
+            float((embedding_usage or {}).get('prompt_tokens', 0.0) or 0.0)
+            + float(llm_total.get('total_tokens', 0.0) or 0.0)
+        )
+
+        return {
+            'embedding': embedding_usage,
+            'code_generation': code_generation_usage,
+            'test_generation': test_generation_usage,
+            'repair_generation': repair_generation_usage,
+            'llm_total': llm_total,
+            'overall_total_tokens_including_embeddings': overall_total_tokens,
+          }
+
+    def _build_execution_summary(
+        self,
+        *,
+        selected_target: str,
+        requested_operation: str | None,
+        apply_result: ApplyResult | None,
+        verification_report: dict[str, Any] | None,
+        merge_plan: MergePlan | None,
+        generated_test_apply: dict[str, Any] | None,
+        external_code_generation: ExternalGenerationCall | None,
+        external_test_generation: ExternalGenerationCall | None,
+        repair_generation: ExternalGenerationCall | None,
+        usage_summary: dict[str, Any] | None,
+    ) -> PipelineExecutionSummary:
+        code_result_summary = (external_code_generation.result_summary if external_code_generation else {}) or {}
+        code_artifact_summary = (code_result_summary.get('code_artifact_summary') or {}) if isinstance(code_result_summary, dict) else {}
+        final_operation = code_artifact_summary.get('operation') or requested_operation
+
+        changed_files = []
+        symbols_in_changed_files = []
+        workspace_path = None
+        linked_requirements: list[str] = []
+        recommended_tests: list[str] = []
+        recommended_test_commands: list[str] = []
+
+        if apply_result is not None:
+            changed_files = list(apply_result.impact.changed_files)
+            symbols_in_changed_files = list(apply_result.impact.symbols_in_changed_files)
+            workspace_path = str(apply_result.workspace_path)
+            linked_requirements = list(apply_result.impact.linked_requirements)
+            recommended_tests = list(apply_result.impact.recommended_tests)
+            recommended_test_commands = list(apply_result.impact.recommended_test_commands)
+
+        verification_passed = None if verification_report is None else bool(verification_report.get('passed', False))
+        has_generated_test = bool((generated_test_apply or {}).get('count', 0))
+        generated_test_files = list((generated_test_apply or {}).get('applied_tests') or [])
+        repair_used = repair_generation is not None
+        merge_mode = None if merge_plan is None else merge_plan.mode
+        merge_ready = None if merge_plan is None else bool(merge_plan.ready_for_manual_merge_review)
+
+        if merge_ready is True:
+            status = 'ready_for_merge_review'
+        elif verification_passed is False:
+            status = 'verification_failed'
+        elif apply_result is not None:
+            status = 'applied'
+        elif external_code_generation is not None:
+            status = 'generated'
+        else:
+            status = 'incomplete'
+
+        return PipelineExecutionSummary(
+            status=status,
+            selected_target=selected_target,
+            requested_operation=requested_operation,
+            final_operation=final_operation,
+            changed_files=changed_files,
+            symbols_in_changed_files=symbols_in_changed_files,
+            workspace_path=workspace_path,
+            verification_passed=verification_passed,
+            has_generated_test=has_generated_test,
+            generated_test_files=generated_test_files,
+            repair_used=repair_used,
+            merge_mode=merge_mode,
+            merge_ready=merge_ready,
+            linked_requirements=linked_requirements,
+            recommended_tests=recommended_tests,
+            recommended_test_commands=recommended_test_commands,
+            code_generation_usage=(usage_summary or {}).get('code_generation'),
+            test_generation_usage=(usage_summary or {}).get('test_generation'),
+            repair_generation_usage=(usage_summary or {}).get('repair_generation'),
+            embedding_usage=(usage_summary or {}).get('embedding'),
+        )
 
     def _run_verification(self, apply_result: ApplyResult) -> dict[str, Any]:
         config = self.project_services.config
@@ -957,7 +1193,7 @@ class PipelineService:
         status = 'ok'
         try:
             payload = func()
-        except Exception:
+        except Exception as exc:
             status = 'error'
             finished = datetime.now(tz=UTC)
             steps.append(PipelineStepRecord(
@@ -967,6 +1203,9 @@ class PipelineService:
                 finished_at=finished.isoformat(),
                 duration_ms=int((perf_counter() - started_perf) * 1000),
                 summary=summary,
+                error_type='step_execution_error',
+                error_message=str(exc),
+                exception_class=exc.__class__.__name__,
             ))
             raise
         finished = datetime.now(tz=UTC)

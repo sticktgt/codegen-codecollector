@@ -190,18 +190,16 @@ def build_generation_request(
         'related_tests': related_tests,
         'recommended_tests': list(context_pack.recommended_tests),
     }
-    reference_summary = {
+    context_pack.reference_summary = {
         'count': len(reference_artifacts),
         'titles': [item.get('title', '') for item in reference_artifacts],
         'content_modes': [item.get('content_mode', '') for item in reference_artifacts],
     }
-    context_pack.reference_summary = dict(reference_summary)
     context_pack.reference_artifacts = list(selected_reference_items[:len(reference_artifacts)])
     reference_context = {
-        'reference_summary': reference_summary,
         'reference_artifacts': reference_artifacts,
     }
-    normalized_operation = _normalize_operation(operation)
+    normalized_operation = _validate_operation(operation)
 
     request = {
         'request_id': f'generate-{target_qualname.split(".")[-1]}',
@@ -215,7 +213,7 @@ def build_generation_request(
         'target': {
             'qualname': target_qualname,
             'file_path': target.file_path,
-            'operation': _normalize_operation(operation),
+            'operation': normalized_operation,
         },
         'project_context': project_context,
         'reference_context': reference_context,
@@ -223,7 +221,6 @@ def build_generation_request(
         'options': {
             'generate_test_mode': config.codegenerator_test_generation_mode,
         },
-        'requested_operation': normalized_operation,
     }
     metrics = {
         'target_source_chars': len(target_source),
@@ -239,7 +236,6 @@ def build_generation_request(
         'related_test_limit': related_test_limit,
         'reference_limit': max(0, int(reference_limits.get(mode, 0) or 0)),
     }
-    request['context_metrics'] = metrics
     LOGGER.info(
         'Prepared generation request: mode=%s request_chars=%s target_source_chars=%s full_file_included=%s full_file_chars=%s related_tests=%s related_test_chars=%s reference_artifacts=%s reference_chars=%s related_test_limit=%s reference_limit=%s estimated_context_chars=%s',
         mode,
@@ -343,20 +339,14 @@ def invoke_generate_test(run_dir: Path, config: AppConfig, request_payload: dict
         }
         request_payload['reference_context'] = reference_context
 
-    context_metrics = dict(request_payload.get('context_metrics') or {})
-    context_metrics['reference_artifacts_count'] = len(((request_payload.get('reference_context') or {}).get('reference_artifacts') or []))
-    context_metrics['reference_chars'] = 0
-    context_metrics['request_chars'] = _json_size(request_payload)
-    request_payload['context_metrics'] = context_metrics
+    request_chars = _json_size(request_payload)
 
     LOGGER.info(
-        'Prepared generation request for test generation: mode=%s request_chars=%s related_tests=%s related_test_chars=%s reference_artifacts=%s reference_chars=%s',
+        'Prepared generation request for test generation: mode=%s request_chars=%s related_tests=%s reference_artifacts=%s',
         request_payload.get('mode'),
-        request_payload['context_metrics'].get('request_chars'),
+        request_chars,
         len(((request_payload.get('project_context') or {}).get('related_tests') or [])),
-        request_payload['context_metrics'].get('related_test_chars'),
         len(((request_payload.get('reference_context') or {}).get('reference_artifacts') or [])),
-        request_payload['context_metrics'].get('reference_chars'),
     )
 
     _write_payload(request_path, request_payload, request_format)
@@ -497,7 +487,7 @@ def invoke_repair(run_dir: Path, config: AppConfig, request_payload: dict[str, A
 
 def patch_artifact_from_result(result_payload: dict[str, Any], fallback_target_qualname: str) -> PatchArtifact:
     artifact = result_payload.get('code_artifact') or {}
-    operation = _normalize_operation(str(artifact.get('operation', 'replace_symbol')))
+    operation = _validate_operation(str(artifact.get('operation', 'replace_symbol')))
     code = artifact.get('code')
     if not code:
         raise ValueError('codegenerator result does not contain code_artifact.code')
@@ -509,29 +499,24 @@ def patch_artifact_from_result(result_payload: dict[str, Any], fallback_target_q
         operation=operation,
     )
 
+_ALLOWED_OPERATIONS = {'replace_symbol', 'insert_after_symbol'}
 
-def _normalize_operation(operation: str) -> str:
+def _validate_operation(operation: str) -> str:
     value = operation.strip().lower()
-    mapping = {
-        'replace_function': 'replace_symbol',
-        'replace_symbol': 'replace_symbol',
-        'add_function': 'add_symbol',
-        'add_symbol': 'add_symbol',
-        'insert_after_function': 'insert_after_symbol',
-        'insert_after_symbol': 'insert_after_symbol',
-    }
-    return mapping.get(value, value)
+    if value not in _ALLOWED_OPERATIONS:
+        raise ValueError(f'Unsupported patch operation from codegenerator: {operation}')
+    return value
 
 def ensure_expected_operation(
     result_payload: dict[str, Any],
     expected_operation: str,
 ) -> str:
     artifact = result_payload.get('code_artifact') or {}
-    actual_operation = _normalize_operation(str(artifact.get('operation', 'replace_symbol')))
-    normalized_expected = _normalize_operation(expected_operation)
-    if actual_operation != normalized_expected:
+    actual_operation = _validate_operation(str(artifact.get('operation', 'replace_symbol')))
+    expected = _validate_operation(expected_operation)
+    if actual_operation != expected:
         raise ValueError(
-            f'Generator returned operation {actual_operation}, expected {normalized_expected}'
+            f'Generator returned operation {actual_operation}, expected {expected}'
         )
     return actual_operation
 

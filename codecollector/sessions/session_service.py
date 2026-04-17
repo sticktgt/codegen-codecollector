@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from codecollector.config import AppConfig
-from codecollector.domain.models import ChangeRequest, PipelineRunResult
+from codecollector.domain.models import ChangeRequest, GenerateApiResultSummary, PipelineRunResult
 from codecollector.logger import get_logger
 from codecollector.orchestration.services import ProjectServices
 from codecollector.projects.project_service import ProjectService
@@ -262,6 +262,7 @@ class SessionService:
                 'workspace_path': workspace_path or None,
                 'session': session_payload,
                 'pipeline_result': self._pipeline_payload(result) if result else None,
+                'result_summary': self._result_summary_payload(result) if result else None,
                 'requested_operation': requested_operation,
             }
 
@@ -297,6 +298,7 @@ class SessionService:
             'workspace_path': workspace_path or None,
             'session': session_payload,
             'pipeline_result': self._pipeline_payload(result),
+            'result_summary': self._result_summary_payload(result),
             'requested_operation': requested_operation,
         }
 
@@ -404,6 +406,7 @@ class SessionService:
                 'message': 'Repair was executed but produced no effective change.',
                 'session': session_payload,
                 'pipeline_result': self._pipeline_payload(result),
+                'result_summary': self._result_summary_payload(result),
             }
 
         if outcome == 'verification_failed':
@@ -429,6 +432,7 @@ class SessionService:
                 'message': 'Repair changed the workspace, but verification failed.',
                 'session': session_payload,
                 'pipeline_result': self._pipeline_payload(result),
+                'result_summary': self._result_summary_payload(result),
             }
 
         if new_workspace_id and old_workspace_id and new_workspace_id != old_workspace_id:
@@ -460,6 +464,7 @@ class SessionService:
             'message': 'Repair completed successfully.',
             'session': session_payload,
             'pipeline_result': self._pipeline_payload(result),
+            'result_summary': self._result_summary_payload(result),
         }
 
     def finalize(self, session_id: str, *, delete_workspace: bool = True) -> dict[str, Any]:
@@ -523,3 +528,28 @@ class SessionService:
             } if result.apply_result else None,
             'merge_plan': asdict(result.merge_plan) if result.merge_plan else None,
         }
+
+    def _result_summary_payload(self, result: PipelineRunResult | None) -> dict[str, Any] | None:
+        if result is None or result.execution_summary is None:
+            return None
+
+        execution = result.execution_summary
+        summary = GenerateApiResultSummary(
+            status=execution.status,
+            selected_target=execution.selected_target,
+            requested_operation=execution.requested_operation,
+            final_operation=execution.final_operation,
+            workspace_path=execution.workspace_path,
+            changed_files=list(execution.changed_files),
+            symbols_in_changed_files=list(execution.symbols_in_changed_files),
+            verification_passed=execution.verification_passed,
+            merge_mode=execution.merge_mode,
+            merge_ready=execution.merge_ready,
+            has_generated_test=execution.has_generated_test,
+            generated_test_files=list(execution.generated_test_files),
+            repair_used=execution.repair_used,
+            linked_requirements=list(execution.linked_requirements),
+            recommended_tests=list(execution.recommended_tests),
+            recommended_test_commands=list(execution.recommended_test_commands),
+        )
+        return asdict(summary)
