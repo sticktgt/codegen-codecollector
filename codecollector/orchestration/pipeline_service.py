@@ -12,10 +12,13 @@ from codecollector.domain.models import (
     GenerationReplay,
     MergePlan,
     PatchArtifact,
-    PipelineExecutionSummary,
     PipelineRunResult,
     PipelineStepRecord,
     SearchCandidate,
+    PipelineExecutionSummary,
+    VerificationBlock,
+    VerificationIssue,
+    VerificationReport,
 )
 from codecollector.logger import get_logger
 from codecollector.orchestration.run_artifacts import RunArtifactsManager
@@ -27,6 +30,14 @@ from codecollector.external_codegen.adapter import (
     build_repair_request,
     invoke_repair,
     ensure_expected_operation,
+)
+
+from codecollector.validation.semantic_checks import (
+    build_verification_report,
+    validate_code_artifact_static_semantics,
+    validate_generated_test_relevance,
+    validate_generated_test_static_semantics,
+    validate_patch_static_semantics,
 )
 
 if TYPE_CHECKING:
@@ -146,7 +157,7 @@ class PipelineService:
         change_request: ChangeRequest,
         selected_target: str,
         previous_result_payload: dict[str, Any],
-        verification_report: dict[str, Any],
+        verification_report: VerificationReport,
         requested_operation: str = 'replace_symbol',
     ) -> PipelineRunResult:
         self.project_services.reset_embedding_usage()
@@ -157,9 +168,10 @@ class PipelineService:
         context_pack: ContextPack | None = None
         repair_generation: ExternalGenerationCall | None = None
         apply_result: ApplyResult | None = None
-        verification_result: dict[str, Any] | None = None
+        verification_result: VerificationReport | None = None
         merge_plan: MergePlan | None = None
         result: PipelineRunResult | None = None
+        caught_exc: Exception | None = None
 
         try:
             build_report = self._run_step(
@@ -210,7 +222,22 @@ class PipelineService:
                 ),
             )
             if not self._has_code_artifact(repair_result_payload):
-                raise RuntimeError(repair_result_payload.get('message') or 'codegenerator repair did not return code_artifact')
+                raise RuntimeError(
+                    repair_result_payload.get('message')
+                    or 'codegenerator repair did not return code_artifact'
+                )
+
+            self._run_step(
+                steps,
+                'external_repair_static_semantics',
+                'Проверить code artifact после external_repair статическими правилами',
+                lambda: self._ensure_code_artifact_static_semantics(
+                    result_payload=repair_result_payload,
+                    step_name='external_repair',
+                    expected_operation=requested_operation,
+                    expected_target_qualname=selected_target,
+                ),
+            )
 
             apply_result = self._replace_active_apply_result(
                 apply_result,
@@ -261,6 +288,8 @@ class PipelineService:
                 warnings=[],
             )
             return result
+        except Exception as exc:
+            caught_exc = exc        
         finally:
             if result is None:
                 result = self._build_partial_run_result(
@@ -283,10 +312,40 @@ class PipelineService:
                     steps=steps,
                     warnings=[],
                 )
+
+            if caught_exc is not None:
+                execution_summary = getattr(result, 'execution_summary', None)
+                if execution_summary is not None:
+                    execution_summary.status = 'failed'
+                    execution_summary.merge_ready = False
+                    execution_summary.verification_passed = False
+                    execution_summary.merge_mode = None
+
+                if result.merge_plan is not None:
+                    result.merge_plan = None
+
             try:
                 self.artifacts_manager.write_bundle(run_dir, f'pipeline_run_{run_label}.json', result)
             except Exception:
                 LOGGER.exception('Failed to write repair pipeline run bundle in finally: %s', run_dir)
+
+            if caught_exc is not None:
+                failed_step = next((step for step in reversed(steps) if step.status == 'error'), None)
+                if failed_step is not None:
+                    message = f'{failed_step.step_name} failed: {caught_exc}'
+                else:
+                    message = str(caught_exc)
+
+                LOGGER.exception(
+                    'pipeline repair failed run_id=%s selected_target=%s failed_step=%s error_class=%s error=%s',
+                    run_id,
+                    selected_target,
+                    failed_step.step_name if failed_step is not None else None,
+                    type(caught_exc).__name__,
+                    str(caught_exc),
+                )
+
+                raise PipelineRunFailed(message, result) from caught_exc
 
     def run_generate(
         self,
@@ -308,7 +367,7 @@ class PipelineService:
         external_code_generation: ExternalGenerationCall | None = None
         external_test_generation: ExternalGenerationCall | None = None
         generated_test_apply: dict[str, Any] | None = None
-        verification_report: dict[str, Any] | None = None
+        verification_report: VerificationReport | None = None
         repair_generation: ExternalGenerationCall | None = None
         apply_result: ApplyResult | None = None
         merge_plan: MergePlan | None = None
@@ -382,14 +441,29 @@ class PipelineService:
                 ),
             )
             if not self._has_code_artifact(external_code_result_payload):
-                raise RuntimeError(external_code_result_payload.get('message') or 'codegenerator generate did not return code_artifact')
-            
+                raise RuntimeError(
+                    external_code_result_payload.get('message')
+                    or 'codegenerator generate did not return code_artifact'
+                )
+
             ensure_expected_operation(external_code_result_payload, requested_operation)
 
             final_payload = external_code_result_payload
             generated_tests: list[dict[str, str]] = []
 
             try:
+                self._run_step(
+                    steps,
+                    'external_generate_static_semantics',
+                    'Проверить code artifact после external_generate статическими правилами',
+                    lambda: self._ensure_code_artifact_static_semantics(
+                        result_payload=external_code_result_payload,
+                        step_name='external_generate',
+                        expected_operation=requested_operation,
+                        expected_target_qualname=selected_target,
+                    ),
+                )
+
                 apply_result = self._replace_active_apply_result(
                     apply_result,
                     self._run_step(
@@ -403,25 +477,57 @@ class PipelineService:
                     ),
                 )
             except Exception as exc:
-                apply_failure_report = self._build_apply_failure_report(exc)
-                if not self.project_services.config.codegenerator_repair_enabled or not apply_failure_report['failure_summary'].get('repairable', False):
+                repair_input_report = self._build_apply_failure_report(exc)
+                repair_input_context = self._normalize_repair_context(repair_input_report)
+                if (
+                    not self.project_services.config.codegenerator_repair_enabled
+                    or not repair_input_context.get('failure_summary', {}).get('repairable', False)
+                ):
                     raise
+
+                repair_step_name = (
+                    'external_repair_after_external_generate_static_semantics'
+                    if any(step.step_name == 'external_generate_static_semantics' and step.status == 'error' for step in steps)
+                    else 'external_repair'
+                )
+                repair_step_summary = (
+                    'Вызвать внешний codegenerator repair после ошибки external_generate_static_semantics'
+                    if repair_step_name == 'external_repair_after_external_generate_static_semantics'
+                    else 'Вызвать внешний codegenerator repair после ошибки apply'
+                )
+
                 repair_generation, repair_result_payload = self._run_step(
                     steps,
-                    'external_repair',
-                    'Вызвать внешний codegenerator repair после ошибки apply',
+                    repair_step_name,
+                    repair_step_summary,
                     lambda: self._external_repair(
                         run_dir,
                         change_request,
                         selected_target,
                         context_pack,
-                        external_code_result_payload,
-                        apply_failure_report,
+                        final_payload,
+                        repair_input_report,
                         requested_operation=requested_operation,
                     ),
                 )
                 if not self._has_code_artifact(repair_result_payload):
-                    raise RuntimeError(repair_result_payload.get('message') or 'codegenerator repair did not return code_artifact')
+                    raise RuntimeError(
+                        repair_result_payload.get('message')
+                        or 'codegenerator repair did not return code_artifact'
+                    )
+
+                self._run_step(
+                    steps,
+                    'external_repair_static_semantics',
+                    'Проверить code artifact после external_repair статическими правилами',
+                    lambda: self._ensure_code_artifact_static_semantics(
+                        result_payload=repair_result_payload,
+                        step_name='external_repair',
+                        expected_operation=requested_operation,
+                        expected_target_qualname=selected_target,
+                    ),
+                )
+
                 final_payload = repair_result_payload
                 apply_result = self._replace_active_apply_result(
                     apply_result,
@@ -435,6 +541,139 @@ class PipelineService:
                         ),
                     ),
                 )
+
+            target_file = str(context_pack.target.file_path or "").strip()
+            original_target_file_path = self.project_services.project_root / target_file
+            patched_target_file_path = apply_result.workspace_path / target_file
+
+            patch_static_block = self._run_step(
+                steps,
+                'patch_static_semantics',
+                'Проверить patch статическими семантическими правилами',
+                lambda: validate_patch_static_semantics(
+                    requested_operation=requested_operation,
+                    change_request=change_request,
+                    target_qualname=selected_target,
+                    original_file_text=original_target_file_path.read_text(encoding='utf-8'),
+                    patched_file_text=patched_target_file_path.read_text(encoding='utf-8'),
+                    changed_files=list(apply_result.impact.changed_files),
+                    target_file=target_file,
+                ),
+            )
+
+            generated_test_blocks: list[VerificationBlock] = []
+
+            if not patch_static_block.ok:
+                if self.project_services.config.codegenerator_repair_enabled:
+                    patch_failure_report = self._build_patch_static_failure_report(
+                        patch_static_block,
+                    )
+                    LOGGER.warning(
+                        "patch static semantics failed; trying repair issue_codes=%s",
+                        [issue.code for issue in patch_static_block.issues],
+                    )
+                    repair_generation, repair_result_payload = self._run_step(
+                        steps,
+                        'external_repair_after_patch_static_semantics',
+                        'Вызвать внешний codegenerator repair после ошибки patch_static_semantics',
+                        lambda: self._external_repair(
+                            run_dir,
+                            change_request,
+                            selected_target,
+                            context_pack,
+                            final_payload,
+                            patch_failure_report,
+                            requested_operation=requested_operation,
+                        ),
+                    )
+                    if not self._has_code_artifact(repair_result_payload):
+                        raise RuntimeError(
+                            repair_result_payload.get('message')
+                            or 'codegenerator repair did not return code_artifact'
+                        )
+
+                    self._run_step(
+                        steps,
+                        'external_repair_after_patch_static_semantics_static_semantics',
+                        'Проверить code artifact после repair статическими правилами',
+                        lambda: self._ensure_code_artifact_static_semantics(
+                            result_payload=repair_result_payload,
+                            step_name='external_repair',
+                            expected_operation=requested_operation,
+                            expected_target_qualname=selected_target,
+                        ),
+                    )
+
+                    final_payload = repair_result_payload
+                    apply_result = self._replace_active_apply_result(
+                        apply_result,
+                        self._run_step(
+                            steps,
+                            'apply_repair_staging_after_patch_static_semantics',
+                            'Применить исправленный артефакт в staging workspace после patch_static_semantics',
+                            lambda: self.project_services.apply(
+                                patch_artifact_from_result(final_payload, selected_target),
+                                generated_tests=[],
+                            ),
+                        ),
+                    )
+
+                    patched_target_file_path = apply_result.workspace_path / target_file
+                    patch_static_block = self._run_step(
+                        steps,
+                        'patch_static_semantics_after_repair',
+                        'Повторно проверить patch статическими семантическими правилами после repair',
+                        lambda: validate_patch_static_semantics(
+                            requested_operation=requested_operation,
+                            change_request=change_request,
+                            target_qualname=selected_target,
+                            original_file_text=original_target_file_path.read_text(encoding='utf-8'),
+                            patched_file_text=patched_target_file_path.read_text(encoding='utf-8'),
+                            changed_files=list(apply_result.impact.changed_files),
+                            target_file=target_file,
+                        ),
+                    )
+
+                if not patch_static_block.ok:
+                    runtime_blocks = self._run_step(
+                        steps,
+                        'verification',
+                        'Запустить runtime-проверки проекта после apply',
+                        lambda: self._run_runtime_verification_blocks(
+                            apply_result,
+                            generated_test_apply,
+                        ),
+                    )
+                    verification_report = build_verification_report(
+                        blocks=[patch_static_block, *runtime_blocks],
+                    )
+                    merge_plan = self._run_step(
+                        steps,
+                        'merge_dry_run',
+                        'Подготовить dry-run план merge в master',
+                        lambda: self._prepare_merge_plan(apply_result, verification_report),
+                    )
+                    result = self._build_partial_run_result(
+                        run_id=run_id,
+                        run_label=run_label,
+                        run_dir=run_dir,
+                        change_request=change_request,
+                        selected_target=selected_target,
+                        build_report=build_report,
+                        candidates=candidates,
+                        context_pack=context_pack,
+                        generation_replay=None,
+                        external_code_generation=external_code_generation,
+                        external_test_generation=external_test_generation,
+                        generated_test_apply=generated_test_apply,
+                        verification_report=verification_report,
+                        repair_generation=repair_generation,
+                        apply_result=apply_result,
+                        merge_plan=merge_plan,
+                        steps=steps,
+                        warnings=warnings,
+                    )
+                    return result         
 
             if self._should_request_generated_test(context_pack, selected_target):
                 external_test_generation, external_test_result_payload = self._run_step(
@@ -450,62 +689,154 @@ class PipelineService:
                         requested_operation=requested_operation,
                     ),
                 )
+
                 generated_tests = self._extract_generated_tests(external_test_result_payload)
+
                 if generated_tests:
-                    generated_test_apply = {
-                        'applied_tests': [item['file_path'] for item in generated_tests],
-                        'count': len(generated_tests),
-                    }
-                    apply_result = self._replace_active_apply_result(
-                        apply_result,
-                        self._run_step(
-                            steps,
-                            'apply_with_generated_tests',
-                            'Повторно применить артефакт вместе с сгенерированными тестами в staging workspace',
-                            lambda: self.project_services.apply(
-                                patch_artifact_from_result(final_payload, selected_target),
-                                generated_tests=generated_tests,
-                            ),
+                    generated_test_file_path = apply_result.workspace_path / generated_tests[0]['file_path']
+                    generated_test_file_path.parent.mkdir(parents=True, exist_ok=True)
+                    generated_test_file_path.write_text(generated_tests[0]['source_code'], encoding='utf-8')
+
+                    generated_test_static_block = self._run_step(
+                        steps,
+                        'generated_test_static_semantics',
+                        'Проверить generated test статическими правилами',
+                        lambda: validate_generated_test_static_semantics(
+                            project_root=apply_result.workspace_path,
+                            test_file_path=generated_test_file_path,
+                            target_qualname=selected_target,
+                            requested_operation=requested_operation,
+                            generated_symbol_names=list(apply_result.impact.symbols_in_changed_files),
                         ),
                     )
+
+                    generated_test_relevance_block = self._run_step(
+                        steps,
+                        'generated_test_relevance',
+                        'Проверить релевантность generated test изменению',
+                        lambda: validate_generated_test_relevance(
+                            test_source=generated_tests[0]['source_code'],
+                            requested_operation=requested_operation,
+                            target_qualname=selected_target,
+                            generated_symbol_names=list(apply_result.impact.symbols_in_changed_files),
+                        ),
+                    )                    
+
+                    generated_test_blocks = [
+                        generated_test_static_block,
+                        generated_test_relevance_block,
+                    ]
+                    LOGGER.info(
+                        "generated test checks result static_ok=%s relevance_ok=%s test_files=%s",
+                        generated_test_static_block.ok,
+                        generated_test_relevance_block.ok,
+                        [item['file_path'] for item in generated_tests],
+                    )
+                    if generated_test_static_block.ok and generated_test_relevance_block.ok:
+                        generated_test_apply = {
+                            'applied_tests': [item['file_path'] for item in generated_tests],
+                            'count': len(generated_tests),
+                            'skipped': False,
+                        }
+                        LOGGER.info(
+                            "generated tests accepted for apply count=%s files=%s",
+                            generated_test_apply['count'],
+                            generated_test_apply['applied_tests'],
+                        )
+                        apply_result = self._replace_active_apply_result(
+                            apply_result,
+                            self._run_step(
+                                steps,
+                                'apply_with_generated_tests',
+                                'Повторно применить артефакт вместе с сгенерированными тестами в staging workspace',
+                                lambda: self.project_services.apply(
+                                    patch_artifact_from_result(final_payload, selected_target),
+                                    generated_tests=generated_tests,
+                                ),
+                            ),
+                        )
+                    else:
+                        generated_test_apply = {
+                            'applied_tests': [],
+                            'count': 0,
+                            'skipped': True,
+                            'reason': 'generated_test_semantic_checks_failed',
+                            'candidate_test_files': [item['file_path'] for item in generated_tests],
+                        }
+                        LOGGER.warning(
+                            "generated tests rejected by semantic checks candidate_files=%s static_issues=%s relevance_issues=%s",
+                            generated_test_apply['candidate_test_files'],
+                            [issue.code for issue in generated_test_static_block.issues],
+                            [issue.code for issue in generated_test_relevance_block.issues],
+                        )
+                else:
+                    generated_test_apply = {
+                        'applied_tests': [],
+                        'count': 0,
+                        'skipped': True,
+                        'reason': 'no_generated_tests',
+                    }
             else:
                 warning_message = 'Генерация теста пропущена: для target уже есть related_tests или recommended_tests.'
                 warnings.append(warning_message)
                 LOGGER.info(warning_message)
 
-            verification_step_name = 'verification_after_repair' if repair_generation is not None else 'verification'
-            verification_step_summary = 'Повторно запустить проверки проекта после repair' if repair_generation is not None else 'Запустить проверки проекта после apply'
-            verification_report = self._run_step(
+            runtime_blocks = self._run_step(
                 steps,
-                verification_step_name,
-                verification_step_summary,
-                lambda: self._run_verification(apply_result),
+                'verification',
+                'Запустить runtime-проверки проекта после apply',
+                lambda: self._run_runtime_verification_blocks(
+                    apply_result,
+                   generated_test_apply,
+                ),
             )
-            if repair_generation is not None:
-                verification_report = self._mark_noop_repair_if_needed(verification_report, apply_result, repair_generation)
 
-            if (not verification_report.get('passed', False)) and self.project_services.config.codegenerator_repair_enabled and repair_generation is None:
-                if self._generated_test_failure_only(verification_report):
+            verification_report = build_verification_report(
+                blocks=[patch_static_block, *generated_test_blocks, *runtime_blocks],
+            )
+
+            if (not verification_report.passed) and self.project_services.config.codegenerator_repair_enabled and repair_generation is None:
+                if verification_report.verdict == 'generated_test_verification_failed':
                     warning_message = 'Repair пропущен: упал только сгенерированный тест, основной код не отправляется в repair.'
                     warnings.append(warning_message)
                     LOGGER.warning(warning_message)
-                else:
+                elif verification_report.verdict == 'verification_failed':
                     repair_generation, repair_result_payload = self._run_step(
                         steps,
                         'external_repair',
                         'Вызвать внешний codegenerator repair после неуспешной проверки',
                         lambda: self._external_repair(
-                            run_dir, 
-                            change_request, 
-                            selected_target, 
-                            context_pack, 
-                            final_payload, 
-                            verification_report,
+                            run_dir,
+                            change_request,
+                            selected_target,
+                            context_pack,
+                            final_payload,
+                            {
+                                'passed': verification_report.passed,
+                                'verdict': verification_report.verdict,
+                                'summary': verification_report.summary,
+                            },
                             requested_operation=requested_operation,
                         ),
                     )
                     if not self._has_code_artifact(repair_result_payload):
-                        raise RuntimeError(repair_result_payload.get('message') or 'codegenerator repair did not return code_artifact')
+                        raise RuntimeError(
+                            repair_result_payload.get('message')
+                            or 'codegenerator repair did not return code_artifact'
+                        )
+
+                    self._run_step(
+                        steps,
+                        'external_repair_static_semantics_after_verification',
+                        'Проверить code artifact после repair статическими правилами',
+                        lambda: self._ensure_code_artifact_static_semantics(
+                            result_payload=repair_result_payload,
+                            step_name='external_repair',
+                            expected_operation=requested_operation,
+                            expected_target_qualname=selected_target,
+                        ),
+                    )
+
                     final_payload = repair_result_payload
                     apply_result = self._replace_active_apply_result(
                         apply_result,
@@ -515,17 +846,24 @@ class PipelineService:
                             'Применить исправленный артефакт в staging workspace',
                             lambda: self.project_services.apply(
                                 patch_artifact_from_result(final_payload, selected_target),
-                                generated_tests=generated_tests,
+                                generated_tests=[],
                             ),
                         ),
                     )
-                    verification_report = self._run_step(
+
+                    runtime_blocks = self._run_step(
                         steps,
                         'verification_after_repair',
-                        'Повторно запустить проверки проекта после repair',
-                        lambda: self._run_verification(apply_result),
+                        'Повторно запустить runtime-проверки проекта после repair',
+                        lambda: self._run_runtime_verification_blocks(
+                            apply_result,
+                            None,
+                        ),
                     )
-                    verification_report = self._mark_noop_repair_if_needed(verification_report, apply_result, repair_generation)
+
+                    verification_report = build_verification_report(
+                        blocks=[patch_static_block, *generated_test_blocks, *runtime_blocks],
+                    )
 
             merge_plan = self._run_step(
                 steps,
@@ -580,10 +918,23 @@ class PipelineService:
                     steps=steps,
                     warnings=warnings,
                 )
+
+            if caught_exc is not None:
+                execution_summary = getattr(result, 'execution_summary', None)
+                if execution_summary is not None:
+                    execution_summary.status = 'failed'
+                    execution_summary.merge_ready = False
+                    execution_summary.verification_passed = False
+                    execution_summary.merge_mode = None
+
+                if result.merge_plan is not None:
+                    result.merge_plan = None
+
             try:
                 self.artifacts_manager.write_bundle(run_dir, f'pipeline_run_{run_label}.json', result)
             except Exception:
                 LOGGER.exception('Failed to write pipeline run bundle in finally: %s', run_dir)
+
         if caught_exc is not None:
             assert result is not None
             failed_step = next((step for step in reversed(steps) if step.status == 'error'), None)
@@ -591,10 +942,20 @@ class PipelineService:
                 message = f'{failed_step.step_name} failed: {caught_exc}'
             else:
                 message = str(caught_exc)
+
+            LOGGER.exception(
+                'pipeline generate failed run_id=%s selected_target=%s failed_step=%s error_class=%s error=%s',
+                run_id,
+                selected_target,
+                failed_step.step_name if failed_step is not None else None,
+                type(caught_exc).__name__,
+                str(caught_exc),
+            )
+
             raise PipelineRunFailed(message, result) from caught_exc
 
         assert result is not None
-        return result        
+        return result
 
     def _delete_apply_workspace(self, apply_result: ApplyResult | None) -> None:
         if apply_result is None:
@@ -612,6 +973,33 @@ class PipelineService:
     def _has_code_artifact(self, result_payload: dict[str, Any]) -> bool:
         code_artifact = result_payload.get('code_artifact') or {}
         return bool(str(code_artifact.get('code', '') or '').strip())
+    
+    def _ensure_code_artifact_static_semantics(
+        self,
+        *,
+        result_payload: dict[str, Any],
+        step_name: str,
+        expected_operation: str | None = None,
+        expected_target_qualname: str | None = None,
+    ) -> VerificationBlock:
+        block = validate_code_artifact_static_semantics(
+            result_payload=result_payload,
+            step_name=step_name,
+            expected_operation=expected_operation,
+            expected_target_qualname=expected_target_qualname,
+        )
+        if not block.ok:
+            first_issue = block.issues[0] if block.issues else None
+            details = dict(block.details or {})
+            syntax_error = dict(details.get("syntax_error") or {})
+
+            error_message = (
+                (first_issue.message if first_issue and first_issue.message else None)
+                or syntax_error.get("message")
+                or f"{step_name} returned invalid code_artifact"
+            )
+            raise SyntaxError(error_message)
+        return block 
 
     def _should_request_generated_test(self, context_pack: ContextPack, selected_target: str) -> bool:
         mode = str(self.project_services.config.codegenerator_test_generation_mode).lower()
@@ -647,44 +1035,18 @@ class PipelineService:
             _entry_matches(item) for item in (context_pack.recommended_tests or [])
         )
 
-    def _generated_test_failure_only(self, verification_report: dict[str, Any] | None) -> bool:
-        if not verification_report or verification_report.get('passed', False):
+    def _generated_test_failure_only(self, verification_report: VerificationReport | None) -> bool:
+        if verification_report is None:
             return False
-
-        results = verification_report.get('results', {}) or {}
-        failed_results = {
-            name: payload for name, payload in results.items()
-            if not bool((payload or {}).get('ok', False))
-        }
-        if not failed_results:
-            return False
-
-        generated_test_failure = False
-        non_generated_test_failure = False
-
-        for check_name, payload in failed_results.items():
-            payload = payload or {}
-            command = payload.get('command') or []
-            command_text = " ".join(str(item) for item in command)
-
-            if check_name.startswith('pytest') and 'test_generated_' in command_text:
-                generated_test_failure = True
-            else:
-                non_generated_test_failure = True
-
-        return generated_test_failure and not non_generated_test_failure
+        return verification_report.verdict == 'generated_test_verification_failed'
     
     def _resolve_verification_status(
         self,
-        verification_report: dict[str, Any] | None,
+        verification_report: VerificationReport | None,
     ) -> str | None:
         if verification_report is None:
             return None
-        if bool(verification_report.get('passed')):
-            return 'passed'
-        if self._generated_test_failure_only(verification_report):
-            return 'generated_test_verification_failed'
-        return 'verification_failed'    
+        return verification_report.verdict
 
     def _build_partial_run_result(
         self,
@@ -701,7 +1063,7 @@ class PipelineService:
         external_code_generation: ExternalGenerationCall | None = None,
         external_test_generation: ExternalGenerationCall | None = None,
         generated_test_apply: dict[str, Any] | None = None,
-        verification_report: dict[str, Any] | None = None,
+        verification_report: VerificationReport | None = None,
         repair_generation: ExternalGenerationCall | None = None,
         apply_result: ApplyResult | None = None,
         merge_plan: MergePlan | None = None,
@@ -715,7 +1077,11 @@ class PipelineService:
         execution_summary = self._build_execution_summary(
             selected_target=selected_target,
             requested_operation=(
-                external_code_generation.request_summary.get('target', {}).get('operation')
+                (
+                    external_code_generation.request_summary.get('target', {}).get('operation')
+                    if isinstance(external_code_generation.request_summary, dict)
+                    else None
+                )
                 if external_code_generation is not None else None
             ),
             apply_result=apply_result,
@@ -819,17 +1185,26 @@ class PipelineService:
         selected_target: str,
         context_pack: ContextPack,
         previous_result_payload: dict[str, Any],
-        verification_report: dict[str, Any],
+        verification_report: VerificationReport | dict[str, Any],
         requested_operation: str = 'replace_symbol',
     ) -> tuple[ExternalGenerationCall, dict[str, Any]]:
+        repair_context = self._normalize_repair_context(verification_report)
+        LOGGER.info(
+            'prepare repair request target=%s requested_operation=%s failed_blocks=%s',
+            selected_target,
+            requested_operation,
+            [
+                item.get('name')
+                for item in (repair_context.get('failure_summary', {}).get('failed_blocks') or [])
+            ],
+        )
         request_payload = build_repair_request(
             change_request,
             selected_target,
             previous_result_payload,
             context_pack,
-            verification_report.get('failure_summary', {}),
+            repair_context.get('failure_summary', {}),
             self.project_services.config,
-            requested_operation=requested_operation,
         )
         call_result = invoke_repair(run_dir, self.project_services.config, request_payload)
         external_call = ExternalGenerationCall(
@@ -988,7 +1363,7 @@ class PipelineService:
         selected_target: str,
         requested_operation: str | None,
         apply_result: ApplyResult | None,
-        verification_report: dict[str, Any] | None,
+        verification_report: VerificationReport | None,
         merge_plan: MergePlan | None,
         generated_test_apply: dict[str, Any] | None,
         external_code_generation: ExternalGenerationCall | None,
@@ -1015,7 +1390,7 @@ class PipelineService:
             recommended_tests = list(apply_result.impact.recommended_tests)
             recommended_test_commands = list(apply_result.impact.recommended_test_commands)
 
-        verification_passed = None if verification_report is None else bool(verification_report.get('passed', False))
+        verification_passed = None if verification_report is None else bool(verification_report.passed)
         verification_status = self._resolve_verification_status(verification_report)
         has_generated_test = bool((generated_test_apply or {}).get('count', 0))
         generated_test_files = list((generated_test_apply or {}).get('applied_tests') or [])
@@ -1023,16 +1398,17 @@ class PipelineService:
         merge_mode = None if merge_plan is None else merge_plan.mode
         merge_ready = None if merge_plan is None else bool(merge_plan.ready_for_manual_merge_review)
 
-        if merge_ready:
+        if verification_status is not None:
+            status = verification_status
+        elif merge_plan is not None and merge_plan.ready_for_manual_merge_review:
             status = 'ready_for_merge_review'
-        elif verification_status == 'generated_test_verification_failed':
-            status = 'generated_test_verification_failed'
-        elif verification_status == 'verification_failed':
-            status = 'verification_failed'
         elif apply_result is not None:
             status = 'applied'
         elif external_code_generation is not None:
-            status = 'generated'
+            code_result_status = None
+            if isinstance(code_result_summary, dict):
+                code_result_status = code_result_summary.get('status')
+            status = 'generated' if code_result_status == 'ok' else 'incomplete'
         else:
             status = 'incomplete'
 
@@ -1049,7 +1425,7 @@ class PipelineService:
             generated_test_files=generated_test_files,
             repair_used=repair_used,
             merge_mode=merge_mode,
-            merge_ready=merge_ready,
+            merge_ready=(status == 'ready_for_merge_review'),
             linked_requirements=linked_requirements,
             recommended_tests=recommended_tests,
             recommended_test_commands=recommended_test_commands,
@@ -1059,64 +1435,168 @@ class PipelineService:
             embedding_usage=(usage_summary or {}).get('embedding'),
         )
 
-    def _run_verification(self, apply_result: ApplyResult) -> dict[str, Any]:
-        config = self.project_services.config
-        results = self.project_services.validation_service.run_post_apply_checks(
-            apply_result.workspace_path,
-            apply_result.impact.recommended_tests,
-            run_ruff=config.verification_run_ruff,
-            run_recommended_tests=config.verification_run_recommended_tests,
-            run_full_project_tests=config.verification_run_full_project_tests,
-        )
-        passed = self.project_services.validation_service.verification_passed(results)
-        failure_summary = self.project_services.validation_service.build_failure_summary(results)
-        return {'passed': passed, 'results': results, 'failure_summary': failure_summary}
-    def _build_apply_failure_report(self, exc: Exception) -> dict[str, Any]:
-        return {
-            'passed': False,
-            'results': {
-                'apply_generated_artifact': {
-                    'ok': False,
-                    'error_type': type(exc).__name__,
-                    'message': str(exc),
-                }
-            },
-            'failure_summary': {
-                'failed_checks': ['apply_generated_artifact'],
-                'repairable': True,
-                'messages': [str(exc)],
-                'stage': 'apply',
-            },
-        }
+    def _collect_verification_test_targets(
+        self,
+        apply_result: ApplyResult,
+        generated_test_apply: dict[str, Any] | None = None,
+    ) -> list[str]:
+        ordered: list[str] = []
+        seen: set[str] = set()
 
-    def _mark_noop_repair_if_needed(self, verification_report: dict[str, Any], apply_result: ApplyResult, repair_generation: ExternalGenerationCall | None) -> dict[str, Any]:
+        for item in list(apply_result.impact.recommended_tests or []):
+            value = str(item or "").strip()
+            if value and value not in seen:
+                seen.add(value)
+                ordered.append(value)
+
+        for item in list((generated_test_apply or {}).get('applied_tests') or []):
+            value = str(item or "").strip()
+            if value and value not in seen:
+                seen.add(value)
+                ordered.append(value)
+
+        LOGGER.info(
+            "verification targets resolved recommended=%s generated_applied=%s final=%s",
+            list(apply_result.impact.recommended_tests or []),
+            list((generated_test_apply or {}).get('applied_tests') or []),
+            ordered,
+        )
+        return ordered
+    
+    def _run_runtime_verification_blocks(
+        self,
+        apply_result: ApplyResult,
+        generated_test_apply: dict[str, Any] | None = None,
+    ) -> list[VerificationBlock]:
+        verification_targets = self._collect_verification_test_targets(
+            apply_result,
+            generated_test_apply,
+        )
+        return self.project_services.validation_service.run_runtime_verification_blocks(
+            apply_result.workspace_path,
+            verification_targets,
+            run_ruff=self.project_services.config.verification_run_ruff,
+            run_recommended_tests=self.project_services.config.verification_run_recommended_tests,
+            run_full_project_tests=self.project_services.config.verification_run_full_project_tests,
+        )    
+
+    def _run_verification(
+        self,
+        apply_result: ApplyResult,
+        generated_test_apply: dict[str, Any] | None = None,
+    ) -> VerificationReport:
+        runtime_blocks = self._run_runtime_verification_blocks(
+            apply_result,
+            generated_test_apply,
+        )
+        return build_verification_report(blocks=runtime_blocks)
+    
+    def _build_apply_failure_report(self, exc: Exception) -> VerificationReport:
+        return build_verification_report(
+            blocks=[
+                VerificationBlock(
+                    name='apply_generated_artifact',
+                    ok=False,
+                    severity='error',
+                    issues=[
+                        VerificationIssue(
+                            code=type(exc).__name__,
+                            message=str(exc),
+                            severity='error',
+                        )
+                    ],
+                    details={
+                        'error_type': type(exc).__name__,
+                        'message': str(exc),
+                    },
+                )
+            ]
+        )
+    
+    def _build_patch_static_failure_report(
+        self,
+        patch_static_block: VerificationBlock,
+    ) -> VerificationReport:
+        return build_verification_report(
+            blocks=[patch_static_block],
+        )
+
+    def _normalize_repair_context(
+        self,
+        verification_report: VerificationReport | dict[str, Any],
+    ) -> dict[str, Any]:
+        if isinstance(verification_report, dict):
+            failure_summary = dict(verification_report.get('failure_summary') or {})
+            if 'repairable' not in failure_summary:
+                failure_summary['repairable'] = bool(
+                    failure_summary.get('failed_blocks')
+                    or failure_summary.get('failed_checks')
+                )
+            normalized = dict(verification_report)
+            normalized['failure_summary'] = failure_summary
+            return normalized
+
+        failed_blocks: list[dict[str, Any]] = []
+        for block in verification_report.blocks:
+            if block.ok:
+                continue
+            failed_blocks.append(
+                {
+                    'name': block.name,
+                    'severity': block.severity,
+                    'issues': [
+                        {
+                            'code': issue.code,
+                            'message': issue.message,
+                            'severity': issue.severity,
+                            'file_path': issue.file_path,
+                            'symbol': issue.symbol,
+                        }
+                        for issue in block.issues
+                    ],
+                    'details': asdict(block).get('details', {}),
+                }
+            )
+
+        return {
+            'verdict': verification_report.verdict,
+            'passed': verification_report.passed,
+            'summary': dict(verification_report.summary or {}),
+            'failure_summary': {
+                'repairable': bool(failed_blocks),
+                'failed_blocks': failed_blocks,
+            },
+        }    
+
+    def _mark_noop_repair_if_needed(
+        self,
+        verification_report: VerificationReport,
+        apply_result: ApplyResult,
+        repair_generation: ExternalGenerationCall | None,
+    ) -> VerificationReport:
         if repair_generation is None:
             return verification_report
+
         diff_text = apply_result.diff.unified_diff or ''
         if diff_text.strip():
             return verification_report
-        verification_report = dict(verification_report)
-        results = dict(verification_report.get('results', {}))
-        results['repair_intent'] = {
-            'ok': False,
-            'message': 'Repair produced no effective change relative to the original project code.',
-        }
-        failure_summary = dict(verification_report.get('failure_summary', {}))
-        failed_checks = list(failure_summary.get('failed_checks', []))
-        if 'repair_intent' not in failed_checks:
-            failed_checks.append('repair_intent')
-        messages = list(failure_summary.get('messages', []))
-        messages.append('Repair lost requested change intent: resulting diff is empty.')
-        failure_summary.update({
-            'failed_checks': failed_checks,
-            'messages': messages,
-            'repairable': False,
-            'stage': 'repair',
-        })
-        verification_report['passed'] = False
-        verification_report['results'] = results
-        verification_report['failure_summary'] = failure_summary
-        return verification_report
+
+        extra_block = VerificationBlock(
+            name='repair_intent',
+            ok=False,
+            severity='error',
+            issues=[
+                VerificationIssue(
+                    code='repair_intent',
+                    message='Repair produced no effective change relative to the original project code.',
+                    severity='error',
+                )
+            ],
+            details={},
+        )
+        return build_verification_report(
+            blocks=[*verification_report.blocks, extra_block]
+        )
 
 
     def _generation_replay(
@@ -1166,8 +1646,12 @@ class PipelineService:
             replacement_code=artifact_file.read_text(encoding='utf-8'),
         )
 
-    def _prepare_merge_plan(self, apply_result: ApplyResult, verification_report: dict[str, Any] | None = None) -> MergePlan:
-        verification_ok = True if verification_report is None else bool(verification_report.get('passed', False))
+    def _prepare_merge_plan(
+        self,
+        apply_result: ApplyResult,
+        verification_report: VerificationReport | None = None,
+    ) -> MergePlan:
+        verification_ok = True if verification_report is None else bool(verification_report.passed)
         ready_for_manual_merge_review = apply_result.validation.is_valid and verification_ok
         summary_lines = [
             'Режим merge: dry-run, без копирования изменений в master.',

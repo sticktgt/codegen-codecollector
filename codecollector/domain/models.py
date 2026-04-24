@@ -152,6 +152,30 @@ class ValidationReport:
     is_valid: bool
     issues: list[ValidationIssue]
 
+@dataclass(slots=True)
+class VerificationIssue:
+    code: str
+    message: str
+    severity: Severity = "error"
+    file_path: str | None = None
+    symbol: str | None = None
+
+
+@dataclass(slots=True)
+class VerificationBlock:
+    name: str
+    ok: bool
+    severity: Severity = "info"
+    issues: list[VerificationIssue] = field(default_factory=list)
+    details: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class VerificationReport:
+    verdict: str
+    passed: bool
+    blocks: list[VerificationBlock] = field(default_factory=list)
+    summary: dict[str, Any] = field(default_factory=dict)
 
 @dataclass(slots=True)
 class ApplyResult:
@@ -289,7 +313,7 @@ class PipelineRunResult:
     external_code_generation: ExternalGenerationCall | None = None
     external_test_generation: ExternalGenerationCall | None = None
     generated_test_apply: dict[str, Any] | None = None
-    verification_report: dict[str, Any] | None = None
+    verification_report: VerificationReport | None = None
     repair_generation: ExternalGenerationCall | None = None
     warnings: list[str] = field(default_factory=list)
     execution_summary: PipelineExecutionSummary | None = None

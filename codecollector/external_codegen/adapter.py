@@ -391,12 +391,48 @@ def invoke_generate_test(run_dir: Path, config: AppConfig, request_payload: dict
         stderr_path=str(stderr_path),
     )
 
-def build_repair_request(change_request: ChangeRequest, target_qualname: str, previous_result_payload: dict[str, Any], context_pack: ContextPack, verification_summary: dict[str, Any], config: AppConfig | None = None) -> dict[str, Any]:
+def build_repair_request(
+    change_request: ChangeRequest,
+    target_qualname: str,
+    previous_result_payload: dict[str, Any],
+    context_pack: ContextPack,
+    verification_summary: dict[str, Any],
+    config: AppConfig | None = None,
+    requested_operation: str = 'replace_symbol',
+) -> dict[str, Any]:
     target = context_pack.target
     failure_summary = verification_summary.get('failure_summary', {}) if isinstance(verification_summary, dict) else {}
     stage = str(failure_summary.get('stage', 'verification'))
     summary_text = 'Apply failed before verification' if stage == 'apply' else 'Verification failed after apply'
     error_type = 'apply_failed' if stage == 'apply' else 'verification_failed'
+    normalized_operation = _validate_operation(requested_operation)
+
+    related_tests_limit = max(
+        0,
+        int((config.codegenerator_repair_related_tests_max_items if config is not None else 1) or 0),
+    )
+    repair_reference_limit = max(
+        0,
+        int((config.codegenerator_repair_reference_max_items if config is not None else 1) or 0),
+    )
+
+    related_tests = _select_related_tests(
+        context_pack,
+        limit=related_tests_limit,
+    )[0]
+
+    selected_reference_artifacts = list(context_pack.reference_artifacts[:repair_reference_limit])
+
+    LOGGER.info(
+        'Prepared repair request: target=%s requested_operation=%s stage=%s related_tests=%s reference_artifacts=%s previous_artifact_has_code=%s',
+        target_qualname,
+        normalized_operation,
+        stage,
+        len(related_tests),
+        len(selected_reference_artifacts),
+        bool((previous_result_payload.get('code_artifact') or {}).get('code')),
+    )
+
     return {
         'request_id': f'repair-{target_qualname.split(".")[-1]}',
         'mode': 'repair',
@@ -415,7 +451,12 @@ def build_repair_request(change_request: ChangeRequest, target_qualname: str, pr
         'previous_artifact': previous_result_payload.get('code_artifact') or {},
         'project_context': {
             'module_outline': [
-                {'qualname': item.qualname, 'kind': item.kind, 'name': item.name, 'docstring': item.docstring}
+                {
+                    'qualname': item.qualname,
+                    'kind': item.kind,
+                    'name': item.name,
+                    'docstring': item.docstring,
+                }
                 for item in context_pack.neighbors
             ],
             'full_file_source': '',
@@ -427,14 +468,15 @@ def build_repair_request(change_request: ChangeRequest, target_qualname: str, pr
                 'source': target.source_code,
                 'truncated': False,
             },
-            'related_tests': _select_related_tests(
-                context_pack,
-                limit=max(0, int((config.codegenerator_repair_related_tests_max_items if config is not None else 1) or 0)),
-            )[0],
+            'related_tests': related_tests,
             'recommended_tests': list(context_pack.recommended_tests),
         },
         'reference_context': {
-            'reference_summary': {'count': min(1, len(context_pack.reference_artifacts)), 'titles': [item.title for item in context_pack.reference_artifacts[:max(0, int((config.codegenerator_repair_reference_max_items if config is not None else 1) or 0))]], 'content_modes': [item.content_mode for item in context_pack.reference_artifacts[:max(0, int((config.codegenerator_repair_reference_max_items if config is not None else 1) or 0))]]},
+            'reference_summary': {
+                'count': len(selected_reference_artifacts),
+                'titles': [item.title for item in selected_reference_artifacts],
+                'content_modes': [item.content_mode for item in selected_reference_artifacts],
+            },
             'reference_artifacts': [
                 {
                     'artifact_id': item.artifact_id,
@@ -448,10 +490,12 @@ def build_repair_request(change_request: ChangeRequest, target_qualname: str, pr
                     'selected_span': item.selected_span,
                     'truncated': False,
                 }
-                for item in context_pack.reference_artifacts[:max(0, int((config.codegenerator_repair_reference_max_items if config is not None else 1) or 0))]
+                for item in selected_reference_artifacts
             ],
         },
-        'options': {},
+        'options': {
+            'requested_operation': normalized_operation,
+        },
     }
 
 

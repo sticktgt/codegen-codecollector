@@ -12,6 +12,9 @@ from codecollector.domain.models import (
     GenerateApiResultSummary,
     PipelineRunResult,
     SelectTargetApiResultSummary,
+    VerificationBlock,
+    VerificationIssue,
+    VerificationReport,
 )
 from codecollector.logger import get_logger
 from codecollector.orchestration.services import ProjectServices
@@ -38,13 +41,17 @@ class SessionService:
         self.project_service = ProjectService(self.tool_root, self.config)
 
     def _repair_outcome(self, result: PipelineRunResult) -> str:
-        verification = result.verification_report or {}
-        if verification.get('passed', False):
+        verification = result.verification_report
+        if verification and verification.passed:
             return 'repaired'
-        failure_summary = verification.get('failure_summary') or {}
-        failed_checks = [str(item) for item in failure_summary.get('failed_checks', [])]
-        if 'repair_intent' in failed_checks:
-            return 'no_effective_change'
+
+        if verification:
+            for block in verification.blocks:
+                if block.name == 'repair_intent' and not block.ok:
+                    return 'no_effective_change'
+
+        if verification:
+            return verification.verdict
         return 'verification_failed'
 
     def _run_bundle_path(self, run_id: str) -> Path:
@@ -68,23 +75,33 @@ class SessionService:
             return external_payload
         raise ValueError('Previous run does not contain a reusable code artifact for repair')
 
-    def _build_manual_repair_report(self, note: str | None = None) -> dict[str, Any]:
+    def _build_manual_repair_report(self, note: str | None = None) -> VerificationReport:
         message = (note or 'Пользователь запросил дополнительный repair после review.').strip()
-        return {
-            'passed': False,
-            'results': {
-                'manual_repair_request': {
-                    'ok': False,
-                    'message': message,
-                }
+        return VerificationReport(
+           verdict='verification_failed',
+            passed=False,
+            blocks=[
+                VerificationBlock(
+                    name='manual_repair_request',
+                    ok=False,
+                    severity='error',
+                    issues=[
+                        VerificationIssue(
+                            code='manual_repair_request',
+                            message=message,
+                            severity='error',
+                            file_path=None,
+                            symbol=None,
+                        )
+                    ],
+                    details={},
+                )
+            ],
+            summary={
+                'production_failed': True,
+                'generated_test_failed': False,
             },
-            'failure_summary': {
-                'failed_checks': ['manual_repair_request'],
-                'repairable': True,
-                'messages': [message],
-                'stage': 'verification',
-            },
-        }
+       )
 
     def create_session(
         self,
@@ -261,9 +278,18 @@ class SessionService:
             if workspace_id and workspace_id not in workspace_ids:
                 workspace_ids.append(workspace_id)
 
+            result_summary = self._result_summary_payload(result) if result else None
+            result_status = str((result_summary or {}).get('status') or '').strip()
+
+            if not result_status and result and result.verification_report is not None:
+                result_status = result.verification_report.verdict
+
+            if not result_status:
+                result_status = 'generate_failed'
+
             session_payload['selected_target'] = resolved_target
             session_payload['requested_operation'] = requested_operation
-            session_payload['status'] = 'generate_failed'
+            session_payload['status'] = result_status
             session_payload['updated_at'] = _utc_now()
             session_payload['run_ids'] = run_ids
             session_payload['workspace_ids'] = workspace_ids
@@ -284,7 +310,7 @@ class SessionService:
                 'workspace_path': workspace_path or None,
                 'session': session_payload,
                 'pipeline_result': self._pipeline_payload(result) if result else None,
-                'result_summary': self._result_summary_payload(result) if result else None,
+                'result_summary': result_summary,
                 'requested_operation': requested_operation,
             }
 
@@ -302,9 +328,11 @@ class SessionService:
         result_summary = self._result_summary_payload(result)
         result_status = str((result_summary or {}).get('status') or '').strip()
 
+        if not result_status and result.verification_report is not None:
+            result_status = result.verification_report.verdict
+
         if not result_status:
-            verification_passed = bool((result.verification_report or {}).get('passed', False))
-            result_status = 'generated' if verification_passed else 'verification_failed'            
+            result_status = 'generated'
 
         session_payload['selected_target'] = resolved_target
         session_payload['requested_operation'] = requested_operation
@@ -544,7 +572,7 @@ class SessionService:
             'external_code_generation': asdict(result.external_code_generation) if result.external_code_generation else None,
             'external_test_generation': asdict(result.external_test_generation) if result.external_test_generation else None,
             'generated_test_apply': result.generated_test_apply,
-            'verification_report': result.verification_report,
+            'verification_report': asdict(result.verification_report) if result.verification_report else None,
             'repair_generation': asdict(result.repair_generation) if result.repair_generation else None,
             'apply_result': {
                 'workspace_path': str(result.apply_result.workspace_path),
