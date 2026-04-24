@@ -811,11 +811,7 @@ class PipelineService:
                             selected_target,
                             context_pack,
                             final_payload,
-                            {
-                                'passed': verification_report.passed,
-                                'verdict': verification_report.verdict,
-                                'summary': verification_report.summary,
-                            },
+                            verification_report,
                             requested_operation=requested_operation,
                         ),
                     )
@@ -846,24 +842,40 @@ class PipelineService:
                             'Применить исправленный артефакт в staging workspace',
                             lambda: self.project_services.apply(
                                 patch_artifact_from_result(final_payload, selected_target),
-                                generated_tests=[],
+                                generated_tests=generated_tests if generated_test_apply and generated_test_apply.get('applied_tests') else [],
                             ),
                         ),
                     )
-
                     runtime_blocks = self._run_step(
                         steps,
                         'verification_after_repair',
                         'Повторно запустить runtime-проверки проекта после repair',
                         lambda: self._run_runtime_verification_blocks(
                             apply_result,
-                            None,
+                            generated_test_apply,
                         ),
                     )
 
                     verification_report = build_verification_report(
                         blocks=[patch_static_block, *generated_test_blocks, *runtime_blocks],
                     )
+
+            verification_report = self._reclassify_generated_test_failure_only(
+                verification_report,
+                generated_test_apply,
+            )
+
+            if (
+                apply_result is not None
+                and self._is_generated_test_only_verdict(verification_report)
+            ):
+                notes = list(apply_result.impact.notes or [])
+                special_note = (
+                    'Основное изменение прошло проверки, но упал только сгенерированный тест; требуется ручная оценка качества generated test.'
+                )
+                if special_note not in notes:
+                    notes.append(special_note)
+                    apply_result.impact.notes = notes            
 
             merge_plan = self._run_step(
                 steps,
@@ -1035,11 +1047,117 @@ class PipelineService:
             _entry_matches(item) for item in (context_pack.recommended_tests or [])
         )
 
-    def _generated_test_failure_only(self, verification_report: VerificationReport | None) -> bool:
+    def _generated_test_failure_only(
+        self,
+        verification_report: VerificationReport | None,
+        generated_test_apply: dict[str, Any] | None = None,
+    ) -> bool:
         if verification_report is None:
             return False
-        return verification_report.verdict == 'generated_test_verification_failed'
+        return (
+            verification_report.verdict == 'generated_test_verification_failed'
+            or self._is_generated_test_only_runtime_failure(
+                verification_report,
+                generated_test_apply,
+            )
+        )
     
+    def _is_generated_test_only_verdict(
+        self,
+        verification_report: VerificationReport | None,
+    ) -> bool:
+        if verification_report is None:
+            return False
+        return (
+            verification_report.verdict == 'generated_test_verification_failed'
+            or bool((verification_report.summary or {}).get('generated_test_runtime_only'))
+        )    
+
+    def _is_generated_test_only_runtime_failure(
+        self,
+        verification_report: VerificationReport | None,
+        generated_test_apply: dict[str, Any] | None = None,
+    ) -> bool:
+        if verification_report is None:
+            return False
+
+        generated_paths = {
+            str(item or "").strip().replace("\\", "/").lower()
+            for item in list((generated_test_apply or {}).get('applied_tests') or [])
+            if str(item or "").strip()
+        }
+        if not generated_paths:
+            return False
+
+        failed_blocks = [block for block in verification_report.blocks if not block.ok]
+        if len(failed_blocks) != 1:
+            return False
+
+        failed_block = failed_blocks[0]
+        if failed_block.name != 'runtime_pytest_recommended':
+            return False
+
+        details = dict(failed_block.details or {})
+        output_parts = [
+            str(details.get('stdout') or '').strip(),
+            str(details.get('stderr') or '').strip(),
+        ]
+        output = '\n'.join(part for part in output_parts if part).replace("\\", "/").lower()
+        if not output:
+            return False
+
+        command_paths = {
+            str(part).strip().replace("\\", "/").lower()
+            for part in list(details.get('command') or [])
+            if str(part).strip().endswith('.py')
+        }
+        non_generated_paths = {
+            path for path in command_paths
+            if path not in generated_paths
+        }
+
+        generated_mentioned = any(
+            path in output or Path(path).name.lower() in output
+            for path in generated_paths
+        )
+        if not generated_mentioned:
+            return False
+
+        non_generated_mentioned = any(
+            path in output or Path(path).name.lower() in output
+            for path in non_generated_paths
+        )
+        if non_generated_mentioned:
+            return False
+
+        return True
+
+    def _reclassify_generated_test_failure_only(
+        self,
+        verification_report: VerificationReport | None,
+        generated_test_apply: dict[str, Any] | None = None,
+    ) -> VerificationReport | None:
+        if verification_report is None:
+            return None
+
+        if not self._is_generated_test_only_runtime_failure(
+            verification_report,
+            generated_test_apply,
+        ):
+            return verification_report
+
+        summary = dict(verification_report.summary or {})
+        summary['production_failed'] = False
+        summary['generated_test_failed'] = True
+        summary['generated_test_runtime_only'] = True
+
+        return VerificationReport(
+            verdict='generated_test_verification_failed',
+            passed=False,
+            blocks=list(verification_report.blocks),
+            summary=summary,
+        )
+
     def _resolve_verification_status(
         self,
         verification_report: VerificationReport | None,
@@ -1652,16 +1770,39 @@ class PipelineService:
         verification_report: VerificationReport | None = None,
     ) -> MergePlan:
         verification_ok = True if verification_report is None else bool(verification_report.passed)
-        ready_for_manual_merge_review = apply_result.validation.is_valid and verification_ok
+        generated_test_only_failed = self._is_generated_test_only_verdict(verification_report)
+
+        ready_for_manual_merge_review = (
+            apply_result.validation.is_valid
+            and (verification_ok or generated_test_only_failed)
+        )
+
+        status_line = (
+            'Структурная валидация и тестовые проверки прошли, но итоговое решение о merge принимает человек.'
+            if verification_ok
+            else (
+                'Основное изменение прошло проверки, но упал только сгенерированный тест; merge возможен после ручной оценки.'
+                if generated_test_only_failed
+                else 'Есть ошибки валидации или тестов, merge не рекомендуется без дополнительной проверки.'
+            )
+        )
+
+        post_apply_line = (
+            'Проверки после apply: only generated test failed'
+            if generated_test_only_failed
+            else f'Проверки после apply: {"passed" if verification_ok else "failed"}'
+        )
+
         summary_lines = [
             'Режим merge: dry-run, без копирования изменений в master.',
-            'Структурная валидация и тестовые проверки прошли, но итоговое решение о merge принимает человек.' if ready_for_manual_merge_review else 'Есть ошибки валидации или тестов, merge не рекомендуется без дополнительной проверки.',
+            status_line,
             f'Измененные файлы: {", ".join(apply_result.impact.changed_files) or "—"}',
             f'Символы в измененных файлах: {", ".join(apply_result.impact.symbols_in_changed_files) or "—"}',
             f'Связанные требования: {", ".join(apply_result.impact.linked_requirements) or "—"}',
             f'Рекомендуемые тесты: {", ".join(apply_result.impact.recommended_tests) or "—"}',
-            f'Проверки после apply: {"passed" if verification_ok else "failed"}',
+            post_apply_line,
         ]
+
         return MergePlan(
             mode='dry_run',
             ready_for_manual_merge_review=ready_for_manual_merge_review,
