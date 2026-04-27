@@ -53,7 +53,7 @@
 - с успешным `generate-test`, если тестовый артефакт создан и прошел verification;
 - с неуспешным `generate-test`, если основной код корректен, но verification упал только на сгенерированном тесте.
 
-Если падает только сгенерированный тест, итоговый статус фиксируется как `generated_test_verification_failed`, а основной код не отправляется в `repair`.
+Если verification не пройден, пайплайн может выполнить `repair`. Если после повторной проверки основной код проходит, а ошибка остается только в сгенерированном тесте, итоговый статус фиксируется как `generated_test_verification_failed`.
 
 ---
 
@@ -242,13 +242,18 @@
 
 Для итогового статуса используются два разных случая:
 
-- `verification_failed` — verification не пройден, и ошибка относится к общему результату изменения;
-- `generated_test_verification_failed` — основной код применен, но verification не пройден из-за ошибки только в сгенерированном тесте.
+- `verification_failed` — verification не пройден, и проблема относится к общему результату изменения;
+- `generated_test_verification_failed` — после проверки и, при необходимости, попытки `repair` основной код считается корректным, но verification не пройден из-за ошибки только в сгенерированном тесте.
 
 Это различие сохраняется:
 - в `result_summary.status`;
 - в `session.status`;
-- в итоговом payload run.
+- в итоговом payload run;
+- в `merge_plan.summary_lines`;
+- в `apply_result.impact.notes`.
+
+Пример:
+- если `pytest` падает только на `tests/test_generated_*.py`, а production-код и связанные проектные тесты проходят, итоговый статус должен быть `generated_test_verification_failed`.
 
 ### Run artifacts
 
