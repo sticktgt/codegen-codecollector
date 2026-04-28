@@ -57,9 +57,13 @@ def _has_dataclass_decorator_for_class(source: str, class_name: str) -> bool:
     for node in getattr(tree, "body", []):
         if isinstance(node, ast.ClassDef) and node.name == class_name:
             for decorator in node.decorator_list:
-                if isinstance(decorator, ast.Name) and decorator.id == "dataclass":
+                candidate = decorator
+                if isinstance(candidate, ast.Call):
+                    candidate = candidate.func
+
+                if isinstance(candidate, ast.Name) and candidate.id == "dataclass":
                     return True
-                if isinstance(decorator, ast.Attribute) and decorator.attr == "dataclass":
+                if isinstance(candidate, ast.Attribute) and candidate.attr == "dataclass":
                     return True
     return False
 
