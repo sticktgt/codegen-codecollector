@@ -52,6 +52,7 @@ class AppConfig:
     codegenerator_generate_test_related_tests_max_items: int
     codegenerator_repair_related_tests_max_items: int
     codegenerator_generate_reference_max_items: int
+    codegenerator_generate_test_reference_max_items: int
     codegenerator_repair_reference_max_items: int
     codegenerator_test_generation_mode: str
     codegenerator_repair_enabled: bool
@@ -185,6 +186,7 @@ def load_config(config_path: Path | None = None) -> AppConfig:
         codegenerator_generate_test_related_tests_max_items=int(codegen.get('generate_test_related_tests_max_items', 1)),
         codegenerator_repair_related_tests_max_items=int(codegen.get('repair_related_tests_max_items', 1)),
         codegenerator_generate_reference_max_items=int(codegen.get('generate_reference_max_items', 1)),
+        codegenerator_generate_test_reference_max_items=int(codegen.get('generate_test_reference_max_items', 1)),
         codegenerator_repair_reference_max_items=int(codegen.get('repair_reference_max_items', 1)),
         codegenerator_test_generation_mode=str(codegen.get('test_generation_mode', 'always')),
         codegenerator_repair_enabled=bool(codegen.get('repair_enabled', True)),

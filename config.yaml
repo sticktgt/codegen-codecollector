@@ -49,6 +49,7 @@ codegenerator:
   generate_test_related_tests_max_items: 1
   repair_related_tests_max_items: 1
   generate_reference_max_items: 1
+  generate_test_reference_max_items: 1
   repair_reference_max_items: 1
   test_generation_mode: always
   repair_enabled: true

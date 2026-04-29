@@ -93,7 +93,7 @@ def build_generation_request(
     }
     reference_limits = {
         'generate': config.codegenerator_generate_reference_max_items,
-        'generate_test': 0,
+        'generate_test': config.codegenerator_generate_test_reference_max_items,
         'repair': config.codegenerator_repair_reference_max_items,
     }
 
@@ -120,7 +120,7 @@ def build_generation_request(
         ],
     )
 
-    include_reference = mode == 'generate'
+    include_reference = mode in {'generate', 'generate_test'}
     if include_reference:
         for item in selected_reference_items:
             content = item.content
@@ -328,17 +328,6 @@ def invoke_generate_test(run_dir: Path, config: AppConfig, request_payload: dict
         )
         request_payload['mode'] = 'generate_test'
 
-    reference_context = dict(request_payload.get('reference_context') or {})
-    if reference_context.get('reference_artifacts'):
-        LOGGER.info('Dropping reference artifacts from generate-test request payload by structural policy')
-        reference_context['reference_artifacts'] = []
-        reference_context['reference_summary'] = {
-            'count': 0,
-            'titles': [],
-            'content_modes': [],
-        }
-        request_payload['reference_context'] = reference_context
-
     request_chars = _json_size(request_payload)
 
     LOGGER.info(
@@ -423,6 +412,13 @@ def build_repair_request(
 
     selected_reference_artifacts = list(context_pack.reference_artifacts[:repair_reference_limit])
 
+    previous_artifact = dict(previous_result_payload.get('code_artifact') or {})
+    previous_artifact['operation'] = normalized_operation
+    previous_artifact.setdefault('target_qualname', target_qualname)
+    previous_artifact.setdefault('target_file', target.file_path)
+    if normalized_operation == 'insert_after_symbol':
+        previous_artifact['insert_after'] = previous_artifact.get('insert_after') or target_qualname
+
     LOGGER.info(
         'Prepared repair request: target=%s requested_operation=%s stage=%s related_tests=%s reference_artifacts=%s previous_artifact_has_code=%s',
         target_qualname,
@@ -430,7 +426,7 @@ def build_repair_request(
         stage,
         len(related_tests),
         len(selected_reference_artifacts),
-        bool((previous_result_payload.get('code_artifact') or {}).get('code')),
+        bool(previous_artifact.get('code')),
     )
 
     return {
@@ -448,7 +444,7 @@ def build_repair_request(
             'summary': summary_text,
             'verification_summary': verification_summary,
         },
-        'previous_artifact': previous_result_payload.get('code_artifact') or {},
+        'previous_artifact': previous_artifact,
         'project_context': {
             'module_outline': [
                 {

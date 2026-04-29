@@ -770,12 +770,28 @@ class PipelineService:
                             [issue.code for issue in generated_test_relevance_block.issues],
                         )
                 else:
-                    generated_test_apply = {
-                        'applied_tests': [],
-                        'count': 0,
-                        'skipped': True,
-                        'reason': 'no_generated_tests',
-                    }
+                    generation_error = self._external_result_error(external_test_generation, external_test_result_payload)
+                    if generation_error:
+                        generated_test_apply = {
+                            'applied_tests': [],
+                            'count': 0,
+                            'skipped': True,
+                            'reason': 'generated_test_generation_failed',
+                            'error_type': generation_error.get('error_type'),
+                            'message': generation_error.get('message'),
+                            'request_id': generation_error.get('request_id'),
+                            'trace_path': generation_error.get('trace_path'),
+                        }
+                        warning_message = self._format_generated_test_generation_warning(generation_error)
+                        warnings.append(warning_message)
+                        LOGGER.warning(warning_message)
+                    else:
+                        generated_test_apply = {
+                            'applied_tests': [],
+                            'count': 0,
+                            'skipped': True,
+                            'reason': 'no_generated_tests',
+                        }
             else:
                 warning_message = 'Генерация теста пропущена: для target уже есть related_tests или recommended_tests.'
                 warnings.append(warning_message)
@@ -1255,6 +1271,9 @@ class PipelineService:
         request_payload['request_id'] = f'generate-test-{selected_target.split(".")[-1]}'
         request_payload['mode'] = 'generate_test'
         request_payload.setdefault('options', {})['generate_test_mode'] = 'always'
+        request_payload.setdefault('options', {})['generate_test_include_reference_artifacts'] = bool(
+            (request_payload.get('reference_context') or {}).get('reference_artifacts')
+        )
         call_result = invoke_generate_test(run_dir, self.project_services.config, request_payload)
         external_call = ExternalGenerationCall(
             mode='cli_json',
@@ -1323,6 +1342,7 @@ class PipelineService:
             context_pack,
             repair_context.get('failure_summary', {}),
             self.project_services.config,
+            requested_operation=requested_operation,
         )
         call_result = invoke_repair(run_dir, self.project_services.config, request_payload)
         external_call = ExternalGenerationCall(
@@ -1345,6 +1365,40 @@ class PipelineService:
         if not file_path or not source_code:
             return []
         return [{'file_path': file_path, 'source_code': source_code}]
+
+    def _external_result_error(
+        self,
+        external_call: ExternalGenerationCall | None,
+        result_payload: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        payload = result_payload or {}
+        result_summary = (external_call.result_summary if external_call else {}) or {}
+        status = str(payload.get('status') or result_summary.get('status') or '').strip().lower()
+        error_type = str(payload.get('error_type') or result_summary.get('error_type') or '').strip()
+        message = str(payload.get('message') or result_summary.get('message') or '').strip()
+        has_test_artifact = bool((payload.get('test_artifact') or {}).get('source_code'))
+
+        if has_test_artifact or (status and status not in {'error', 'failed', 'failure'} and not error_type and not message):
+            return None
+        if status in {'error', 'failed', 'failure'} or error_type or message:
+            return {
+                'request_id': payload.get('request_id') or result_summary.get('request_id'),
+                'status': status or None,
+                'error_type': error_type or None,
+                'message': message or None,
+                'trace_path': payload.get('trace_path') or result_summary.get('trace_path'),
+            }
+        return None
+
+    def _format_generated_test_generation_warning(self, error: dict[str, Any]) -> str:
+        parts = [
+            str(error.get('error_type') or '').strip(),
+            str(error.get('message') or '').strip(),
+        ]
+        details = ': '.join(item for item in parts if item)
+        if details:
+            return f'Генерация теста завершилась ошибкой: {details}'
+        return 'Генерация теста завершилась ошибкой: test artifact не был создан.'
     
     def _summarize_external_request(self, request_payload: dict[str, Any]) -> dict[str, Any]:
         target = dict(request_payload.get('target') or {})
