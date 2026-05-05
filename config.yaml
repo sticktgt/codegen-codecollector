@@ -58,3 +58,51 @@ verification:
   run_ruff: false
   run_recommended_tests: true
   run_full_project_tests: false
+analysis:
+  llm_assist:
+    enabled: true
+    base_url: "https://ollama.com"
+    api_key: "690c1905bf5142119e9eac6f0a6ee992.31gfL8NrBTR2PCsnuR90va_M"
+    model: "qwen3-coder-next"
+    timeout_sec: 420
+    think: false
+    temperature: 0.0
+    num_ctx: 16384
+    num_predict: 700
+    keep_alive: 0
+    max_prompt_chars: 12000
+    search_plan_max_prompt_chars: 8000
+    rerank_max_prompt_chars: 15000
+    min_confidence_auto_operation: 0.65
+    min_confidence_auto_recommend_target: 0.65
+  prompts:
+    dir: codecollector/prompts
+    system_template: codecollector/prompts/analyze_system_template.txt
+    search_plan_template: codecollector/prompts/analyze_search_plan_user_template.txt
+    rerank_template: codecollector/prompts/analyze_candidate_rerank_user_template.txt
+  recall:
+    project_map_max_files: 10
+    project_map_min_files: 4
+    project_map_symbols_per_file: 12
+    project_map_min_symbols_per_file: 4
+    project_map_module_doc_chars: 140
+    project_map_symbol_doc_chars: 90
+    base_search_limit: 10
+    max_search_plan_queries: 3
+    max_recall_candidates: 12
+  candidate_context:
+    max_candidate_cards: 7
+    min_candidate_cards: 5
+    candidate_source_chars: 260
+    candidate_source_min_chars: 120
+    related_test_chars: 180
+    related_test_min_chars: 80
+    related_tests: 1
+    siblings: 3
+    min_siblings: 1
+    sibling_doc_chars: 70
+    module_doc_chars: 100
+    relation_limit: 1
+    search_reasons: 3
+  result:
+    max_candidates: 5

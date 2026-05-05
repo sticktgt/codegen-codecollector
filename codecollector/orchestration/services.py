@@ -40,6 +40,7 @@ class ProjectServices:
             config=self.config,
         )
         self.context_service = ContextService(self.project_root, self.store, self.overlays)
+        self._context_cache: dict[str, ContextPack] = {}
         self.reference_library_service = ReferenceLibraryService(self.tool_root, self.store, self.vector_search_service, self.config)
         self.apply_service = ApplyService(
             self.tool_root,
@@ -58,6 +59,7 @@ class ProjectServices:
         report = self.builder.build(full_rebuild=full_rebuild)
         report.graph_indexing_ms = int((time.perf_counter() - started_at) * 1000)
         self.store.replace_knowledge_relations(str(self.project_root), self.overlays.knowledge_relations())
+        self._context_cache.clear()
         sync_stats = self._sync_search_documents()
         report.search_documents_sync_ms = sync_stats['search_documents_sync_ms']
         report.vector_index_sync_ms = sync_stats['vector_index_sync_ms']
@@ -98,15 +100,45 @@ class ProjectServices:
             use_vector_search=use_vector_search,
             requested_operation=requested_operation,
         )
+    
+    def search_many(
+        self,
+        queries: list[str],
+        limit: int = 5,
+        use_vector_search: bool | None = None,
+        requested_operation: str = 'replace_symbol',
+    ) -> dict[str, list[SearchCandidate]]:
+        LOGGER.info(
+            'Searching in %s for queries_count=%s limit=%s',
+            self.project_root,
+            len(queries),
+            limit,
+        )
+        self.overlays.refresh()
+        return self.search_service.search_many(
+            queries=queries,
+            limit=limit,
+            use_vector_search=use_vector_search,
+            requested_operation=requested_operation,
+        )    
 
     def context(self, qualname: str) -> ContextPack:
+        cached = self._context_cache.get(qualname)
+        if cached is not None:
+            LOGGER.info('Using cached context for %s in %s', qualname, self.project_root)
+            return cached
+
         LOGGER.info('Building context for %s in %s', qualname, self.project_root)
         self.overlays.refresh()
-        return self.context_service.build_context(qualname)
+        context = self.context_service.build_context(qualname)
+        self._context_cache[qualname] = context
+        return context
 
     def apply(self, artifact: PatchArtifact, generated_tests: list[dict[str, str]] | None = None) -> ApplyResult:
         LOGGER.info('Applying artifact %s (%s) to %s', artifact.target_qualname, artifact.operation, self.project_root)
-        return self.apply_service.apply_artifact(self.project_root, artifact, generated_tests=generated_tests)
+        result = self.apply_service.apply_artifact(self.project_root, artifact, generated_tests=generated_tests)
+        self._context_cache.clear()
+        return result
 
     def retrieve_reference_artifacts(self, change_request: ChangeRequest, selected_target: str) -> list:
         target = self.store.get_symbol(str(self.project_root), selected_target)

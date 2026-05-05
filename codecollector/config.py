@@ -60,6 +60,48 @@ class AppConfig:
     verification_run_ruff: bool
     verification_run_recommended_tests: bool
     verification_run_full_project_tests: bool
+    analysis_llm_enabled: bool
+    analysis_llm_base_url: str
+    analysis_llm_api_key: str
+    analysis_llm_model: str
+    analysis_llm_timeout_sec: int
+    analysis_llm_temperature: float
+    analysis_llm_num_ctx: int
+    analysis_llm_num_predict: int
+    analysis_llm_keep_alive: int | str
+    analysis_llm_think: bool | None
+    analysis_llm_max_prompt_chars: int
+    analysis_llm_search_plan_max_prompt_chars: int
+    analysis_llm_rerank_max_prompt_chars: int
+    analysis_prompt_dir: str
+    analysis_system_template: str
+    analysis_search_plan_template: str
+    analysis_rerank_template: str
+    analysis_project_map_max_files: int
+    analysis_project_map_min_files: int
+    analysis_project_map_symbols_per_file: int
+    analysis_project_map_min_symbols_per_file: int
+    analysis_project_map_module_doc_chars: int
+    analysis_project_map_symbol_doc_chars: int
+    analysis_base_search_limit: int
+    analysis_max_search_plan_queries: int
+    analysis_max_recall_candidates: int
+    analysis_max_candidate_cards: int
+    analysis_min_candidate_cards: int
+    analysis_candidate_source_chars: int
+    analysis_candidate_source_min_chars: int
+    analysis_candidate_related_test_chars: int
+    analysis_candidate_related_test_min_chars: int
+    analysis_candidate_related_tests: int
+    analysis_candidate_siblings: int
+    analysis_candidate_min_siblings: int
+    analysis_candidate_sibling_doc_chars: int
+    analysis_candidate_module_doc_chars: int
+    analysis_candidate_relation_limit: int
+    analysis_candidate_search_reasons: int
+    analysis_max_return_candidates: int
+    analysis_min_confidence_auto_operation: float
+    analysis_min_confidence_auto_recommend_target: float
 
     @property
     def ui_default_demo_project_path(self) -> Path:
@@ -148,6 +190,12 @@ def load_config(config_path: Path | None = None) -> AppConfig:
     resolved_path = (config_path or DEFAULT_CONFIG_PATH).resolve()
     payload: dict[str, Any] = _merge_config(resolved_path)
     codegen = payload.get('codegenerator', {}) if isinstance(payload.get('codegenerator', {}), dict) else {}
+    analysis = payload.get('analysis', {}) if isinstance(payload.get('analysis', {}), dict) else {}
+    llm_assist = analysis.get('llm_assist', {}) if isinstance(analysis.get('llm_assist', {}), dict) else {}
+    prompts = analysis.get('prompts', {}) if isinstance(analysis.get('prompts', {}), dict) else {}
+    recall = analysis.get('recall', {}) if isinstance(analysis.get('recall', {}), dict) else {}
+    candidate_context = analysis.get('candidate_context', {}) if isinstance(analysis.get('candidate_context', {}), dict) else {}
+    analysis_result = analysis.get('result', {}) if isinstance(analysis.get('result', {}), dict) else {}
     return AppConfig(
         root_path=resolved_path.parent,
         app_name=payload.get('app', {}).get('name', 'codecollector'),
@@ -194,4 +242,46 @@ def load_config(config_path: Path | None = None) -> AppConfig:
         verification_run_ruff=bool(payload.get('verification', {}).get('run_ruff', False)),
         verification_run_recommended_tests=bool(payload.get('verification', {}).get('run_recommended_tests', True)),
         verification_run_full_project_tests=bool(payload.get('verification', {}).get('run_full_project_tests', False)),
+        analysis_llm_enabled=bool(llm_assist.get('enabled', True)),
+        analysis_llm_base_url=str(llm_assist.get('base_url', '')),
+        analysis_llm_api_key=str(llm_assist.get('api_key', '')),
+        analysis_llm_model=str(llm_assist.get('model', 'qwen3-coder-next')),
+        analysis_llm_timeout_sec=int(llm_assist.get('timeout_sec', 420)),
+        analysis_llm_temperature=float(llm_assist.get('temperature', 0.0)),
+        analysis_llm_num_ctx=int(llm_assist.get('num_ctx', 16384)),
+        analysis_llm_num_predict=int(llm_assist.get('num_predict', 700)),
+        analysis_llm_keep_alive=llm_assist.get('keep_alive', 0),
+        analysis_llm_think=llm_assist.get('think', False),
+        analysis_llm_max_prompt_chars=int(llm_assist.get('max_prompt_chars', 12000)),
+        analysis_llm_search_plan_max_prompt_chars=int(llm_assist.get('search_plan_max_prompt_chars', llm_assist.get('max_prompt_chars', 8000))),
+        analysis_llm_rerank_max_prompt_chars=int(llm_assist.get('rerank_max_prompt_chars', llm_assist.get('max_prompt_chars', 12000))),
+        analysis_prompt_dir=str(prompts.get('dir', 'codecollector/prompts')),
+        analysis_system_template=str(prompts.get('system_template', 'codecollector/prompts/analyze_system_template.txt')),
+        analysis_search_plan_template=str(prompts.get('search_plan_template', 'codecollector/prompts/analyze_search_plan_user_template.txt')),
+        analysis_rerank_template=str(prompts.get('rerank_template', 'codecollector/prompts/analyze_candidate_rerank_user_template.txt')),
+        analysis_project_map_max_files=int(recall.get('project_map_max_files', 10)),
+        analysis_project_map_min_files=int(recall.get('project_map_min_files', 4)),
+        analysis_project_map_symbols_per_file=int(recall.get('project_map_symbols_per_file', 12)),
+        analysis_project_map_min_symbols_per_file=int(recall.get('project_map_min_symbols_per_file', 4)),
+        analysis_project_map_module_doc_chars=int(recall.get('project_map_module_doc_chars', 140)),
+        analysis_project_map_symbol_doc_chars=int(recall.get('project_map_symbol_doc_chars', 90)),
+        analysis_base_search_limit=int(recall.get('base_search_limit', 10)),
+        analysis_max_search_plan_queries=int(recall.get('max_search_plan_queries', 3)),
+        analysis_max_recall_candidates=int(recall.get('max_recall_candidates', 12)),
+        analysis_max_candidate_cards=int(candidate_context.get('max_candidate_cards', 7)),
+        analysis_min_candidate_cards=int(candidate_context.get('min_candidate_cards', 5)),
+        analysis_candidate_source_chars=int(candidate_context.get('candidate_source_chars', 260)),
+        analysis_candidate_source_min_chars=int(candidate_context.get('candidate_source_min_chars', 120)),
+        analysis_candidate_related_test_chars=int(candidate_context.get('related_test_chars', 180)),
+        analysis_candidate_related_test_min_chars=int(candidate_context.get('related_test_min_chars', 80)),
+        analysis_candidate_related_tests=int(candidate_context.get('related_tests', 1)),
+        analysis_candidate_siblings=int(candidate_context.get('siblings', 3)),
+        analysis_candidate_min_siblings=int(candidate_context.get('min_siblings', 1)),
+        analysis_candidate_sibling_doc_chars=int(candidate_context.get('sibling_doc_chars', 70)),
+        analysis_candidate_module_doc_chars=int(candidate_context.get('module_doc_chars', 100)),
+        analysis_candidate_relation_limit=int(candidate_context.get('relation_limit', 1)),
+        analysis_candidate_search_reasons=int(candidate_context.get('search_reasons', 3)),
+        analysis_max_return_candidates=int(analysis_result.get('max_candidates', 5)),
+        analysis_min_confidence_auto_operation=float(llm_assist.get('min_confidence_auto_operation', 0.65)),
+        analysis_min_confidence_auto_recommend_target=float(llm_assist.get('min_confidence_auto_recommend_target', 0.65)),
     )

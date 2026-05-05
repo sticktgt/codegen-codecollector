@@ -81,6 +81,25 @@ class WorkspaceService:
             return None
         return json.loads(path.read_text(encoding='utf-8'))
 
+    def _extract_excluded_files_from_bundle(self, bundle: dict[str, Any] | None) -> list[str]:
+        if not bundle:
+            return []
+
+        merge_plan = bundle.get('merge_plan') or {}
+        excluded: list[str] = []
+        seen: set[str] = set()
+
+        for item in list(merge_plan.get('excluded_files') or []):
+            rel = str(item or '').strip().replace('\\', '/')
+            if not rel:
+                continue
+            if self._is_skipped_path(rel):
+                continue
+            if rel not in seen:
+                seen.add(rel)
+                excluded.append(rel)
+
+        return excluded
 
     def _is_skipped_path(self, rel_path: str) -> bool:
         path = Path(rel_path)
@@ -106,6 +125,11 @@ class WorkspaceService:
         apply_result = bundle.get('apply_result') or {}
         impact = apply_result.get('impact') or {}
         diff_payload = apply_result.get('diff') or {}
+        excluded_files = {
+            str(item or '').strip().replace('\\', '/')
+            for item in list(merge_plan.get('excluded_files') or [])
+            if str(item or '').strip()
+        }        
 
         candidates: list[str] = []
         candidates.extend(list(impact.get('changed_files') or []))
@@ -122,7 +146,10 @@ class WorkspaceService:
             if rel.startswith(str(self.workspace_root)) or rel.startswith(str(self.tool_root)):
                 # абсолютные пути из bundle нам здесь не нужны
                 continue
+            rel = rel.replace('\\', '/')
             if self._is_skipped_path(rel):
+                continue
+            if rel in excluded_files:
                 continue
             if rel not in seen:
                 seen.add(rel)
@@ -151,10 +178,16 @@ class WorkspaceService:
         resolved = self.resolve(workspace_id)
         session = self._find_session_for_workspace(workspace_id)
         bundle = self._load_run_bundle(resolved.run_id)
+        excluded_files = self._extract_excluded_files_from_bundle(bundle) 
         changed_files = self._extract_changed_files_from_bundle(bundle)
         if not changed_files and resolved.project_root is not None:
             changed_files = self._collect_changed_files(resolved.project_root, resolved.workspace_path)
- 
+        if excluded_files:
+           excluded_set = {item.replace('\\', '/') for item in excluded_files}
+           changed_files = [
+               rel for rel in changed_files
+               if rel.replace('\\', '/') not in excluded_set
+           ]
         return {
             'workspace_id': workspace_id,
             'workspace_path': str(resolved.workspace_path),
@@ -163,6 +196,7 @@ class WorkspaceService:
             'project_root': str(resolved.project_root) if resolved.project_root else None,
             'run_id': resolved.run_id,
             'changed_files': changed_files,
+            'excluded_files': excluded_files,
             'is_last_workspace': bool(session and str(session.get('last_workspace_id') or '') == workspace_id),
         }
 
@@ -171,9 +205,17 @@ class WorkspaceService:
         if resolved.project_root is None:
             raise ValueError(f'Workspace {workspace_id} is not linked to a registered project')
         bundle = self._load_run_bundle(resolved.run_id)
+        excluded_files = self._extract_excluded_files_from_bundle(bundle)        
         changed_files = self._extract_changed_files_from_bundle(bundle)
         if not changed_files:
             changed_files = self._collect_changed_files(resolved.project_root, resolved.workspace_path)
+
+        if excluded_files:
+            excluded_set = {item.replace('\\', '/') for item in excluded_files}
+            changed_files = [
+                rel for rel in changed_files
+                if rel.replace('\\', '/') not in excluded_set
+            ]            
         unified_parts: list[str] = []
         for rel in changed_files:
             if self._is_skipped_path(rel):
@@ -191,6 +233,7 @@ class WorkspaceService:
             'project_root': str(resolved.project_root),
             'run_id': resolved.run_id,
             'changed_files': [rel for rel in changed_files if not self._is_skipped_path(rel)],
+            'excluded_files': excluded_files,            
             'unified_diff': ''.join(unified_parts),
         }
 
@@ -205,6 +248,7 @@ class WorkspaceService:
             )
         diff_payload = self.diff_workspace(workspace_id)
         changed_files = diff_payload['changed_files']
+        excluded_files = list(diff_payload.get('excluded_files') or [])        
         applied_files: list[str] = []
         for rel in changed_files:
             src = resolved.workspace_path / rel
@@ -230,6 +274,7 @@ class WorkspaceService:
             'project_root': str(resolved.project_root),
             'run_id': resolved.run_id,
             'applied_files': applied_files,
+            'excluded_files': excluded_files,            
             'applied': True,
             'onboarding': asdict(onboarding_result),
         }

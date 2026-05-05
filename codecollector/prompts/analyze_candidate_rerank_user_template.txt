@@ -1,0 +1,36 @@
+Выбери лучшую operation и лучший target/anchor для change request codecollector.
+
+Верни только валидный JSON без markdown.
+
+JSON-формат ответа:
+{
+  "recommended_operation": "replace_symbol | insert_after_symbol | unknown",
+  "operation_confidence": 0.0,
+  "operation_reason": "короткое объяснение",
+  "recommended_candidate_id": "candidate id or null",
+  "recommended_target": "qualname or null",
+  "target_role": "target | anchor | unknown",
+  "target_confidence": 0.0,
+  "target_reason": "короткое объяснение",
+  "manual_review_required": false,
+  "warnings": [{"code": "string", "message": "string"}],
+  "ranked_candidates": [
+    {"candidate_id": "string", "rank": 1, "reason": "коротко"}
+  ],
+  "alternatives": [{"candidate_id": "string", "reason": "коротко"}]
+}
+
+Правила выбора:
+- Для replace_symbol выбирай symbol, который непосредственно реализует изменяемое поведение.
+- Не выбирай wrapper/controller/use-case метод, если есть более конкретный callee с нужной логикой.
+- Для insert_after_symbol выбирай anchor-symbol: место, рядом с которым логично добавить новый class/function.
+- Для insert_after_symbol target_role должен быть "anchor".
+- Если правильного target/anchor нет среди candidate_cards, верни recommended_target=null и manual_review_required=true.
+- Если данных недостаточно, честно верни manual_review_required=true.
+- Если user_operation задана и кажется неверной, не меняй ее молча; укажи warning.
+- ranked_candidates должен содержать до 5 лучших candidate_id из candidate_cards в порядке полезности для человека.
+- Первый элемент ranked_candidates должен совпадать с recommended_candidate_id, если recommended_candidate_id не null.
+- Не добавляй в ranked_candidates кандидатов, которых нет во входных candidate_cards.
+
+Входные данные:
+$payload_json

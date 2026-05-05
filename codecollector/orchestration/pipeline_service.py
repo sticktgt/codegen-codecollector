@@ -811,6 +811,27 @@ class PipelineService:
                 blocks=[patch_static_block, *generated_test_blocks, *runtime_blocks],
             )
 
+            verification_report = self._reclassify_generated_test_failure_only(
+                verification_report,
+                generated_test_apply,
+            )
+
+            if self._is_generated_test_only_verdict(verification_report):
+                excluded_files = list((verification_report.summary or {}).get('generated_test_excluded_files') or [])
+                if generated_test_apply is not None:
+                    generated_test_apply = dict(generated_test_apply)
+                    generated_test_apply['verification_failed'] = True
+                    generated_test_apply['merge_recommended'] = False
+                    generated_test_apply['excluded_files'] = excluded_files
+
+                warning_message = (
+                    'Сгенерированный тест не прошел verification; основной код можно рассматривать отдельно, '
+                    'generated test будет исключен из apply/merge.'
+                )
+                if warning_message not in warnings:
+                    warnings.append(warning_message)
+                LOGGER.warning(warning_message)
+
             if (not verification_report.passed) and self.project_services.config.codegenerator_repair_enabled and repair_generation is None:
                 if verification_report.verdict == 'generated_test_verification_failed':
                     warning_message = 'Repair пропущен: упал только сгенерированный тест, основной код не отправляется в repair.'
@@ -1089,6 +1110,35 @@ class PipelineService:
             or bool((verification_report.summary or {}).get('generated_test_runtime_only'))
         )    
 
+    def _generated_test_applied_paths(
+        self,
+        generated_test_apply: dict[str, Any] | None = None,
+    ) -> list[str]:
+        return [
+            str(item or '').strip().replace('\\', '/').lower()
+            for item in list((generated_test_apply or {}).get('applied_tests') or [])
+            if str(item or '').strip()
+        ]
+
+    def _pytest_failed_paths_from_output(self, output: str) -> set[str]:
+        failed_paths: set[str] = set()
+
+        for line in output.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith('FAILED '):
+                continue
+
+            parts = stripped.split()
+            if len(parts) < 2:
+                continue
+
+            test_ref = parts[1].strip().replace('\\', '/').lower()
+            path = test_ref.split('::', 1)[0].strip()
+            if path.endswith('.py'):
+                failed_paths.add(path)
+
+        return failed_paths
+
     def _is_generated_test_only_runtime_failure(
         self,
         verification_report: VerificationReport | None,
@@ -1097,11 +1147,7 @@ class PipelineService:
         if verification_report is None:
             return False
 
-        generated_paths = {
-            str(item or "").strip().replace("\\", "/").lower()
-            for item in list((generated_test_apply or {}).get('applied_tests') or [])
-            if str(item or "").strip()
-        }
+        generated_paths = set(self._generated_test_applied_paths(generated_test_apply))
         if not generated_paths:
             return False
 
@@ -1122,28 +1168,17 @@ class PipelineService:
         if not output:
             return False
 
-        command_paths = {
-            str(part).strip().replace("\\", "/").lower()
-            for part in list(details.get('command') or [])
-            if str(part).strip().endswith('.py')
-        }
-        non_generated_paths = {
-            path for path in command_paths
-            if path not in generated_paths
-        }
-
-        generated_mentioned = any(
-            path in output or Path(path).name.lower() in output
-            for path in generated_paths
-        )
-        if not generated_mentioned:
+        failed_paths = self._pytest_failed_paths_from_output(output)
+        if not failed_paths:
             return False
 
-        non_generated_mentioned = any(
-            path in output or Path(path).name.lower() in output
-            for path in non_generated_paths
-        )
-        if non_generated_mentioned:
+        generated_names = {Path(path).name.lower() for path in generated_paths}
+
+        for failed_path in failed_paths:
+            if failed_path in generated_paths:
+                continue
+            if Path(failed_path).name.lower() in generated_names:
+                continue
             return False
 
         return True
@@ -1162,10 +1197,14 @@ class PipelineService:
         ):
             return verification_report
 
+        generated_paths = self._generated_test_applied_paths(generated_test_apply)
+
         summary = dict(verification_report.summary or {})
         summary['production_failed'] = False
         summary['generated_test_failed'] = True
         summary['generated_test_runtime_only'] = True
+        summary['generated_test_failed_files'] = generated_paths
+        summary['generated_test_excluded_files'] = generated_paths
 
         return VerificationReport(
             verdict='generated_test_verification_failed',
@@ -1569,6 +1608,7 @@ class PipelineService:
         repair_used = repair_generation is not None
         merge_mode = None if merge_plan is None else merge_plan.mode
         merge_ready = None if merge_plan is None else bool(merge_plan.ready_for_manual_merge_review)
+        excluded_files = [] if merge_plan is None else list(getattr(merge_plan, 'excluded_files', []) or [])
 
         if verification_status is not None:
             status = verification_status
@@ -1597,10 +1637,11 @@ class PipelineService:
             generated_test_files=generated_test_files,
             repair_used=repair_used,
             merge_mode=merge_mode,
-            merge_ready=(status == 'ready_for_merge_review'),
+            merge_ready=merge_ready,
             linked_requirements=linked_requirements,
             recommended_tests=recommended_tests,
             recommended_test_commands=recommended_test_commands,
+            excluded_files=excluded_files,
             code_generation_usage=(usage_summary or {}).get('code_generation'),
             test_generation_usage=(usage_summary or {}).get('test_generation'),
             repair_generation_usage=(usage_summary or {}).get('repair_generation'),
@@ -1826,6 +1867,14 @@ class PipelineService:
         verification_ok = True if verification_report is None else bool(verification_report.passed)
         generated_test_only_failed = self._is_generated_test_only_verdict(verification_report)
 
+        excluded_files = []
+        if generated_test_only_failed and verification_report is not None:
+            excluded_files = [
+                str(item or '').strip().replace('\\', '/')
+                for item in list((verification_report.summary or {}).get('generated_test_excluded_files') or [])
+                if str(item or '').strip()
+            ]
+
         ready_for_manual_merge_review = (
             apply_result.validation.is_valid
             and (verification_ok or generated_test_only_failed)
@@ -1847,6 +1896,12 @@ class PipelineService:
             else f'Проверки после apply: {"passed" if verification_ok else "failed"}'
         )
 
+        excluded_line = (
+            f'Исключены из apply/merge: {", ".join(excluded_files)}'
+            if excluded_files
+            else ''
+        )
+
         summary_lines = [
             'Режим merge: dry-run, без копирования изменений в master.',
             status_line,
@@ -1856,6 +1911,8 @@ class PipelineService:
             f'Рекомендуемые тесты: {", ".join(apply_result.impact.recommended_tests) or "—"}',
             post_apply_line,
         ]
+        if excluded_line:
+            summary_lines.append(excluded_line)        
 
         return MergePlan(
             mode='dry_run',
@@ -1866,6 +1923,7 @@ class PipelineService:
             linked_requirements=apply_result.impact.linked_requirements,
             recommended_tests=apply_result.impact.recommended_tests,
             recommended_test_commands=apply_result.impact.recommended_test_commands,
+            excluded_files=excluded_files,            
             summary_lines=summary_lines,
         )
 

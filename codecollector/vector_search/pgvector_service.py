@@ -41,6 +41,22 @@ class PGVectorDescriptionSearchService:
             use_jsonb=True,
             pre_delete_collection=False,
         )
+    
+    def _scores_from_results(self, results, project_key: str, limit: int) -> dict[str, float]:
+        scores: dict[str, float] = {}
+        for doc, score in results:
+            metadata = doc.metadata or {}
+            if metadata.get('project_root') != project_key:
+                continue
+            qualname = str(metadata.get('qualname', ''))
+            if not qualname:
+                continue
+            similarity = 1.0 / (1.0 + float(score))
+            if similarity > scores.get(qualname, 0.0):
+                scores[qualname] = similarity
+
+        ranked = sorted(scores.items(), key=lambda pair: (-pair[1], pair[0]))[:limit]
+        return dict(ranked)    
 
     def sync_documents(self, documents: list[dict[str, str]], project_key: str | None = None) -> None:
         project_key = project_key or self.project_key
@@ -82,16 +98,39 @@ class PGVectorDescriptionSearchService:
         project_key = project_key or self.project_key
         store = self._vector_store()
         results = store.similarity_search_with_score(query, k=limit * 3)
-        scores: dict[str, float] = {}
-        for doc, score in results:
-            metadata = doc.metadata or {}
-            if metadata.get('project_root') != project_key:
-                continue
-            qualname = str(metadata.get('qualname', ''))
-            if not qualname:
-                continue
-            similarity = 1.0 / (1.0 + float(score))
-            if similarity > scores.get(qualname, 0.0):
-                scores[qualname] = similarity
-        ranked = sorted(scores.items(), key=lambda pair: (-pair[1], pair[0]))[:limit]
-        return dict(ranked)
+        return self._scores_from_results(results, project_key, limit)
+
+    def search_many(self, queries: list[str], limit: int = 10, project_key: str | None = None) -> dict[str, dict[str, float]]:
+        project_key = project_key or self.project_key
+        normalized_queries = [query.strip() for query in queries if query.strip()]
+        if not normalized_queries:
+            return {}
+
+        store = self._vector_store()
+        search_by_vector = getattr(store, 'similarity_search_with_score_by_vector', None)
+        if search_by_vector is None:
+            LOGGER.warning(
+                'PGVector backend does not expose similarity_search_with_score_by_vector; falling back to per-query vector search'
+            )
+            return {
+                query: self.search(query, limit=limit, project_key=project_key)
+                for query in normalized_queries
+            }
+
+        embeddings = self.embedding.embed_documents(normalized_queries)
+        if len(embeddings) != len(normalized_queries):
+            LOGGER.warning(
+                'Batch embedding returned unexpected count: queries=%s embeddings=%s; falling back to per-query vector search',
+                len(normalized_queries),
+                len(embeddings),
+            )
+            return {
+                query: self.search(query, limit=limit, project_key=project_key)
+                for query in normalized_queries
+            }
+
+        result: dict[str, dict[str, float]] = {}
+        for query, embedding in zip(normalized_queries, embeddings, strict=True):
+            results = search_by_vector(embedding, k=limit * 3)
+            result[query] = self._scores_from_results(results, project_key, limit)
+        return result    
