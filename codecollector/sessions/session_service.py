@@ -135,12 +135,15 @@ class SessionService:
         *,
         recommended_target: str | None,
         requested_operation: str | None = None,
+        analysis_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload = self.registry.get(session_id)
         payload["recommended_target"] = recommended_target
         if requested_operation:
             payload["requested_operation"] = requested_operation
-        payload["status"] = "analyzed"
+        if analysis_metadata:
+            payload["analysis"] = analysis_metadata
+        payload["status"] = "needs_user_decision" if bool((analysis_metadata or {}).get("manual_review_required")) else "analyzed"
         payload["updated_at"] = _utc_now()
         self.registry.save(payload)
         return payload
@@ -154,7 +157,93 @@ class SessionService:
     def delete_session(self, session_id: str) -> bool:
         return self.registry.delete(session_id)
 
-    def select_target(self, session_id: str, selected_qualname: str) -> dict[str, Any]:
+    def _request_quality_status(self, session_payload: dict[str, Any]) -> str:
+        analysis = session_payload.get('analysis') or {}
+        if not isinstance(analysis, dict):
+            return ''
+
+        request_quality = analysis.get('request_quality') or {}
+        if not isinstance(request_quality, dict):
+            return ''
+
+        return str(request_quality.get('status') or '').strip().lower()
+
+    def _is_insufficient_request(self, session_payload: dict[str, Any]) -> bool:
+        return self._request_quality_status(session_payload) == 'insufficient'
+
+    def _build_generate_blocked_result(self, session_payload: dict[str, Any]) -> dict[str, Any] | None:
+        session_id = str(session_payload.get('session_id') or '').strip()
+        project_id = str(session_payload.get('project_id') or '').strip()
+        status = str(session_payload.get('status') or '').strip()
+
+        analysis = session_payload.get('analysis') or {}
+        request_quality = analysis.get('request_quality') or {}
+        request_quality_status = self._request_quality_status(session_payload)
+
+        if self._is_insufficient_request(session_payload):
+            missing_information = request_quality.get('missing_information') or []
+            message = (
+                'Запрос недостаточно конкретен для генерации. '
+                'Переформулируйте запрос и запустите analyze заново.'
+            )
+
+            return {
+                'session_id': session_id,
+                'project_id': project_id,
+                'selected_target': session_payload.get('selected_target'),
+                'selected_target_source': 'session_selected'
+                if session_payload.get('selected_target')
+                else None,
+                'run_id': None,
+                'workspace_id': None,
+                'workspace_path': None,
+                'session': session_payload,
+                'pipeline_result': None,
+                'result_summary': {
+                    'status': 'needs_user_decision',
+                    'generation_blocked': True,
+                    'block_reason': 'insufficient_request',
+                    'message': message,
+                    'request_quality_status': request_quality_status,
+                    'missing_information': missing_information,
+                    'recommended_action': 'rewrite_request_and_run_analyze_again',
+                    'selected_target': session_payload.get('selected_target'),
+                    'requested_operation': session_payload.get('requested_operation'),
+                },
+                'requested_operation': session_payload.get('requested_operation'),
+            }
+
+        if status not in {'analyzed', 'target_selected'}:
+            message = f'Session is not ready for generation: status={status}'
+
+            return {
+                'session_id': session_id,
+                'project_id': project_id,
+                'selected_target': session_payload.get('selected_target'),
+                'selected_target_source': 'session_selected'
+                if session_payload.get('selected_target')
+                else None,
+                'run_id': None,
+                'workspace_id': None,
+                'workspace_path': None,
+                'session': session_payload,
+                'pipeline_result': None,
+                'result_summary': {
+                    'status': status or 'not_ready',
+                    'generation_blocked': True,
+                    'block_reason': 'session_not_ready',
+                    'message': message,
+                    'request_quality_status': request_quality_status or None,
+                    'recommended_action': 'select_target_or_run_analyze_again',
+                    'selected_target': session_payload.get('selected_target'),
+                    'requested_operation': session_payload.get('requested_operation'),
+                },
+                'requested_operation': session_payload.get('requested_operation'),
+            }
+
+        return None 
+
+    def select_target(self, session_id: str, selected_qualname: str, requested_operation: str | None = None) -> dict[str, Any]:
         payload = self.registry.get(session_id)
         previous_selected_target = str(payload.get('selected_target') or '').strip() or None
         recommended_target = str(payload.get('recommended_target') or '').strip() or None
@@ -164,7 +253,14 @@ class SessionService:
         selection_changed = new_selected_target != effective_previous_target
 
         payload['selected_target'] = selected_qualname
-        payload['status'] = 'target_selected'
+        if requested_operation:
+            payload['requested_operation'] = requested_operation
+
+        if self._is_insufficient_request(payload):
+            payload['status'] = 'needs_user_decision'
+        else:
+            payload['status'] = 'target_selected'
+
         payload['updated_at'] = _utc_now()
         self.registry.save(payload)
 
@@ -200,6 +296,16 @@ class SessionService:
         requested_operation: str | None = None,
     ) -> dict[str, Any]:
         session_payload = self.registry.get(session_id)
+        blocked_result = self._build_generate_blocked_result(session_payload)
+        if blocked_result is not None:
+            LOGGER.info(
+                'Session generate blocked: session_id=%s reason=%s status=%s',
+                session_id,
+                blocked_result.get('result_summary', {}).get('block_reason'),
+                blocked_result.get('result_summary', {}).get('status'),
+            )
+            return blocked_result
+
         project = self.project_service.get_project(str(session_payload['project_id']))
         resolved_target, target_source = self.resolve_target(session_id, selected_target)
 
@@ -608,6 +714,7 @@ class SessionService:
             linked_requirements=list(execution.linked_requirements),
             recommended_tests=list(execution.recommended_tests),
             recommended_test_commands=list(execution.recommended_test_commands),
+            excluded_files=list(getattr(execution, 'excluded_files', []) or []),            
         )
         return asdict(summary)
     

@@ -70,7 +70,7 @@ def build_parser() -> argparse.ArgumentParser:
     session_analyze.add_argument('--constraint', action='append', default=[])
     session_analyze.add_argument('--note', action='append', default=[])
     session_analyze.add_argument('--limit', type=int)
-    session_analyze.add_argument('--operation', choices=PATCH_OPERATIONS, default='replace_symbol')
+    session_analyze.add_argument('--operation', choices=PATCH_OPERATIONS, default=None)
 
     sessions_sub.add_parser('list')
 
@@ -87,6 +87,7 @@ def build_parser() -> argparse.ArgumentParser:
     session_select = sessions_sub.add_parser('select-target')
     session_select.add_argument('--session-id', required=True)
     session_select.add_argument('--selected-qualname', required=True)
+    session_select.add_argument("--operation", choices=PATCH_OPERATIONS, default=None)
 
     session_generate = sessions_sub.add_parser('generate')
     session_generate.add_argument('--session-id', required=True)
@@ -242,7 +243,7 @@ def main() -> None:
             return
 
         if args.command == 'sessions' and args.sessions_command == 'select-target':
-            result = session_service.select_target(args.session_id, args.selected_qualname)
+            result = session_service.select_target(args.session_id, args.selected_qualname, requested_operation=args.operation)
             print(json.dumps(result, ensure_ascii=False, indent=2))
             return
 

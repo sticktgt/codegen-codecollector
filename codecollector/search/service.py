@@ -58,6 +58,65 @@ class SearchService:
 
         candidates.sort(key=lambda item: (-item.score, -item.confidence, item.file_path, item.qualname))
         return candidates[:limit]
+    
+    def search_many(
+        self,
+        queries: list[str],
+        limit: int = 5,
+        use_vector_search: bool | None = None,
+        requested_operation: str = 'replace_symbol',
+    ) -> dict[str, list[SearchCandidate]]:
+        normalized_queries: list[str] = []
+        seen_queries: set[str] = set()
+        for query in queries:
+            query_text = str(query or '').strip()
+            if not query_text or query_text in seen_queries:
+                continue
+            normalized_queries.append(query_text)
+            seen_queries.add(query_text)
+
+        if not normalized_queries:
+            return {}
+
+        LOGGER.info(
+            "Executing batch search queries_count=%s limit=%s for %s",
+            len(normalized_queries),
+            limit,
+            self.project_root,
+        )
+
+        vector_enabled = self.config.search_vector_enabled if use_vector_search is None else use_vector_search
+        vector_scores_by_query: dict[str, dict[str, float]] = {}
+        if vector_enabled and self.vector_search:
+            vector_scores_by_query = self.vector_search.search_many(
+                normalized_queries,
+                limit=max(limit * 3, 10),
+            )
+
+        symbols = [item for item in self.store.list_symbols(self.project_key) if item.kind != 'module']
+        result: dict[str, list[SearchCandidate]] = {}
+
+        for query in normalized_queries:
+            normalized_query = self._normalize_text(query)
+            query_terms = self._expand_terms(normalized_query)
+            vector_scores = vector_scores_by_query.get(query, {})
+
+            candidates: list[SearchCandidate] = []
+            for symbol in symbols:
+                candidate = self._score_symbol(
+                    symbol,
+                    query_terms,
+                    query,
+                    vector_scores.get(symbol.qualname, 0.0),
+                    requested_operation=requested_operation,
+                )
+                if candidate.score > 0:
+                    candidates.append(candidate)
+
+            candidates.sort(key=lambda item: (-item.score, -item.confidence, item.file_path, item.qualname))
+            result[query] = candidates[:limit]
+
+        return result    
 
     def _expand_terms(self, normalized_query: str) -> list[str]:
         terms = set(TERM_RE.findall(normalized_query))

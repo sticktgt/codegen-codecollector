@@ -1,0 +1,41 @@
+Сформируй компактный план анализа change request для codecollector.
+
+Верни только валидный JSON без markdown.
+
+JSON-формат ответа:
+{
+  "request_quality": {
+    "status": "processable | uncertain | insufficient",
+    "reason": "короткое объяснение",
+    "missing_information": ["что нужно уточнить"]
+  },
+  "operation": {
+    "value": "replace_symbol | insert_after_symbol | unknown",
+    "confidence": 0.0,
+    "reason": "короткое объяснение"
+  },
+  "expected_new_symbols": [
+    {"name": "имя", "kind": "function | class | method | unknown"}
+  ],
+  "search_plan": {
+    "search_queries": ["короткая поисковая фраза"],
+    "preferred_files": ["path/to/file.py"],
+    "preferred_qualnames": ["package.module.symbol"],
+    "preferred_layers": ["domain | services | api | storage | tests"],
+    "avoid_layers": ["слой"],
+    "reason": "короткое объяснение"
+  },
+  "multi_target_likely": false,
+  "manual_review_required": false,
+  "warnings": []
+}
+
+Правила:
+- Если user_operation задана человеком, верни ее как operation.value, но можешь добавить предупреждение в reason/warnings.
+- Для replace_symbol ищем существующий symbol, который нужно заменить целиком.
+- Для insert_after_symbol ищем anchor-symbol, после которого нужно добавить новый class/function.
+- search_queries должны быть короткими: 2-5 слов, максимум 4 запроса.
+- Не придумывай файлы и qualname, которых нет в project_map.
+
+Входные данные:
+$payload_json

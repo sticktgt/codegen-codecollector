@@ -77,6 +77,10 @@ class SearchCandidate:
     docstring: str = ""
     knowledge_title: str = ""
     requirements: list[str] = field(default_factory=list)
+    ranked_by_llm: bool = False
+    llm_recommended: bool = False
+    llm_rank: int | None = None
+    llm_reason: str = ""
 
 
 @dataclass(slots=True)
@@ -219,6 +223,7 @@ class MergePlan:
     linked_requirements: list[str] = field(default_factory=list)
     recommended_tests: list[str] = field(default_factory=list)
     recommended_test_commands: list[str] = field(default_factory=list)
+    excluded_files: list[str] = field(default_factory=list)
     summary_lines: list[str] = field(default_factory=list)
 
 
@@ -252,6 +257,7 @@ class PipelineExecutionSummary:
     linked_requirements: list[str] = field(default_factory=list)
     recommended_tests: list[str] = field(default_factory=list)
     recommended_test_commands: list[str] = field(default_factory=list)
+    excluded_files: list[str] = field(default_factory=list)
     code_generation_usage: dict[str, Any] | None = None
     test_generation_usage: dict[str, Any] | None = None
     repair_generation_usage: dict[str, Any] | None = None
@@ -275,6 +281,7 @@ class GenerateApiResultSummary:
     linked_requirements: list[str] = field(default_factory=list)
     recommended_tests: list[str] = field(default_factory=list)
     recommended_test_commands: list[str] = field(default_factory=list)
+    excluded_files: list[str] = field(default_factory=list)
 
 @dataclass(slots=True)
 class AnalyzeApiResultSummary:
@@ -283,8 +290,17 @@ class AnalyzeApiResultSummary:
     requested_operation: str | None = None
     recommended_target: str | None = None
     candidates_count: int = 0
+    recall_candidates_count: int = 0
+    returned_candidates_count: int = 0
     top_candidates: list[str] = field(default_factory=list)
     has_context_summary: bool = False
+    operation_source: str | None = None
+    operation_confidence: float | None = None
+    request_quality_status: str | None = None
+    manual_review_required: bool = False
+    target_selection_source: str | None = None
+    target_selection_confidence: float | None = None
+    analysis_usage: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
