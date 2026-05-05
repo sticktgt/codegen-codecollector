@@ -27,6 +27,7 @@ from codecollector.orchestration.pipeline_service import PipelineRunFailed
 import json
 
 LOGGER = get_logger(__name__)
+INSERT_SCOPES = {'module_body', 'class_body'}
 
 
 def _utc_now() -> str:
@@ -171,6 +172,66 @@ class SessionService:
     def _is_insufficient_request(self, session_payload: dict[str, Any]) -> bool:
         return self._request_quality_status(session_payload) == 'insufficient'
 
+    def _normalize_insert_scope(self, value: str | None) -> str | None:
+        scope = str(value or '').strip()
+        return scope if scope in INSERT_SCOPES else None
+
+    def _target_symbol_payload(self, session_payload: dict[str, Any], selected_target: str | None) -> dict[str, Any]:
+        project_id = str(session_payload.get('project_id') or '').strip()
+        if not project_id or not selected_target:
+            return {}
+        project = self.project_service.get_project(project_id)
+        services = ProjectServices(Path(project.project_root), config=self.config)
+        symbol = services.store.get_symbol(str(services.project_root), selected_target)
+        if symbol is None:
+            return {}
+        return asdict(symbol)
+
+    def _build_blocked_generation_payload(
+        self,
+        session_payload: dict[str, Any],
+        *,
+        block_reason: str,
+        message: str,
+        recommended_action: str,
+        selected_target: str | None = None,
+        selected_target_source: str | None = None,
+        requested_operation: str | None = None,
+        insert_scope: str | None = None,
+        target_symbol: dict[str, Any] | None = None,
+        missing_information: list[Any] | None = None,
+    ) -> dict[str, Any]:
+        session_id = str(session_payload.get('session_id') or '').strip()
+        project_id = str(session_payload.get('project_id') or '').strip()
+        status = str(session_payload.get('status') or '').strip() or 'needs_user_decision'
+        request_quality_status = self._request_quality_status(session_payload) or None
+        return {
+            'session_id': session_id,
+            'project_id': project_id,
+            'selected_target': selected_target if selected_target is not None else session_payload.get('selected_target'),
+            'selected_target_source': selected_target_source,
+            'run_id': None,
+            'workspace_id': None,
+            'workspace_path': None,
+            'session': session_payload,
+            'pipeline_result': None,
+            'result_summary': {
+                'status': status,
+                'generation_blocked': True,
+                'block_reason': block_reason,
+                'message': message,
+                'request_quality_status': request_quality_status,
+                'missing_information': list(missing_information or []),
+                'recommended_action': recommended_action,
+                'selected_target': selected_target if selected_target is not None else session_payload.get('selected_target'),
+                'requested_operation': requested_operation if requested_operation is not None else session_payload.get('requested_operation'),
+                'insert_scope': insert_scope if insert_scope is not None else session_payload.get('insert_scope'),
+                'target_symbol': target_symbol or {},
+            },
+            'requested_operation': requested_operation if requested_operation is not None else session_payload.get('requested_operation'),
+            'insert_scope': insert_scope if insert_scope is not None else session_payload.get('insert_scope'),
+        }
+
     def _build_generate_blocked_result(self, session_payload: dict[str, Any]) -> dict[str, Any] | None:
         session_id = str(session_payload.get('session_id') or '').strip()
         project_id = str(session_payload.get('project_id') or '').strip()
@@ -209,8 +270,10 @@ class SessionService:
                     'recommended_action': 'rewrite_request_and_run_analyze_again',
                     'selected_target': session_payload.get('selected_target'),
                     'requested_operation': session_payload.get('requested_operation'),
+                    'insert_scope': session_payload.get('insert_scope'),
                 },
                 'requested_operation': session_payload.get('requested_operation'),
+                'insert_scope': session_payload.get('insert_scope'),
             }
 
         if status not in {'analyzed', 'target_selected'}:
@@ -237,13 +300,15 @@ class SessionService:
                     'recommended_action': 'select_target_or_run_analyze_again',
                     'selected_target': session_payload.get('selected_target'),
                     'requested_operation': session_payload.get('requested_operation'),
+                    'insert_scope': session_payload.get('insert_scope'),
                 },
                 'requested_operation': session_payload.get('requested_operation'),
+                'insert_scope': session_payload.get('insert_scope'),
             }
 
         return None 
 
-    def select_target(self, session_id: str, selected_qualname: str, requested_operation: str | None = None) -> dict[str, Any]:
+    def select_target(self, session_id: str, selected_qualname: str, requested_operation: str | None = None, insert_scope: str | None = None) -> dict[str, Any]:
         payload = self.registry.get(session_id)
         previous_selected_target = str(payload.get('selected_target') or '').strip() or None
         recommended_target = str(payload.get('recommended_target') or '').strip() or None
@@ -255,6 +320,9 @@ class SessionService:
         payload['selected_target'] = selected_qualname
         if requested_operation:
             payload['requested_operation'] = requested_operation
+        normalized_insert_scope = self._normalize_insert_scope(insert_scope)
+        if normalized_insert_scope:
+            payload['insert_scope'] = normalized_insert_scope
 
         if self._is_insufficient_request(payload):
             payload['status'] = 'needs_user_decision'
@@ -294,6 +362,7 @@ class SessionService:
         limit: int | None = None,
         use_vector_search: bool | None = None,
         requested_operation: str | None = None,
+        insert_scope: str | None = None,
     ) -> dict[str, Any]:
         session_payload = self.registry.get(session_id)
         blocked_result = self._build_generate_blocked_result(session_payload)
@@ -326,12 +395,66 @@ class SessionService:
             or stored_requested_operation
             or 'replace_symbol'
         )
+        effective_insert_scope = (
+            self._normalize_insert_scope(insert_scope)
+            or self._normalize_insert_scope(str(session_payload.get('insert_scope') or ''))
+        )
 
         LOGGER.info(
-            "Session generate resolved operation: session_id=%s effective_requested_operation=%s",
+            "Session generate resolved operation: session_id=%s effective_requested_operation=%s insert_scope=%s",
             session_id,
             requested_operation,
+            effective_insert_scope,
         )
+
+        target_symbol_payload = self._target_symbol_payload(session_payload, resolved_target)
+        target_kind = str(target_symbol_payload.get('kind') or '').strip()
+        if requested_operation == 'insert_after_symbol' and target_kind == 'method':
+            if not effective_insert_scope:
+                return self._build_blocked_generation_payload(
+                    session_payload,
+                    block_reason='ambiguous_insert_scope',
+                    message=(
+                        'Выбран метод внутри класса как anchor для insert_after_symbol. '
+                        'Укажите insert_scope=class_body для добавления метода класса или выберите module-level anchor.'
+                    ),
+                    recommended_action='select_target_with_insert_scope_or_choose_module_anchor',
+                    selected_target=resolved_target,
+                    selected_target_source=target_source,
+                    requested_operation=requested_operation,
+                    insert_scope=effective_insert_scope,
+                    target_symbol=target_symbol_payload,
+                )
+            if effective_insert_scope == 'module_body':
+                return self._build_blocked_generation_payload(
+                    session_payload,
+                    block_reason='unsafe_method_anchor_for_module_insert',
+                    message=(
+                        'Для module_body вставки нельзя использовать method-anchor внутри класса. '
+                        'Выберите top-level anchor или измените insert_scope на class_body.'
+                    ),
+                    recommended_action='choose_module_anchor_or_use_class_body_scope',
+                    selected_target=resolved_target,
+                    selected_target_source=target_source,
+                    requested_operation=requested_operation,
+                    insert_scope=effective_insert_scope,
+                    target_symbol=target_symbol_payload,
+                )
+        if requested_operation == 'insert_after_symbol' and effective_insert_scope == 'class_body':
+            return self._build_blocked_generation_payload(
+                session_payload,
+                block_reason='class_body_insert_not_supported',
+                message=(
+                    'insert_scope=class_body пока не поддержан patching/codegenerator. '
+                    'Доработка будет реализована отдельным шагом.'
+                ),
+                recommended_action='wait_for_class_body_insert_support_or_choose_module_anchor',
+                selected_target=resolved_target,
+                selected_target_source=target_source,
+                requested_operation=requested_operation,
+                insert_scope=effective_insert_scope,
+                target_symbol=target_symbol_payload,
+            )
 
         run_id = ""
         workspace_path = ""
@@ -395,6 +518,8 @@ class SessionService:
 
             session_payload['selected_target'] = resolved_target
             session_payload['requested_operation'] = requested_operation
+            if effective_insert_scope:
+                session_payload['insert_scope'] = effective_insert_scope
             session_payload['status'] = result_status
             session_payload['updated_at'] = _utc_now()
             session_payload['run_ids'] = run_ids
@@ -418,6 +543,7 @@ class SessionService:
                 'pipeline_result': self._pipeline_payload(result) if result else None,
                 'result_summary': result_summary,
                 'requested_operation': requested_operation,
+                'insert_scope': effective_insert_scope,
             }
 
         run_id = result.run_id
@@ -442,6 +568,8 @@ class SessionService:
 
         session_payload['selected_target'] = resolved_target
         session_payload['requested_operation'] = requested_operation
+        if effective_insert_scope:
+            session_payload['insert_scope'] = effective_insert_scope
         session_payload['status'] = result_status
         session_payload['updated_at'] = _utc_now()
         session_payload['run_ids'] = run_ids
@@ -702,6 +830,7 @@ class SessionService:
             selected_target=execution.selected_target,
             requested_operation=execution.requested_operation,
             final_operation=execution.final_operation,
+            insert_scope=getattr(execution, 'insert_scope', None),
             workspace_path=execution.workspace_path,
             changed_files=list(execution.changed_files),
             symbols_in_changed_files=list(execution.symbols_in_changed_files),
@@ -730,6 +859,7 @@ class SessionService:
             status=str(session_payload.get('status') or ''),
             project_id=str(session_payload.get('project_id') or ''),
             requested_operation=str(session_payload.get('requested_operation') or '').strip() or None,
+            insert_scope=str(session_payload.get('insert_scope') or '').strip() or None,
             recommended_target=recommended,
             selected_target=selected_target,
             selection_changed=selection_changed,

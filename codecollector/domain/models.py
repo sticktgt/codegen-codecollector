@@ -18,6 +18,7 @@ RelationSource = Literal["index", "knowledge"]
 RelationConfidence = Literal["high", "medium", "low"]
 Severity = Literal["info", "warning", "error"]
 PatchOperation = Literal["replace_symbol", "insert_after_symbol"]
+InsertScope = Literal["module_body", "class_body"]
 
 
 @dataclass(slots=True)
@@ -122,6 +123,10 @@ class PatchArtifact:
     target_qualname: str
     replacement_code: str
     operation: PatchOperation = "replace_symbol"
+    insert_scope: InsertScope | None = None
+    expected_new_symbol_kind: str | None = None
+    parent_qualname: str | None = None
+    import_changes: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -245,6 +250,7 @@ class PipelineExecutionSummary:
     selected_target: str
     requested_operation: str | None = None
     final_operation: str | None = None
+    insert_scope: str | None = None
     changed_files: list[str] = field(default_factory=list)
     symbols_in_changed_files: list[str] = field(default_factory=list)
     workspace_path: str | None = None
@@ -269,6 +275,7 @@ class GenerateApiResultSummary:
     selected_target: str
     requested_operation: str | None = None
     final_operation: str | None = None
+    insert_scope: str | None = None
     workspace_path: str | None = None
     changed_files: list[str] = field(default_factory=list)
     symbols_in_changed_files: list[str] = field(default_factory=list)
@@ -288,6 +295,7 @@ class AnalyzeApiResultSummary:
     status: str
     project_id: str
     requested_operation: str | None = None
+    insert_scope: str | None = None
     recommended_target: str | None = None
     candidates_count: int = 0
     recall_candidates_count: int = 0
@@ -308,6 +316,7 @@ class SelectTargetApiResultSummary:
     status: str
     project_id: str
     requested_operation: str | None = None
+    insert_scope: str | None = None
     recommended_target: str | None = None
     selected_target: str | None = None
     selection_changed: bool = False    

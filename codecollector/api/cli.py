@@ -24,6 +24,7 @@ from codecollector.orchestration.pipeline_service import PipelineRunFailed
 
 LOGGER = get_logger(__name__)
 PATCH_OPERATIONS = ('replace_symbol', 'insert_after_symbol')
+INSERT_SCOPES = ('module_body', 'class_body')
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -88,11 +89,13 @@ def build_parser() -> argparse.ArgumentParser:
     session_select.add_argument('--session-id', required=True)
     session_select.add_argument('--selected-qualname', required=True)
     session_select.add_argument("--operation", choices=PATCH_OPERATIONS, default=None)
+    session_select.add_argument("--insert-scope", choices=INSERT_SCOPES, default=None)
 
     session_generate = sessions_sub.add_parser('generate')
     session_generate.add_argument('--session-id', required=True)
     session_generate.add_argument('--selected-qualname')
     session_generate.add_argument('--operation', choices=PATCH_OPERATIONS, default=None)
+    session_generate.add_argument('--insert-scope', choices=INSERT_SCOPES, default=None)
     session_generate.add_argument('--limit', type=int)
     session_generate.add_argument('--disable-vector-search', action='store_true')
 
@@ -219,6 +222,7 @@ def main() -> None:
                 project_id=args.project_id,
                 input_requirements=[requirement_payload],
                 requested_operation=args.operation,
+                insert_scope=args.insert_scope,
                 limit=args.limit or config.search_default_limit,
             )
             print(json.dumps(asdict(result), ensure_ascii=False, indent=2))
@@ -243,21 +247,28 @@ def main() -> None:
             return
 
         if args.command == 'sessions' and args.sessions_command == 'select-target':
-            result = session_service.select_target(args.session_id, args.selected_qualname, requested_operation=args.operation)
+            result = session_service.select_target(
+                args.session_id,
+                args.selected_qualname,
+                requested_operation=args.operation,
+                insert_scope=args.insert_scope,
+            )
             print(json.dumps(result, ensure_ascii=False, indent=2))
             return
 
         if args.command == 'sessions' and args.sessions_command == 'generate':
             LOGGER.info(
-                "CLI sessions generate: session_id=%s selected_qualname=%s operation=%s",
+                "CLI sessions generate: session_id=%s selected_qualname=%s operation=%s insert_scope=%s",
                 args.session_id,
                 args.selected_qualname,
                 args.operation,
+                args.insert_scope,
             )
             result = session_service.generate(
                 session_id=args.session_id,
                 selected_target=args.selected_qualname,
                 requested_operation=args.operation,
+                insert_scope=args.insert_scope,
                 limit=args.limit or config.search_default_limit,
                 use_vector_search=not args.disable_vector_search,
             )
