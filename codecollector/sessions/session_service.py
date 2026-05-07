@@ -395,10 +395,21 @@ class SessionService:
             or stored_requested_operation
             or 'replace_symbol'
         )
+        analysis = session_payload.get('analysis') or {}
+        target_recommendation = analysis.get('target_recommendation') or {}
+        target_insert_scope = target_recommendation.get('insert_scope') or {}
+        search_plan = analysis.get('search_plan') or {}
+        search_insert_scope = search_plan.get('insert_scope') or {}
+
         effective_insert_scope = (
             self._normalize_insert_scope(insert_scope)
             or self._normalize_insert_scope(str(session_payload.get('insert_scope') or ''))
+            or self._normalize_insert_scope(str((target_insert_scope or {}).get('value') or ''))
+            or self._normalize_insert_scope(str((search_insert_scope or {}).get('value') or ''))
+        
         )
+        if effective_insert_scope:
+            session_payload['insert_scope'] = effective_insert_scope
 
         LOGGER.info(
             "Session generate resolved operation: session_id=%s effective_requested_operation=%s insert_scope=%s",
@@ -440,22 +451,6 @@ class SessionService:
                     insert_scope=effective_insert_scope,
                     target_symbol=target_symbol_payload,
                 )
-        if requested_operation == 'insert_after_symbol' and effective_insert_scope == 'class_body':
-            return self._build_blocked_generation_payload(
-                session_payload,
-                block_reason='class_body_insert_not_supported',
-                message=(
-                    'insert_scope=class_body пока не поддержан patching/codegenerator. '
-                    'Доработка будет реализована отдельным шагом.'
-                ),
-                recommended_action='wait_for_class_body_insert_support_or_choose_module_anchor',
-                selected_target=resolved_target,
-                selected_target_source=target_source,
-                requested_operation=requested_operation,
-                insert_scope=effective_insert_scope,
-                target_symbol=target_symbol_payload,
-            )
-
         run_id = ""
         workspace_path = ""
         workspace_id = ""
@@ -492,6 +487,7 @@ class SessionService:
                 use_vector_search=use_vector_search,
                 skip_search=target_source in {'request', 'session_selected'},
                 requested_operation=requested_operation,
+                insert_scope=effective_insert_scope,
            )
         except PipelineRunFailed as exc:
             result = exc.result

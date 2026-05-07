@@ -67,6 +67,7 @@ def build_generation_request(
     generated_code_artifact: dict[str, Any] | None = None,
     mode: str = 'generate',
     operation: str = 'replace_symbol',
+    insert_scope: str | None = None,
 ) -> dict[str, Any]:
     target = context_pack.target
     full_file_source = (project_root / target.file_path).read_text(encoding='utf-8')
@@ -168,6 +169,43 @@ def build_generation_request(
         len(full_file_source),
     )
 
+    normalized_operation = _validate_operation(operation)
+    normalized_insert_scope = str(insert_scope or '').strip() or None
+    parent_qualname = ''
+    expected_new_symbol_kind = ''
+    if normalized_operation == 'insert_after_symbol':
+        if normalized_insert_scope == 'class_body':
+            if target.kind == 'method':
+                parent_qualname = str(target.parent_qualname or '')
+            elif target.kind == 'class':
+                parent_qualname = target.qualname
+            expected_new_symbol_kind = 'method'
+        elif normalized_insert_scope == 'module_body':
+            expected_new_symbol_kind = 'class' if 'dataclass' in (change_request.title + ' ' + change_request.description).casefold() else 'function'
+
+    parent_symbol_payload = None
+    class_members: list[dict[str, Any]] = []
+    if parent_qualname:
+        parent_symbol = next((item for item in [target, *context_pack.neighbors] if item.qualname == parent_qualname), None)
+        if parent_symbol is not None:
+            parent_symbol_payload = {
+                'qualname': parent_symbol.qualname,
+                'name': parent_symbol.name,
+                'kind': parent_symbol.kind,
+                'docstring': parent_symbol.docstring,
+                'source': parent_symbol.source_code,
+            }
+        for item in [target, *context_pack.neighbors]:
+            if item.parent_qualname == parent_qualname and item.kind == 'method':
+                first_line = (item.source_code or '').strip().splitlines()[0] if item.source_code else item.name
+                class_members.append({
+                    'qualname': item.qualname,
+                    'name': item.name,
+                    'kind': item.kind,
+                    'signature': first_line.strip(),
+                    'docstring': item.docstring,
+                })
+
     project_context = {
         'module_outline': [
             {
@@ -187,6 +225,8 @@ def build_generation_request(
             'source': target_source,
             'truncated': target_truncated,
         },
+        'parent_symbol': parent_symbol_payload,
+        'class_members': class_members,
         'related_tests': related_tests,
         'recommended_tests': list(context_pack.recommended_tests),
     }
@@ -199,8 +239,6 @@ def build_generation_request(
     reference_context = {
         'reference_artifacts': reference_artifacts,
     }
-    normalized_operation = _validate_operation(operation)
-
     request = {
         'request_id': f'generate-{target_qualname.split(".")[-1]}',
         'mode': mode,
@@ -214,6 +252,9 @@ def build_generation_request(
             'qualname': target_qualname,
             'file_path': target.file_path,
             'operation': normalized_operation,
+            'insert_scope': normalized_insert_scope,
+            'expected_new_symbol_kind': expected_new_symbol_kind,
+            'parent_qualname': parent_qualname,
         },
         'project_context': project_context,
         'reference_context': reference_context,
@@ -388,6 +429,7 @@ def build_repair_request(
     verification_summary: dict[str, Any],
     config: AppConfig | None = None,
     requested_operation: str = 'replace_symbol',
+    insert_scope: str | None = None,
 ) -> dict[str, Any]:
     target = context_pack.target
     failure_summary = verification_summary.get('failure_summary', {}) if isinstance(verification_summary, dict) else {}
@@ -395,6 +437,25 @@ def build_repair_request(
     summary_text = 'Apply failed before verification' if stage == 'apply' else 'Verification failed after apply'
     error_type = 'apply_failed' if stage == 'apply' else 'verification_failed'
     normalized_operation = _validate_operation(requested_operation)
+
+    normalized_insert_scope = str(insert_scope or '').strip() or None
+    parent_qualname = ''
+    expected_new_symbol_kind = ''
+
+    if normalized_operation == 'insert_after_symbol':
+        if normalized_insert_scope == 'class_body':
+            if target.kind == 'method':
+                parent_qualname = str(target.parent_qualname or '')
+            elif target.kind == 'class':
+                parent_qualname = target.qualname
+            expected_new_symbol_kind = 'method'
+        elif normalized_insert_scope == 'module_body':
+            expected_new_symbol_kind = (
+                'class'
+                if 'dataclass' in (change_request.title + ' ' + change_request.description).casefold()
+                else 'function'
+            )
+
 
     related_tests_limit = max(
         0,
@@ -418,6 +479,16 @@ def build_repair_request(
     previous_artifact.setdefault('target_file', target.file_path)
     if normalized_operation == 'insert_after_symbol':
         previous_artifact['insert_after'] = previous_artifact.get('insert_after') or target_qualname
+    previous_artifact['insert_scope'] = previous_artifact.get('insert_scope') or normalized_insert_scope
+
+    if expected_new_symbol_kind:
+        previous_artifact['expected_new_symbol_kind'] = (
+            previous_artifact.get('expected_new_symbol_kind') or expected_new_symbol_kind
+        )
+    if parent_qualname:
+        previous_artifact['parent_qualname'] = (
+            previous_artifact.get('parent_qualname') or parent_qualname
+        )
 
     LOGGER.info(
         'Prepared repair request: target=%s requested_operation=%s stage=%s related_tests=%s reference_artifacts=%s previous_artifact_has_code=%s',
@@ -439,6 +510,14 @@ def build_repair_request(
             'constraints': list(change_request.constraints),
             'notes': list(change_request.notes),
         },
+        'target': {
+            'qualname': target_qualname,
+            'file_path': target.file_path,
+            'operation': normalized_operation,
+            'insert_scope': normalized_insert_scope,
+            'expected_new_symbol_kind': expected_new_symbol_kind,
+            'parent_qualname': parent_qualname,
+        },        
         'error_context': {
             'type': error_type,
             'summary': summary_text,
@@ -491,6 +570,9 @@ def build_repair_request(
         },
         'options': {
             'requested_operation': normalized_operation,
+            'insert_scope': normalized_insert_scope,
+            'expected_new_symbol_kind': expected_new_symbol_kind,
+            'parent_qualname': parent_qualname,
         },
     }
 
@@ -537,6 +619,10 @@ def patch_artifact_from_result(result_payload: dict[str, Any], fallback_target_q
         target_qualname=str(artifact.get('target_qualname') or fallback_target_qualname),
         replacement_code=str(code),
         operation=operation,
+        insert_scope=str(artifact.get('insert_scope') or '') or None,
+        expected_new_symbol_kind=str(artifact.get('expected_new_symbol_kind') or '') or None,
+        parent_qualname=str(artifact.get('parent_qualname') or '') or None,
+        import_changes=list(artifact.get('import_changes') or []),
     )
 
 _ALLOWED_OPERATIONS = {'replace_symbol', 'insert_after_symbol'}

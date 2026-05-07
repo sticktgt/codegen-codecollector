@@ -14,6 +14,11 @@ JSON-формат ответа:
     "confidence": 0.0,
     "reason": "короткое объяснение"
   },
+  "insert_scope": {
+    "value": "module_body | class_body | unknown",
+    "confidence": 0.0,
+    "reason": "короткое объяснение"
+  },
   "expected_new_symbols": [
     {"name": "имя", "kind": "function | class | method | unknown"}
   ],
@@ -32,10 +37,15 @@ JSON-формат ответа:
 
 Правила:
 - Если user_operation задана человеком, верни ее как operation.value, но можешь добавить предупреждение в reason/warnings.
+- Если user_insert_scope задан человеком, верни его как insert_scope.value, но можешь добавить предупреждение в reason/warnings.
 - Для replace_symbol ищем существующий symbol, который нужно заменить целиком.
-- Для insert_after_symbol ищем anchor-symbol, после которого нужно добавить новый class/function.
+- Для insert_after_symbol ищем anchor-symbol, после которого нужно добавить новый symbol.
+- Если пользователь просит добавить функцию/helper на уровне модуля, используй insert_scope=module_body и expected_new_symbols.kind=function.
+- Если пользователь явно просит добавить метод в класс, используй insert_scope=class_body и expected_new_symbols.kind=method.
+- Если непонятно, функция это или метод класса, используй insert_scope=unknown и manual_review_required=true.
 - search_queries должны быть короткими: 2-5 слов, максимум 4 запроса.
-- Не придумывай файлы и qualname, которых нет в project_map.
+- project_map может быть неполным: отсутствие symbol в нем не доказывает отсутствие в проекте.
+- Если пользователь явно назвал symbol, добавь его короткое имя в search_queries; preferred_files и preferred_qualnames заполняй только надежными значениями.
 
 Входные данные:
 $payload_json
