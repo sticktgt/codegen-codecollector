@@ -37,6 +37,21 @@ def _top_level_defs(tree: ast.AST | None) -> dict[str, str]:
             result[node.name] = "class"
     return result
 
+def _class_methods(tree: ast.AST | None, class_name: str) -> set[str]:
+    if tree is None or not class_name:
+        return set()
+    for node in getattr(tree, "body", []):
+        if isinstance(node, ast.ClassDef) and node.name == class_name:
+            return {
+                child.name
+                for child in node.body
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+    return set()
+
+def _class_name_from_qualname(value: str | None) -> str:
+    return str(value or '').strip().rsplit('.', 1)[-1]
+
 
 def _constraint_contains(change_request: ChangeRequest, needle: str) -> bool:
     needle_norm = needle.strip().lower()
@@ -254,6 +269,8 @@ def validate_patch_static_semantics(
     patched_file_text: str,
     changed_files: list[str],
     target_file: str,
+    insert_scope: str | None = None,
+    parent_qualname: str | None = None,
 ) -> VerificationBlock:
     issues: list[VerificationIssue] = []
 
@@ -302,26 +319,66 @@ def validate_patch_static_semantics(
             )
 
     if requested_operation == "insert_after_symbol":
-        if target_name not in after_defs:
-            issues.append(
-                VerificationIssue(
-                    code="anchor_symbol_missing_after_insert",
-                    message="После insert_after_symbol anchor symbol отсутствует в файле.",
-                    file_path=target_file,
-                    symbol=target_qualname,
+        if insert_scope == "class_body":
+            parent_name = _class_name_from_qualname(parent_qualname or target_qualname.rsplit('.', 1)[0])
+            before_methods = _class_methods(before_tree, parent_name)
+            after_methods = _class_methods(after_tree, parent_name)
+            new_methods = sorted(after_methods - before_methods)
+            anchor_name = target_name
+            if anchor_name and anchor_name not in after_methods and anchor_name in before_methods:
+                issues.append(
+                    VerificationIssue(
+                        code="method_anchor_missing_after_insert",
+                        message="После insert_after_symbol anchor method отсутствует в классе.",
+                        file_path=target_file,
+                        symbol=target_qualname,
+                    )
                 )
-            )
-        if not new_symbols:
-            issues.append(
-                VerificationIssue(
-                    code="no_new_top_level_symbol",
-                    message="После insert_after_symbol не найден новый top-level symbol.",
-                    file_path=target_file,
+            if not new_methods:
+                issues.append(
+                    VerificationIssue(
+                        code="generated_method_missing_after_insert",
+                        message="После insert_after_symbol не найден новый метод в целевом классе.",
+                        file_path=target_file,
+                        symbol=parent_qualname,
+                    )
                 )
-            )
+            top_level_new_functions = [name for name, kind in new_symbols.items() if kind == "function"]
+            if top_level_new_functions:
+                issues.append(
+                    VerificationIssue(
+                        code="generated_symbol_scope_mismatch",
+                        message=(
+                            "Ожидался метод внутри класса, но появился новый top-level function: "
+                            + ", ".join(top_level_new_functions)
+                        ),
+                        file_path=target_file,
+                        symbol=parent_qualname,
+                    )
+                )
+            new_symbols = {name: "method" for name in new_methods}
+        else:
+            if target_name not in after_defs:
+                issues.append(
+                    VerificationIssue(
+                        code="anchor_symbol_missing_after_insert",
+                        message="После insert_after_symbol anchor symbol отсутствует в файле.",
+                        file_path=target_file,
+                        symbol=target_qualname,
+                    )
+                )
+            if not new_symbols:
+                issues.append(
+                    VerificationIssue(
+                        code="no_new_top_level_symbol",
+                        message="После insert_after_symbol не найден новый top-level symbol.",
+                        file_path=target_file,
+                    )
+                )
 
     if _constraint_contains(change_request, "только одну новую функцию"):
-        new_functions = [name for name, kind in new_symbols.items() if kind == "function"]
+        expected_kind = "method" if insert_scope == "class_body" else "function"
+        new_functions = [name for name, kind in new_symbols.items() if kind == expected_kind]
         if len(new_functions) != 1:
             issues.append(
                 VerificationIssue(
@@ -375,6 +432,8 @@ def validate_patch_static_semantics(
             "requested_operation": requested_operation,
             "target_file": target_file,
             "target_qualname": target_qualname,
+            "insert_scope": insert_scope,
+            "parent_qualname": parent_qualname,
             "new_symbols": new_symbols,
         },
     )

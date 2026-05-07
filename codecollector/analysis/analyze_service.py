@@ -15,6 +15,7 @@ from codecollector.logger import get_logger
 
 LOGGER = get_logger(__name__)
 PATCH_OPERATIONS = {'replace_symbol', 'insert_after_symbol'}
+INSERT_SCOPES = {'module_body', 'class_body'}
 
 
 @dataclass(slots=True)
@@ -23,6 +24,7 @@ class AnalyzeSessionResult:
     project_id: str
     input_requirements: list[dict[str, Any]]
     requested_operation: str
+    insert_scope: str | None
     operation_source: str
     operation_confidence: float | None
     operation_reason: str | None
@@ -53,6 +55,7 @@ class AnalyzeService:
         project_id: str,
         input_requirements: list[dict[str, Any]],
         requested_operation: str | None = None,
+        insert_scope: str | None = None,
         limit: int | None = None,
         use_vector_search: bool | None = None,
     ) -> AnalyzeSessionResult:
@@ -78,12 +81,14 @@ class AnalyzeService:
             analysis_timings[name] = round(time.perf_counter() - started_at, 6)
 
         effective_operation = self._normalize_operation(requested_operation) or 'replace_symbol'
+        effective_insert_scope = self._normalize_insert_scope(insert_scope)
         if self.llm_assist is not None:
             search_plan_started_at = time.perf_counter()
             try:
                 search_plan = self.llm_assist.build_search_plan(
                     requirements=input_requirements,
                     user_operation=requested_operation,
+                    insert_scope=effective_insert_scope,
                     services=services,
                 )
                 record_timing('search_plan_total_sec', search_plan_started_at)
@@ -96,6 +101,8 @@ class AnalyzeService:
                     operation_source = 'llm_search_plan'
                 operation_confidence = self._safe_float((search_plan.get('operation') or {}).get('confidence')) or operation_confidence
                 operation_reason = str((search_plan.get('operation') or {}).get('reason') or operation_reason or '').strip() or None
+                if effective_insert_scope is None:
+                    effective_insert_scope = self._insert_scope_from_payload(search_plan)
                 request_quality = self._request_quality_from_plan(search_plan)
                 self._record_llm_usage(llm_usage_steps, 'search_plan', search_plan)
                 manual_review_required = bool(search_plan.get('manual_review_required'))
@@ -146,6 +153,7 @@ class AnalyzeService:
                     requirements=input_requirements,
                     user_operation=requested_operation,
                     effective_operation=effective_operation,
+                    insert_scope=effective_insert_scope,
                     search_plan=search_plan,
                     candidates=candidates,
                     services=services,
@@ -155,6 +163,8 @@ class AnalyzeService:
                 request_quality = self._resolved_request_quality(request_quality, target_recommendation)
                 warnings.extend(self._warnings_from_plan(target_recommendation))
                 self._record_llm_usage(llm_usage_steps, 'candidate_rerank', target_recommendation)
+                if effective_insert_scope is None:
+                    effective_insert_scope = self._insert_scope_from_payload(target_recommendation)
                 rerank_operation = self._normalize_operation(str(target_recommendation.get('recommended_operation') or ''))
                 if requested_operation:
                     effective_operation = self._normalize_operation(requested_operation) or effective_operation
@@ -188,6 +198,7 @@ class AnalyzeService:
             recommended_target, candidates, target_recommendation = self._post_process_recommended_target(
                 services=services,
                 requested_operation=effective_operation,
+                insert_scope=effective_insert_scope,
                 recommended_target=recommended_target,
                 candidates=candidates,
                 target_recommendation=target_recommendation,
@@ -198,6 +209,12 @@ class AnalyzeService:
             target_recommendation,
             candidates,
             recommended_target=recommended_target,
+        )
+        warnings = self._final_top_level_warnings(
+            warnings,
+            manual_review_required=manual_review_required,
+            recommended_target=recommended_target,
+            target_recommendation=target_recommendation,
         )
         recall_candidates_count = len(candidates)
         api_candidates_started_at = time.perf_counter()
@@ -224,6 +241,7 @@ class AnalyzeService:
                 'operation_source': operation_source,
                 'operation_confidence': operation_confidence,
                 'operation_reason': operation_reason,
+                'insert_scope': effective_insert_scope,
                 'request_quality': request_quality,
                 'search_plan': search_plan,
                 'target_recommendation': target_recommendation,
@@ -254,6 +272,7 @@ class AnalyzeService:
             project_id=project_id,
             input_requirements=input_requirements,
             requested_operation=effective_operation,
+            insert_scope=effective_insert_scope,
             operation_source=operation_source,
             operation_confidence=operation_confidence,
             operation_reason=operation_reason,
@@ -270,6 +289,7 @@ class AnalyzeService:
             result_summary=self._build_result_summary(
                 project_id=project_id,
                 requested_operation=effective_operation,
+                insert_scope=effective_insert_scope,
                 recommended_target=recommended_target,
                 candidates=api_candidates,
                 recall_candidates_count=recall_candidates_count,
@@ -480,6 +500,7 @@ class AnalyzeService:
         *,
         services: ProjectServices,
         requested_operation: str,
+        insert_scope: str | None,
         recommended_target: str,
         candidates: list[SearchCandidate],
         target_recommendation: dict[str, Any],
@@ -612,6 +633,12 @@ class AnalyzeService:
                 adjusted.append(candidate)
         return [promoted, *adjusted]
 
+    def _insert_scope_from_payload(self, payload: dict[str, Any]) -> str | None:
+        scope_payload = payload.get('insert_scope') if isinstance(payload, dict) else None
+        if isinstance(scope_payload, dict):
+            return self._normalize_insert_scope(str(scope_payload.get('value') or ''))
+        return self._normalize_insert_scope(str(scope_payload or ''))
+
     def _operation_from_search_plan(self, search_plan: dict[str, Any]) -> str | None:
         operation = search_plan.get('operation') or {}
         return self._normalize_operation(str(operation.get('value') or ''))
@@ -619,6 +646,10 @@ class AnalyzeService:
     def _normalize_operation(self, value: str | None) -> str | None:
         operation = str(value or '').strip()
         return operation if operation in PATCH_OPERATIONS else None
+
+    def _normalize_insert_scope(self, value: str | None) -> str | None:
+        scope = str(value or '').strip()
+        return scope if scope in INSERT_SCOPES else None
 
     def _request_quality_from_plan(self, search_plan: dict[str, Any]) -> dict[str, Any]:
         quality = search_plan.get('request_quality') or {}
@@ -629,6 +660,31 @@ class AnalyzeService:
     def _warnings_from_plan(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
         warnings = payload.get('warnings') or []
         return [item for item in warnings if isinstance(item, dict)]
+
+    def _final_top_level_warnings(
+        self,
+        warnings: list[dict[str, Any]],
+        *,
+        manual_review_required: bool,
+        recommended_target: str | None,
+        target_recommendation: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        if manual_review_required or not recommended_target or not target_recommendation:
+            return warnings
+        if bool(target_recommendation.get('manual_review_required')):
+            return warnings
+        confidence = self._safe_float(target_recommendation.get('target_confidence'))
+        if confidence < self.config.analysis_min_confidence_auto_recommend_target:
+            return warnings
+
+        # Search-plan warnings are diagnostic after rerank resolved the request with
+        # a confident target. Keep only real execution failures at the top level.
+        result: list[dict[str, Any]] = []
+        for warning in warnings:
+            code = str(warning.get('code') or '')
+            if code.startswith('analysis_llm_') and code.endswith('_failed'):
+                result.append(warning)
+        return result
 
     def _record_llm_usage(self, target: dict[str, dict[str, Any]], step: str, payload: dict[str, Any]) -> None:
         usage = payload.get('llm_usage') if isinstance(payload, dict) else None
@@ -719,6 +775,7 @@ class AnalyzeService:
         *,
         project_id: str,
         requested_operation: str,
+        insert_scope: str | None,
         recommended_target: str | None,
         candidates: list[SearchCandidate],
         recall_candidates_count: int,
@@ -734,6 +791,7 @@ class AnalyzeService:
             status='needs_user_decision' if manual_review_required else 'analyzed',
             project_id=project_id,
             requested_operation=requested_operation,
+            insert_scope=insert_scope,
             recommended_target=recommended_target,
             candidates_count=recall_candidates_count,
             recall_candidates_count=recall_candidates_count,

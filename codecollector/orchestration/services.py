@@ -179,6 +179,7 @@ class ProjectServices:
         limit: int | None = None,
         use_vector_search: bool | None = None,
         skip_search: bool = False,
+        insert_scope: str | None = None,
     ) -> PipelineRunResult:
         LOGGER.info('Running generate pipeline for %s with target %s', self.project_root, selected_target)
         return self.pipeline_service.run_generate(
@@ -188,6 +189,7 @@ class ProjectServices:
             limit=limit or self.config.search_default_limit,
             use_vector_search=use_vector_search,
             skip_search=skip_search,
+            insert_scope=insert_scope,
         )
 
 
@@ -198,6 +200,7 @@ class ProjectServices:
         previous_result_payload: dict[str, Any],
         verification_report: dict[str, Any],
         requested_operation: str = 'replace_symbol',
+        insert_scope: str | None = None,
     ) -> PipelineRunResult:
         LOGGER.info('Running repair pipeline for %s with target %s', self.project_root, selected_target)
         return self.pipeline_service.run_repair(
@@ -206,6 +209,7 @@ class ProjectServices:
             previous_result_payload=previous_result_payload,
             verification_report=verification_report,
             requested_operation=requested_operation,
+            insert_scope=insert_scope,
         )
     
     def reset_embedding_usage(self) -> None:

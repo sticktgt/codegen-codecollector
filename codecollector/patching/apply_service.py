@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import textwrap
 from pathlib import Path
 
 from codecollector.config import AppConfig, load_config
@@ -85,6 +86,7 @@ class ApplyService:
         LOGGER.info('Applying %s for %s in %s', artifact.operation, symbol.qualname, target_path)
         source = target_path.read_text(encoding='utf-8')
         lines = source.splitlines()
+
         payload_lines = self._normalize_payload_lines(artifact.replacement_code)
 
         if artifact.operation == 'replace_symbol':
@@ -92,14 +94,143 @@ class ApplyService:
             end = symbol.end_line
             lines[start:end] = payload_lines
         elif artifact.operation == 'insert_after_symbol':
+            if artifact.insert_scope == 'class_body':
+                payload_lines = self._normalize_class_body_method_lines(lines, symbol, payload_lines)
             insert_at = symbol.end_line
             lines[insert_at:insert_at] = self._with_spacing_before_insert(lines, insert_at, payload_lines)
         else:
             raise ValueError(f'Unsupported patch operation: {artifact.operation}')
 
         updated_source = '\n'.join(lines).rstrip('\n') + '\n'
+        if artifact.import_changes:
+            updated_source = self._apply_import_changes(updated_source, artifact.import_changes)
         ast.parse(updated_source)
         target_path.write_text(updated_source, encoding='utf-8')
+
+    def _apply_import_changes(self, source: str, import_changes: list[dict]) -> str:
+        if not import_changes:
+            return source
+        lines = source.splitlines()
+        existing = {line.strip() for line in lines}
+        new_imports: list[str] = []
+        for item in import_changes:
+            if not isinstance(item, dict):
+                continue
+            action = str(item.get('action') or '').strip()
+            module = str(item.get('module') or '').strip()
+            if not module:
+                continue
+            if action == 'add_import':
+                alias = str(item.get('alias') or '').strip()
+                line = f'import {module}' + (f' as {alias}' if alias else '')
+            elif action == 'add_from_import':
+                names = [str(name).strip() for name in (item.get('names') or []) if str(name).strip()]
+                if not names:
+                    continue
+                line = f'from {module} import {", ".join(names)}'
+            else:
+                continue
+            if line not in existing and line not in new_imports:
+                new_imports.append(line)
+        if not new_imports:
+            return source
+
+        insert_at = self._import_insert_index(source, lines)
+        lines[insert_at:insert_at] = new_imports
+        return '\n'.join(lines).rstrip('\n') + '\n'
+
+    def _import_insert_index(self, source: str, lines: list[str]) -> int:
+        def is_blank_or_comment(line: str) -> bool:
+            stripped = line.strip()
+            return not stripped or stripped.startswith('#')
+
+        insert_at = 0
+        try:
+            tree = ast.parse(source)
+            if (
+                tree.body
+                and isinstance(tree.body[0], ast.Expr)
+                and isinstance(getattr(tree.body[0], 'value', None), ast.Constant)
+                and isinstance(tree.body[0].value.value, str)
+            ):
+                insert_at = int(getattr(tree.body[0], 'end_lineno', 1) or 1)
+        except SyntaxError:
+            return 0
+
+        # Future imports must stay immediately after the module docstring and
+        # before all regular imports. Skip blank/comment lines only to discover
+        # a future-import block, then insert regular imports after that block.
+        probe = insert_at
+        while probe < len(lines) and is_blank_or_comment(lines[probe]):
+            probe += 1
+        while probe < len(lines) and lines[probe].startswith('from __future__ import '):
+            probe += 1
+            while probe < len(lines) and is_blank_or_comment(lines[probe]):
+                probe += 1
+        # Insert new regular imports before the existing regular import block.
+        # This preserves the required order: module docstring, future imports,
+        # then normal imports. It also keeps newly added stdlib imports from
+        # being placed before from __future__ imports.
+        return probe
+
+    def _normalize_method_snippet_indentation(self, raw_lines: list[str]) -> list[str]:
+        if not raw_lines:
+            return raw_lines
+
+        first_line = raw_lines[0].lstrip()
+        body_lines = raw_lines[1:]
+
+        non_empty_body_indents = [
+            len(line) - len(line.lstrip())
+            for line in body_lines
+            if line.strip()
+        ]
+
+        normalized = [first_line]
+        if not body_lines:
+            return normalized
+
+        min_body_indent = min(non_empty_body_indents) if non_empty_body_indents else 0
+
+        for line in body_lines:
+            if not line.strip():
+                normalized.append('')
+                continue
+
+            stripped_body = line[min_body_indent:] if min_body_indent > 0 else line.lstrip()
+            normalized.append('    ' + stripped_body)
+
+        return normalized
+
+    def _normalize_class_body_method_lines(self, lines: list[str], symbol: SymbolRecord, payload_lines: list[str]) -> list[str]:
+        if symbol.kind not in {'method', 'class'}:
+            raise ValueError('insert_scope=class_body requires class or method target anchor')
+        dedented = textwrap.dedent('\n'.join(payload_lines)).strip('\n')
+        if not dedented.strip():
+            raise ValueError('Generated method code is empty for class_body insert')
+        stripped = dedented.lstrip()
+        if not (stripped.startswith('def ') or stripped.startswith('async def ')):
+            raise ValueError('insert_scope=class_body expects generated code to start with def or async def')
+        method_indent = self._method_indent(lines, symbol)
+        normalized_lines = self._normalize_method_snippet_indentation(dedented.splitlines())
+        return [method_indent + line if line.strip() else '' for line in normalized_lines]
+
+    def _method_indent(self, lines: list[str], symbol: SymbolRecord) -> str:
+        if symbol.kind == 'method' and 0 <= symbol.start_line - 1 < len(lines):
+            line = lines[symbol.start_line - 1]
+            return line[: len(line) - len(line.lstrip())]
+        if symbol.kind == 'class':
+            class_indent = ''
+            if 0 <= symbol.start_line - 1 < len(lines):
+                line = lines[symbol.start_line - 1]
+                class_indent = line[: len(line) - len(line.lstrip())]
+            for idx in range(symbol.start_line, min(symbol.end_line, len(lines))):
+                line = lines[idx]
+                stripped = line.lstrip()
+                if stripped.startswith('def ') or stripped.startswith('async def '):
+                    return line[: len(line) - len(stripped)]
+            return class_indent + '    '
+        return '    '
 
     def _normalize_payload_lines(self, payload: str) -> list[str]:
         stripped = payload.rstrip('\n')
@@ -122,8 +253,14 @@ class ApplyService:
         qualnames: list[str] = []
 
         for node in tree.body:
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 qualnames.append(f'{module_name}.{node.name}')
+            elif isinstance(node, ast.ClassDef):
+                class_qualname = f'{module_name}.{node.name}'
+                qualnames.append(class_qualname)
+                for child in node.body:
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        qualnames.append(f'{class_qualname}.{child.name}')
 
         return qualnames    
 

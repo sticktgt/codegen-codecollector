@@ -159,6 +159,7 @@ class PipelineService:
         previous_result_payload: dict[str, Any],
         verification_report: VerificationReport,
         requested_operation: str = 'replace_symbol',
+        insert_scope: str | None = None,
     ) -> PipelineRunResult:
         self.project_services.reset_embedding_usage()
         run_id, run_label, run_dir = self.artifacts_manager.create_run_dir('pipeline')
@@ -219,6 +220,7 @@ class PipelineService:
                     previous_result_payload,
                     verification_report,
                     requested_operation=requested_operation,
+                    insert_scope=insert_scope,
                 ),
             )
             if not self._has_code_artifact(repair_result_payload):
@@ -355,6 +357,7 @@ class PipelineService:
         use_vector_search: bool | None = None,
         skip_search: bool = False,
         requested_operation: str = 'replace_symbol',
+        insert_scope: str | None = None,
     ) -> PipelineRunResult:
         self.project_services.reset_embedding_usage()
         run_id, run_label, run_dir = self.artifacts_manager.create_run_dir('pipeline')
@@ -438,6 +441,7 @@ class PipelineService:
                     selected_target,
                     context_pack,
                     requested_operation,
+                    insert_scope=insert_scope,
                 ),
             )
             if not self._has_code_artifact(external_code_result_payload):
@@ -508,6 +512,7 @@ class PipelineService:
                         final_payload,
                         repair_input_report,
                         requested_operation=requested_operation,
+                        insert_scope=insert_scope,
                     ),
                 )
                 if not self._has_code_artifact(repair_result_payload):
@@ -558,6 +563,8 @@ class PipelineService:
                     patched_file_text=patched_target_file_path.read_text(encoding='utf-8'),
                     changed_files=list(apply_result.impact.changed_files),
                     target_file=target_file,
+                    insert_scope=insert_scope,
+                    parent_qualname=self._parent_qualname_for_insert_scope(context_pack, insert_scope),
                 ),
             )
 
@@ -584,6 +591,7 @@ class PipelineService:
                             final_payload,
                             patch_failure_report,
                             requested_operation=requested_operation,
+                            insert_scope=insert_scope,
                         ),
                     )
                     if not self._has_code_artifact(repair_result_payload):
@@ -631,6 +639,8 @@ class PipelineService:
                             patched_file_text=patched_target_file_path.read_text(encoding='utf-8'),
                             changed_files=list(apply_result.impact.changed_files),
                             target_file=target_file,
+                            insert_scope=insert_scope,
+                            parent_qualname=self._parent_qualname_for_insert_scope(context_pack, insert_scope),
                         ),
                     )
 
@@ -687,6 +697,7 @@ class PipelineService:
                         context_pack,
                         final_payload,
                         requested_operation=requested_operation,
+                        insert_scope=insert_scope,
                     ),
                 )
 
@@ -850,6 +861,7 @@ class PipelineService:
                             final_payload,
                             verification_report,
                             requested_operation=requested_operation,
+                            insert_scope=insert_scope,
                         ),
                     )
                     if not self._has_code_artifact(repair_result_payload):
@@ -1288,6 +1300,17 @@ class PipelineService:
             execution_summary=execution_summary,
         )
 
+
+    def _parent_qualname_for_insert_scope(self, context_pack: ContextPack, insert_scope: str | None) -> str | None:
+        if insert_scope != 'class_body':
+            return None
+        target = context_pack.target
+        if target.kind == 'class':
+            return target.qualname
+        if target.kind == 'method':
+            return target.parent_qualname
+        return None
+
     def _external_generate_test(
         self,
         run_dir: Path,
@@ -1296,6 +1319,7 @@ class PipelineService:
         context_pack: ContextPack,
         final_payload: dict[str, Any],
         requested_operation: str = 'replace_symbol',
+        insert_scope: str | None = None,
     ) -> tuple[ExternalGenerationCall, dict[str, Any]]:
         request_payload = build_generation_request(
             self.project_services.project_root,
@@ -1306,6 +1330,7 @@ class PipelineService:
             generated_code_artifact=final_payload.get("code_artifact") or {},
             mode='generate_test',
             operation=requested_operation,
+            insert_scope=insert_scope,
         )
         request_payload['request_id'] = f'generate-test-{selected_target.split(".")[-1]}'
         request_payload['mode'] = 'generate_test'
@@ -1332,6 +1357,7 @@ class PipelineService:
         selected_target: str,
         context_pack: ContextPack,
         operation: str = 'replace_symbol',
+        insert_scope: str | None = None,
     ) -> tuple[ExternalGenerationCall, dict[str, Any]]:
         request_payload = build_generation_request(
             self.project_services.project_root,
@@ -1340,6 +1366,7 @@ class PipelineService:
             context_pack,
             self.project_services.config,
             operation=operation,
+            insert_scope=insert_scope,
         )
         request_payload.setdefault('options', {})['generate_test_mode'] = 'never'
         call_result = invoke_generate(run_dir, self.project_services.config, request_payload)
@@ -1363,6 +1390,7 @@ class PipelineService:
         previous_result_payload: dict[str, Any],
         verification_report: VerificationReport | dict[str, Any],
         requested_operation: str = 'replace_symbol',
+        insert_scope: str | None = None,
     ) -> tuple[ExternalGenerationCall, dict[str, Any]]:
         repair_context = self._normalize_repair_context(verification_report)
         LOGGER.info(
@@ -1382,6 +1410,7 @@ class PipelineService:
             repair_context.get('failure_summary', {}),
             self.project_services.config,
             requested_operation=requested_operation,
+            insert_scope=insert_scope,
         )
         call_result = invoke_repair(run_dir, self.project_services.config, request_payload)
         external_call = ExternalGenerationCall(
@@ -1452,6 +1481,9 @@ class PipelineService:
                 'qualname': target.get('qualname'),
                 'file_path': target.get('file_path'),
                 'operation': target.get('operation'),
+                'insert_scope': target.get('insert_scope'),
+                'expected_new_symbol_kind': target.get('expected_new_symbol_kind'),
+                'parent_qualname': target.get('parent_qualname'),
             },
             'project_context_summary': {
                 'module_outline_count': len(project_context.get('module_outline') or []),
@@ -1481,6 +1513,10 @@ class PipelineService:
                 'target_qualname': code_artifact.get('target_qualname'),
                 'target_file': code_artifact.get('target_file'),
                 'insert_after': code_artifact.get('insert_after'),
+                'insert_scope': code_artifact.get('insert_scope'),
+                'expected_new_symbol_kind': code_artifact.get('expected_new_symbol_kind'),
+                'parent_qualname': code_artifact.get('parent_qualname'),
+                'import_changes_count': len(code_artifact.get('import_changes') or []),
                 'code_chars': len(str(code_artifact.get('code') or '')),
             } if code_artifact else {},
             'has_test_artifact': bool(test_artifact.get('source_code')),
@@ -1624,6 +1660,13 @@ class PipelineService:
         else:
             status = 'incomplete'
 
+        request_summary = (external_code_generation.request_summary if external_code_generation else {}) or {}
+        request_target_summary = (request_summary.get('target') or {}) if isinstance(request_summary, dict) else {}
+        insert_scope = (
+            code_artifact_summary.get('insert_scope')
+            or request_target_summary.get('insert_scope')
+        )
+
         return PipelineExecutionSummary(
             status=status,
             selected_target=selected_target,
@@ -1646,6 +1689,7 @@ class PipelineService:
             test_generation_usage=(usage_summary or {}).get('test_generation'),
             repair_generation_usage=(usage_summary or {}).get('repair_generation'),
             embedding_usage=(usage_summary or {}).get('embedding'),
+            insert_scope=insert_scope,
         )
 
     def _collect_verification_test_targets(

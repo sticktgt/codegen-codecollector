@@ -33,18 +33,21 @@ class AnalysisLlmAssistService:
         *,
         requirements: list[dict[str, Any]],
         user_operation: str | None,
-        services: ProjectServices,
+        insert_scope: str | None = None,
+        services: ProjectServices = None,
     ) -> dict[str, Any]:
         project_map = self._project_map(services)
         LOGGER.info(
-            'analysis search plan context: project_files=%s project_symbols=%s user_operation=%s',
+            'analysis search plan context: project_files=%s project_symbols=%s user_operation=%s insert_scope=%s',
             len(project_map),
             sum(len(item.get('symbols') or []) for item in project_map),
             user_operation,
+            insert_scope,
         )
         payload = {
             'request': self._request_payload(requirements),
             'user_operation': user_operation,
+            'user_insert_scope': insert_scope,
             'operation_definitions': self._operation_definitions(),
             'project_map': project_map
         }
@@ -66,7 +69,8 @@ class AnalysisLlmAssistService:
         requirements: list[dict[str, Any]],
         user_operation: str | None,
         effective_operation: str,
-        search_plan: dict[str, Any] | None,
+        insert_scope: str | None = None,
+        search_plan: dict[str, Any] | None = None,
         candidates: list[SearchCandidate],
         services: ProjectServices,
     ) -> dict[str, Any]:
@@ -81,6 +85,7 @@ class AnalysisLlmAssistService:
             'request': self._request_payload(requirements),
             'user_operation': user_operation,
             'effective_operation': effective_operation,
+            'effective_insert_scope': insert_scope,
             'search_plan': self._compact_search_plan(search_plan or {}),
             'operation_definitions': self._operation_definitions(),
             'candidate_cards': candidate_cards
@@ -115,6 +120,7 @@ class AnalysisLlmAssistService:
     def _build_limited_rerank_prompt(self, payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         mutable_payload = deepcopy(payload)
         limit = self.config.analysis_llm_rerank_max_prompt_chars or self.config.analysis_llm_max_prompt_chars
+        soft_limit = int(limit * 1.03)
         trim_steps: list[str] = []
         while True:
             user_prompt = self._render(self.rerank_template, {'payload_json': self._json(mutable_payload)})
@@ -122,9 +128,24 @@ class AnalysisLlmAssistService:
             if prompt_chars <= limit:
                 self._log_prompt_budget('analyze_candidate_rerank', prompt_chars, limit, trim_steps)
                 return user_prompt, {'max_prompt_chars': limit, 'prompt_chars': prompt_chars, 'trim_steps': trim_steps}
-            if not self._shrink_candidate_cards(mutable_payload, trim_steps):
-                self._log_prompt_budget('analyze_candidate_rerank_too_large', prompt_chars, limit, trim_steps)
-                raise ValueError(f'analyze candidate rerank prompt is too large after trimming: {prompt_chars} chars > {limit} chars')
+
+            if self._shrink_candidate_cards(mutable_payload, trim_steps):
+                continue
+
+            if prompt_chars <= soft_limit:
+                trim_steps.append(f'soft_overflow_allowed:{prompt_chars}>{limit}')
+                self._log_prompt_budget('analyze_candidate_rerank_soft_overflow', prompt_chars, soft_limit, trim_steps)
+                return user_prompt, {
+                    'max_prompt_chars': soft_limit,
+                    'prompt_chars': prompt_chars,
+                    'trim_steps': trim_steps,
+                }
+
+            self._log_prompt_budget('analyze_candidate_rerank_too_large', prompt_chars, soft_limit, trim_steps)
+            raise ValueError(
+                f'analyze candidate rerank prompt is too large after trimming: '
+                f'{prompt_chars} chars > {soft_limit} chars'
+            )
 
     def _shrink_project_map(self, payload: dict[str, Any], trim_steps: list[str]) -> bool:
         project_map = payload.get('project_map') or []
@@ -252,20 +273,13 @@ class AnalysisLlmAssistService:
         id_to_candidate = {f'c{index}': candidate for index, candidate in enumerate(candidates[: self.config.analysis_max_candidate_cards], start=1)}
         ranked: list[SearchCandidate] = []
         used_qualnames: set[str] = set()
-        recommended_target = str(recommendation.get('recommended_target') or '').strip()
-        recommended_confidence = self._safe_float(recommendation.get('target_confidence'))
-        recommendation_is_usable = (
-            bool(recommended_target)
-            and not bool(recommendation.get('manual_review_required'))
-            and recommended_confidence >= self.config.analysis_min_confidence_auto_recommend_target
-        )
         for rank, item in enumerate(ranked_items, start=1):
             candidate_id = str(item.get('candidate_id') or '').strip()
             candidate = id_to_candidate.get(candidate_id)
             if candidate is None or candidate.qualname in used_qualnames:
                 continue
             reason = str(item.get('reason') or '').strip()
-            recommended = recommendation_is_usable and candidate.qualname == recommended_target
+            recommended = candidate.qualname == str(recommendation.get('recommended_target') or '').strip() or rank == 1
             reasons = list(candidate.reasons)
             if recommended:
                 target_reason = str(recommendation.get('target_reason') or reason or '').strip()
@@ -279,7 +293,7 @@ class AnalysisLlmAssistService:
                     llm_recommended=recommended,
                     llm_rank=rank,
                     llm_reason=reason or str(recommendation.get('target_reason') or '').strip(),
-                    confidence=max(candidate.confidence, min(1.0, recommended_confidence) if recommended else candidate.confidence),
+                    confidence=max(candidate.confidence, min(1.0, self._safe_float(recommendation.get('target_confidence')) if recommended else candidate.confidence)),
                     relevance_category='высокая' if recommended else candidate.relevance_category,
                     reasons=self._dedupe(reasons)[:8],
                 )
@@ -318,11 +332,7 @@ class AnalysisLlmAssistService:
     ) -> list[SearchCandidate]:
         target = str(recommendation.get('recommended_target') or '').strip()
         confidence = self._safe_float(recommendation.get('target_confidence'))
-        if (
-            not target
-            or bool(recommendation.get('manual_review_required'))
-            or confidence < self.config.analysis_min_confidence_auto_recommend_target
-        ):
+        if not target or confidence < self.config.analysis_min_confidence_auto_recommend_target:
             return candidates
         result: list[SearchCandidate] = []
         moved: SearchCandidate | None = None
@@ -413,11 +423,13 @@ class AnalysisLlmAssistService:
             'name': candidate.name,
             'kind': candidate.kind,
             'file_path': candidate.file_path,
+            'parent_qualname': getattr(context.target, 'parent_qualname', None),
             'module_docstring': self._truncate(module_symbol.docstring if module_symbol else '', self.config.analysis_candidate_module_doc_chars),
             'docstring': candidate.docstring,
             'knowledge_title': candidate.knowledge_title,
             'requirements': candidate.requirements,
             'source_excerpt': self._truncate(target.source_code, self.config.analysis_candidate_source_chars),
+            'class_members': self._class_members(target, file_symbols),
             'siblings': [
                 {
                     'qualname': symbol.qualname,
@@ -442,6 +454,30 @@ class AnalysisLlmAssistService:
             'search_reasons': candidate.reasons[: self.config.analysis_candidate_search_reasons],
         }
 
+    def _class_members(self, target: SymbolRecord, file_symbols: list[SymbolRecord]) -> list[dict[str, Any]]:
+        if target.kind == 'class':
+            parent_qualname = target.qualname
+        else:
+            parent_qualname = target.parent_qualname
+        if not parent_qualname:
+            return []
+        members = [
+            symbol
+            for symbol in file_symbols
+            if symbol.parent_qualname == parent_qualname and symbol.kind == 'method'
+        ]
+        members.sort(key=lambda item: (item.start_line, item.qualname))
+        return [
+            {
+                'qualname': symbol.qualname,
+                'name': symbol.name,
+                'kind': symbol.kind,
+                'signature': self._signature(symbol),
+                'docstring': self._truncate(symbol.docstring, self.config.analysis_candidate_sibling_doc_chars),
+            }
+            for symbol in members[: self.config.analysis_candidate_siblings]
+        ]
+
     def _compact_search_plan(self, search_plan: dict[str, Any]) -> dict[str, Any]:
         plan = search_plan.get('search_plan') or {}
         operation = search_plan.get('operation') or {}
@@ -455,6 +491,7 @@ class AnalysisLlmAssistService:
                 'value': operation.get('value'),
                 'confidence': operation.get('confidence'),
             },
+            'insert_scope': search_plan.get('insert_scope') or {},
             'expected_new_symbols': search_plan.get('expected_new_symbols') or [],
             'search_plan': {
                 'search_queries': (plan.get('search_queries') or [])[: self.config.analysis_max_search_plan_queries],

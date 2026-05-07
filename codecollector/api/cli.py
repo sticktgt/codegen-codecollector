@@ -72,6 +72,7 @@ def build_parser() -> argparse.ArgumentParser:
     session_analyze.add_argument('--note', action='append', default=[])
     session_analyze.add_argument('--limit', type=int)
     session_analyze.add_argument('--operation', choices=PATCH_OPERATIONS, default=None)
+    session_analyze.add_argument('--insert-scope', choices=INSERT_SCOPES, default=None)
 
     sessions_sub.add_parser('list')
 

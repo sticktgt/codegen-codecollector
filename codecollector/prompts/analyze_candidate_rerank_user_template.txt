@@ -7,9 +7,16 @@ JSON-формат ответа:
   "recommended_operation": "replace_symbol | insert_after_symbol | unknown",
   "operation_confidence": 0.0,
   "operation_reason": "короткое объяснение",
+  "insert_scope": {
+    "value": "module_body | class_body | unknown",
+    "confidence": 0.0,
+    "reason": "короткое объяснение"
+  },
+  "expected_new_symbol_kind": "function | class | method | unknown",
+  "parent_qualname": "qualname or null",
   "recommended_candidate_id": "candidate id or null",
   "recommended_target": "qualname or null",
-  "target_role": "target | anchor | unknown",
+  "target_role": "target | anchor | method_anchor | parent_class | unknown",
   "target_confidence": 0.0,
   "target_reason": "короткое объяснение",
   "manual_review_required": false,
@@ -23,8 +30,13 @@ JSON-формат ответа:
 Правила выбора:
 - Для replace_symbol выбирай symbol, который непосредственно реализует изменяемое поведение.
 - Не выбирай wrapper/controller/use-case метод, если есть более конкретный callee с нужной логикой.
-- Для insert_after_symbol выбирай anchor-symbol: место, рядом с которым логично добавить новый class/function.
-- Для insert_after_symbol target_role должен быть "anchor".
+- Для insert_after_symbol выбирай anchor-symbol: место, рядом с которым логично добавить новый symbol.
+- Для insert_after_symbol + insert_scope=module_body target_role должен быть "anchor".
+- Для insert_after_symbol + insert_scope=class_body target_role должен быть "method_anchor" или "parent_class".
+- Если пользователь явно просит добавить метод в класс, используй insert_scope=class_body, expected_new_symbol_kind=method и заполни parent_qualname.
+- Если пользователь просит добавить top-level helper/function/class, используй insert_scope=module_body.
+- Для insert_after_symbol + module_body выбирай разумный top-level anchor (function/class) в подходящем файле; не возвращай null, если такой candidate есть.
+- Не выбирай method как финальный module_body anchor; если близкий candidate — method, предпочти top-level anchor в том же файле.
 - Если правильного target/anchor нет среди candidate_cards, верни recommended_target=null и manual_review_required=true.
 - Если данных недостаточно, честно верни manual_review_required=true.
 - Если user_operation задана и кажется неверной, не меняй ее молча; укажи warning.
