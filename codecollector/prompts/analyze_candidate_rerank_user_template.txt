@@ -34,6 +34,7 @@ JSON-формат ответа:
 - Для insert_after_symbol + insert_scope=module_body target_role должен быть "anchor".
 - Для insert_after_symbol + insert_scope=class_body target_role должен быть "method_anchor" или "parent_class".
 - Если пользователь явно просит добавить метод в класс, используй insert_scope=class_body, expected_new_symbol_kind=method и заполни parent_qualname.
+- Если пользователь использует слово "функция" в смысле новой возможности/обработчика, но candidate_cards показывают, что похожий API/handler слой реализован методами класса/controller, выбирай insert_scope=class_body и expected_new_symbol_kind=method.
 - Если пользователь просит добавить top-level helper/function/class, используй insert_scope=module_body.
 - Для insert_after_symbol + module_body выбирай разумный top-level anchor (function/class) в подходящем файле; не возвращай null, если такой candidate есть.
 - Не выбирай method как финальный module_body anchor; если близкий candidate — method, предпочти top-level anchor в том же файле.

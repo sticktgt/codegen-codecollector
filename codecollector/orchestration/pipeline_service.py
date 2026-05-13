@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from time import perf_counter
@@ -452,6 +453,8 @@ class PipelineService:
 
             ensure_expected_operation(external_code_result_payload, requested_operation)
 
+            required_contracts = self._required_contracts_from_generation_request(run_dir)
+
             final_payload = external_code_result_payload
             generated_tests: list[dict[str, str]] = []
 
@@ -565,6 +568,9 @@ class PipelineService:
                     target_file=target_file,
                     insert_scope=insert_scope,
                     parent_qualname=self._parent_qualname_for_insert_scope(context_pack, insert_scope),
+                    related_symbols=list(context_pack.related_symbols or []),
+                    import_changes=list((final_payload.get('code_artifact') or {}).get('import_changes') or []),
+                    required_contracts=required_contracts,
                 ),
             )
 
@@ -641,6 +647,8 @@ class PipelineService:
                             target_file=target_file,
                             insert_scope=insert_scope,
                             parent_qualname=self._parent_qualname_for_insert_scope(context_pack, insert_scope),
+                            related_symbols=list(context_pack.related_symbols or []),
+                            import_changes=list((final_payload.get('code_artifact') or {}).get('import_changes') or []),
                         ),
                     )
 
@@ -1137,17 +1145,29 @@ class PipelineService:
 
         for line in output.splitlines():
             stripped = line.strip()
-            if not stripped.startswith('FAILED '):
+            if not stripped:
                 continue
 
-            parts = stripped.split()
-            if len(parts) < 2:
-                continue
+            normalized = stripped.replace('\\', '/').lower()
 
-            test_ref = parts[1].strip().replace('\\', '/').lower()
-            path = test_ref.split('::', 1)[0].strip()
-            if path.endswith('.py'):
-                failed_paths.add(path)
+            if normalized.startswith(('failed ', 'error ')):
+                parts = normalized.split()
+                if len(parts) >= 2:
+                    test_ref = parts[1].strip()
+                    path = test_ref.split('::', 1)[0].strip()
+                    if path.endswith('.py'):
+                        failed_paths.add(path)
+                        continue
+
+            # Pytest setup errors often include a separate source line such as:
+            #   file /workspace/tests/test_generated.py, line 10
+            if normalized.startswith('file ') and '.py' in normalized:
+                candidate = normalized[len('file '):].split(',', 1)[0].strip()
+                marker = '/tests/'
+                if marker in candidate:
+                    candidate = 'tests/' + candidate.split(marker, 1)[1]
+                if candidate.endswith('.py'):
+                    failed_paths.add(candidate)
 
         return failed_paths
 
@@ -1402,6 +1422,7 @@ class PipelineService:
                 for item in (repair_context.get('failure_summary', {}).get('failed_blocks') or [])
             ],
         )
+        previous_generation_request = self._read_generation_request_payload(run_dir)
         request_payload = build_repair_request(
             change_request,
             selected_target,
@@ -1411,6 +1432,7 @@ class PipelineService:
             self.project_services.config,
             requested_operation=requested_operation,
             insert_scope=insert_scope,
+            previous_generation_request=previous_generation_request,
         )
         call_result = invoke_repair(run_dir, self.project_services.config, request_payload)
         external_call = ExternalGenerationCall(
@@ -1423,6 +1445,38 @@ class PipelineService:
             result_summary=self._summarize_external_result(call_result.result_payload),
         )
         return external_call, call_result.result_payload
+
+    def _read_generation_request_payload(self, run_dir: Path) -> dict[str, Any] | None:
+        request_format = str(self.project_services.config.codegenerator_request_format or 'json').lower()
+        request_path = run_dir / f'generation_request.{request_format}'
+        if not request_path.exists():
+            LOGGER.info('previous generation request is not available for repair: path=%s', request_path)
+            return None
+        if request_format != 'json':
+            LOGGER.info('previous generation request format is not supported for repair context reuse: format=%s path=%s', request_format, request_path)
+            return None
+        try:
+            payload = json.loads(request_path.read_text(encoding='utf-8'))
+        except (OSError, json.JSONDecodeError) as exc:
+            LOGGER.warning('failed to read previous generation request for repair: path=%s error=%s', request_path, exc)
+            return None
+        if not isinstance(payload, dict):
+            LOGGER.warning('previous generation request payload is not an object: path=%s', request_path)
+            return None
+        return payload
+
+    def _required_contracts_from_generation_request(self, run_dir: Path) -> list[dict[str, Any]]:
+        payload = self._read_generation_request_payload(run_dir)
+        if not isinstance(payload, dict):
+            return []
+        project_context = payload.get('project_context')
+        if not isinstance(project_context, dict):
+            return []
+        return [
+            dict(item)
+            for item in (project_context.get('required_contracts') or [])
+            if isinstance(item, dict)
+        ]
 
     def _extract_generated_tests(self, result_payload: dict[str, Any]) -> list[dict[str, str]]:
         test_artifact = result_payload.get('test_artifact') or {}

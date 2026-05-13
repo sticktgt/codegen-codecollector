@@ -45,9 +45,17 @@ codegenerator:
   request_format: json
   include_full_file_for_non_symbol_targets: true
   include_full_file_for_generate_test: true
+  include_full_file_for_repair: true
+  repair_full_file_chars: 6000
   generate_related_tests_max_items: 1
   generate_test_related_tests_max_items: 1
   repair_related_tests_max_items: 1
+  generate_related_symbols_max_items: 4
+  generate_related_symbol_chars: 700
+  generate_test_related_symbols_max_items: 4
+  generate_test_related_symbol_chars: 700
+  repair_related_symbols_max_items: 4
+  repair_related_symbol_chars: 700
   generate_reference_max_items: 1
   generate_test_reference_max_items: 1
   repair_reference_max_items: 1
@@ -68,11 +76,30 @@ analysis:
     think: false
     temperature: 0.0
     num_ctx: 16384
-    num_predict: 700
+    num_predict: 1200
     keep_alive: 0
     max_prompt_chars: 12000
     search_plan_max_prompt_chars: 8000
     rerank_max_prompt_chars: 15000
+    rerank_soft_overflow_ratio: 1.02
+    rerank_json_indent: 0
+    rerank_drop_operation_definitions_on_overflow: true
+    rerank_candidate_drop_fields:
+      - module_docstring
+      - knowledge_title
+      - requirements
+    rerank_candidate_keep_fields:
+      - candidate_id
+      - qualname
+      - name
+      - kind
+      - file_path
+      - parent_qualname
+      - docstring
+      - class_members
+      - search_score
+      - search_confidence
+    rerank_emergency_min_candidate_cards: 4
     min_confidence_auto_operation: 0.65
     min_confidence_auto_recommend_target: 0.65
   prompts:
@@ -91,18 +118,36 @@ analysis:
     max_search_plan_queries: 3
     max_recall_candidates: 12
   candidate_context:
-    max_candidate_cards: 7
-    min_candidate_cards: 5
-    candidate_source_chars: 260
-    candidate_source_min_chars: 120
-    related_test_chars: 180
-    related_test_min_chars: 80
-    related_tests: 1
-    siblings: 3
-    min_siblings: 1
-    sibling_doc_chars: 70
-    module_doc_chars: 100
+    max_candidate_cards: 6
+    min_candidate_cards: 4
+    candidate_source_chars: 180
+    candidate_source_min_chars: 80
+    related_test_chars: 120
+    related_test_min_chars: 40
+    related_tests: 0
+    siblings: 2
+    min_siblings: 0
+    sibling_doc_chars: 50
+    module_doc_chars: 60
     relation_limit: 1
-    search_reasons: 3
+    search_reasons: 2
   result:
     max_candidates: 5
+
+onboarding:
+  knowledge:
+    architecture_doc_names:
+      - ARCHITECT.md
+      - ARCHITECTURE.md
+    architecture_enrichment_system_template: codecollector/prompts/knowledge_architect_enrichment_system_template.txt
+    architecture_enrichment_template: codecollector/prompts/knowledge_architect_enrichment_user_template.txt
+    architecture_enrichment_max_prompt_chars: 32000
+    architecture_enrichment_soft_overflow_ratio: 1.10
+    architecture_doc_max_chars: 18000
+    architecture_doc_min_chars: 5000
+    architecture_doc_min_ratio: 0.30
+    architecture_enrichment_max_modules: 200
+    architecture_enrichment_max_symbols: 500
+    architecture_enrichment_docstring_chars: 160
+    architecture_enrichment_json_indent: 0
+    architecture_enrichment_num_predict: 4096

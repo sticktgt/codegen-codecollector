@@ -48,9 +48,17 @@ class AppConfig:
     codegenerator_request_format: str
     codegenerator_include_full_file_for_non_symbol_targets: bool
     codegenerator_include_full_file_for_generate_test: bool
+    codegenerator_include_full_file_for_repair: bool
+    codegenerator_repair_full_file_chars: int
     codegenerator_generate_related_tests_max_items: int
     codegenerator_generate_test_related_tests_max_items: int
     codegenerator_repair_related_tests_max_items: int
+    codegenerator_generate_related_symbols_max_items: int
+    codegenerator_generate_related_symbol_chars: int
+    codegenerator_generate_test_related_symbols_max_items: int
+    codegenerator_generate_test_related_symbol_chars: int
+    codegenerator_repair_related_symbols_max_items: int
+    codegenerator_repair_related_symbol_chars: int
     codegenerator_generate_reference_max_items: int
     codegenerator_generate_test_reference_max_items: int
     codegenerator_repair_reference_max_items: int
@@ -73,6 +81,12 @@ class AppConfig:
     analysis_llm_max_prompt_chars: int
     analysis_llm_search_plan_max_prompt_chars: int
     analysis_llm_rerank_max_prompt_chars: int
+    analysis_llm_rerank_soft_overflow_ratio: float
+    analysis_llm_rerank_json_indent: int
+    analysis_llm_rerank_drop_operation_definitions_on_overflow: bool
+    analysis_llm_rerank_candidate_drop_fields: list[str]
+    analysis_llm_rerank_candidate_keep_fields: list[str]
+    analysis_llm_rerank_emergency_min_candidate_cards: int
     analysis_prompt_dir: str
     analysis_system_template: str
     analysis_search_plan_template: str
@@ -102,6 +116,19 @@ class AppConfig:
     analysis_max_return_candidates: int
     analysis_min_confidence_auto_operation: float
     analysis_min_confidence_auto_recommend_target: float
+    onboarding_architecture_doc_names: list[str]
+    onboarding_architecture_enrichment_system_template: str
+    onboarding_architecture_enrichment_template: str
+    onboarding_architecture_enrichment_max_prompt_chars: int
+    onboarding_architecture_enrichment_soft_overflow_ratio: float
+    onboarding_architecture_doc_max_chars: int
+    onboarding_architecture_doc_min_chars: int
+    onboarding_architecture_doc_min_ratio: float
+    onboarding_architecture_enrichment_max_modules: int
+    onboarding_architecture_enrichment_max_symbols: int
+    onboarding_architecture_enrichment_docstring_chars: int
+    onboarding_architecture_enrichment_json_indent: int
+    onboarding_architecture_enrichment_num_predict: int
 
     @property
     def ui_default_demo_project_path(self) -> Path:
@@ -179,6 +206,18 @@ def _inject_dynamic_env_vars(config: dict[str, Any], prefix: str = 'RS__') -> di
     return config
 
 
+
+
+def _string_list_config(value: Any, default: list[str]) -> list[str]:
+    if isinstance(value, str):
+        items = [value]
+    elif isinstance(value, list):
+        items = value
+    else:
+        items = default
+    result = [str(item).strip() for item in items if str(item).strip()]
+    return result or list(default)
+
 def _merge_config(path: Path) -> dict[str, Any]:
     payload = _load_yaml_config(path)
     payload = _apply_env_overrides(payload, 'RS')
@@ -196,6 +235,8 @@ def load_config(config_path: Path | None = None) -> AppConfig:
     recall = analysis.get('recall', {}) if isinstance(analysis.get('recall', {}), dict) else {}
     candidate_context = analysis.get('candidate_context', {}) if isinstance(analysis.get('candidate_context', {}), dict) else {}
     analysis_result = analysis.get('result', {}) if isinstance(analysis.get('result', {}), dict) else {}
+    onboarding = payload.get('onboarding', {}) if isinstance(payload.get('onboarding', {}), dict) else {}
+    onboarding_knowledge = onboarding.get('knowledge', {}) if isinstance(onboarding.get('knowledge', {}), dict) else {}
     return AppConfig(
         root_path=resolved_path.parent,
         app_name=payload.get('app', {}).get('name', 'codecollector'),
@@ -230,9 +271,17 @@ def load_config(config_path: Path | None = None) -> AppConfig:
         codegenerator_request_format=str(codegen.get('request_format', 'json')),
         codegenerator_include_full_file_for_non_symbol_targets=bool(codegen.get('include_full_file_for_non_symbol_targets', True)),
         codegenerator_include_full_file_for_generate_test=bool(codegen.get('include_full_file_for_generate_test', True)),
+        codegenerator_include_full_file_for_repair=bool(codegen.get('include_full_file_for_repair', True)),
+        codegenerator_repair_full_file_chars=int(codegen.get('repair_full_file_chars', 6000)),
         codegenerator_generate_related_tests_max_items=int(codegen.get('generate_related_tests_max_items', 1)),
         codegenerator_generate_test_related_tests_max_items=int(codegen.get('generate_test_related_tests_max_items', 1)),
         codegenerator_repair_related_tests_max_items=int(codegen.get('repair_related_tests_max_items', 1)),
+        codegenerator_generate_related_symbols_max_items=int(codegen.get('generate_related_symbols_max_items', 4)),
+        codegenerator_generate_related_symbol_chars=int(codegen.get('generate_related_symbol_chars', 700)),
+        codegenerator_generate_test_related_symbols_max_items=int(codegen.get('generate_test_related_symbols_max_items', 4)),
+        codegenerator_generate_test_related_symbol_chars=int(codegen.get('generate_test_related_symbol_chars', 700)),
+        codegenerator_repair_related_symbols_max_items=int(codegen.get('repair_related_symbols_max_items', 3)),
+        codegenerator_repair_related_symbol_chars=int(codegen.get('repair_related_symbol_chars', 500)),
         codegenerator_generate_reference_max_items=int(codegen.get('generate_reference_max_items', 1)),
         codegenerator_generate_test_reference_max_items=int(codegen.get('generate_test_reference_max_items', 1)),
         codegenerator_repair_reference_max_items=int(codegen.get('repair_reference_max_items', 1)),
@@ -255,6 +304,12 @@ def load_config(config_path: Path | None = None) -> AppConfig:
         analysis_llm_max_prompt_chars=int(llm_assist.get('max_prompt_chars', 12000)),
         analysis_llm_search_plan_max_prompt_chars=int(llm_assist.get('search_plan_max_prompt_chars', llm_assist.get('max_prompt_chars', 8000))),
         analysis_llm_rerank_max_prompt_chars=int(llm_assist.get('rerank_max_prompt_chars', llm_assist.get('max_prompt_chars', 12000))),
+        analysis_llm_rerank_soft_overflow_ratio=float(llm_assist.get('rerank_soft_overflow_ratio', 1.03)),
+        analysis_llm_rerank_json_indent=int(llm_assist.get('rerank_json_indent', 2)),
+        analysis_llm_rerank_drop_operation_definitions_on_overflow=bool(llm_assist.get('rerank_drop_operation_definitions_on_overflow', False)),
+        analysis_llm_rerank_candidate_drop_fields=list(llm_assist.get('rerank_candidate_drop_fields', [])),
+        analysis_llm_rerank_candidate_keep_fields=list(llm_assist.get('rerank_candidate_keep_fields', [])),
+        analysis_llm_rerank_emergency_min_candidate_cards=int(llm_assist.get('rerank_emergency_min_candidate_cards', candidate_context.get('min_candidate_cards', 5))),
         analysis_prompt_dir=str(prompts.get('dir', 'codecollector/prompts')),
         analysis_system_template=str(prompts.get('system_template', 'codecollector/prompts/analyze_system_template.txt')),
         analysis_search_plan_template=str(prompts.get('search_plan_template', 'codecollector/prompts/analyze_search_plan_user_template.txt')),
@@ -284,4 +339,17 @@ def load_config(config_path: Path | None = None) -> AppConfig:
         analysis_max_return_candidates=int(analysis_result.get('max_candidates', 5)),
         analysis_min_confidence_auto_operation=float(llm_assist.get('min_confidence_auto_operation', 0.65)),
         analysis_min_confidence_auto_recommend_target=float(llm_assist.get('min_confidence_auto_recommend_target', 0.65)),
+        onboarding_architecture_doc_names=_string_list_config(onboarding_knowledge.get('architecture_doc_names'), ['ARCHITECT.md', 'ARCHITECTURE.md']),
+        onboarding_architecture_enrichment_system_template=str(onboarding_knowledge.get('architecture_enrichment_system_template', 'codecollector/prompts/knowledge_architect_enrichment_system_template.txt')),
+        onboarding_architecture_enrichment_template=str(onboarding_knowledge.get('architecture_enrichment_template', 'codecollector/prompts/knowledge_architect_enrichment_user_template.txt')),
+        onboarding_architecture_enrichment_max_prompt_chars=int(onboarding_knowledge.get('architecture_enrichment_max_prompt_chars', llm_assist.get('max_prompt_chars', 32000))),
+        onboarding_architecture_enrichment_soft_overflow_ratio=float(onboarding_knowledge.get('architecture_enrichment_soft_overflow_ratio', 1.10)),
+        onboarding_architecture_doc_max_chars=int(onboarding_knowledge.get('architecture_doc_max_chars', 18000)),
+        onboarding_architecture_doc_min_chars=int(onboarding_knowledge.get('architecture_doc_min_chars', 5000)),
+        onboarding_architecture_doc_min_ratio=float(onboarding_knowledge.get('architecture_doc_min_ratio', 0.30)),
+        onboarding_architecture_enrichment_max_modules=int(onboarding_knowledge.get('architecture_enrichment_max_modules', 200)),
+        onboarding_architecture_enrichment_max_symbols=int(onboarding_knowledge.get('architecture_enrichment_max_symbols', 500)),
+        onboarding_architecture_enrichment_docstring_chars=int(onboarding_knowledge.get('architecture_enrichment_docstring_chars', 160)),
+        onboarding_architecture_enrichment_json_indent=int(onboarding_knowledge.get('architecture_enrichment_json_indent', 0)),
+        onboarding_architecture_enrichment_num_predict=int(onboarding_knowledge.get('architecture_enrichment_num_predict', 4096)),
     )

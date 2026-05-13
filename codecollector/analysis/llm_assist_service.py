@@ -16,6 +16,7 @@ from codecollector.orchestration.services import ProjectServices
 
 LOGGER = get_logger(__name__)
 _JSON_OBJECT_RE = re.compile(r'\{.*\}', re.DOTALL)
+_JSON_FENCE_RE = re.compile(r'^```(?:json)?\s*|\s*```$', re.IGNORECASE)
 
 
 class AnalysisLlmAssistService:
@@ -97,7 +98,10 @@ class AnalysisLlmAssistService:
             user_prompt=user_prompt,
             max_prompt_chars=int(prompt_budget.get('max_prompt_chars') or self.config.analysis_llm_rerank_max_prompt_chars),
         )
-        parsed = self._parse_json_object(call.content)
+        try:
+            parsed = self._parse_json_object(call.content)
+        except json.JSONDecodeError as exc:
+            parsed = self._fallback_parse_rerank_response(call.content, candidate_cards, exc)
         parsed.setdefault('llm_usage', call.usage_dict())
         parsed.setdefault('prompt_budget', prompt_budget)
         return parsed
@@ -120,16 +124,22 @@ class AnalysisLlmAssistService:
     def _build_limited_rerank_prompt(self, payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         mutable_payload = deepcopy(payload)
         limit = self.config.analysis_llm_rerank_max_prompt_chars or self.config.analysis_llm_max_prompt_chars
-        soft_limit = int(limit * 1.03)
+        soft_limit = int(limit * max(1.0, self.config.analysis_llm_rerank_soft_overflow_ratio))
         trim_steps: list[str] = []
         while True:
-            user_prompt = self._render(self.rerank_template, {'payload_json': self._json(mutable_payload)})
+            user_prompt = self._render(
+                self.rerank_template,
+                {'payload_json': self._json(mutable_payload, indent=self.config.analysis_llm_rerank_json_indent)},
+            )
             prompt_chars = len(self.system_prompt) + len(user_prompt)
             if prompt_chars <= limit:
                 self._log_prompt_budget('analyze_candidate_rerank', prompt_chars, limit, trim_steps)
                 return user_prompt, {'max_prompt_chars': limit, 'prompt_chars': prompt_chars, 'trim_steps': trim_steps}
 
             if self._shrink_candidate_cards(mutable_payload, trim_steps):
+                continue
+
+            if self._shrink_rerank_payload(mutable_payload, trim_steps):
                 continue
 
             if prompt_chars <= soft_limit:
@@ -230,6 +240,61 @@ class AnalysisLlmAssistService:
             trim_steps.append('related_tests:removed')
             return True
         return False
+
+    def _shrink_rerank_payload(self, payload: dict[str, Any], trim_steps: list[str]) -> bool:
+        cards = payload.get('candidate_cards') or []
+        if self.config.analysis_llm_rerank_drop_operation_definitions_on_overflow and payload.get('operation_definitions'):
+            payload['operation_definitions'] = []
+            trim_steps.append('operation_definitions:removed')
+            return True
+
+        if isinstance(cards, list) and self._drop_configured_candidate_fields(cards, trim_steps):
+            return True
+
+        if isinstance(cards, list) and self._keep_configured_candidate_fields(cards, trim_steps):
+            return True
+
+        if isinstance(cards, list) and len(cards) > self.config.analysis_llm_rerank_emergency_min_candidate_cards:
+            next_count = max(self.config.analysis_llm_rerank_emergency_min_candidate_cards, len(cards) - 1)
+            payload['candidate_cards'] = cards[:next_count]
+            trim_steps.append(f'candidate_cards_emergency:{len(cards)}->{next_count}')
+            return True
+
+        return False
+
+    def _drop_configured_candidate_fields(self, cards: list[dict[str, Any]], trim_steps: list[str]) -> bool:
+        for raw_field_name in self.config.analysis_llm_rerank_candidate_drop_fields:
+            field_name = str(raw_field_name)
+            changed = False
+            for card in cards:
+                if not card.get(field_name):
+                    continue
+                current = card.get(field_name)
+                if isinstance(current, list):
+                    card[field_name] = []
+                elif isinstance(current, dict):
+                    card[field_name] = {}
+                else:
+                    card[field_name] = ''
+                changed = True
+            if changed:
+                trim_steps.append(f'{field_name}:removed')
+                return True
+        return False
+
+    def _keep_configured_candidate_fields(self, cards: list[dict[str, Any]], trim_steps: list[str]) -> bool:
+        keep_fields = [str(field) for field in self.config.analysis_llm_rerank_candidate_keep_fields]
+        if not keep_fields:
+            return False
+        changed = False
+        for index, card in enumerate(cards):
+            reduced = {field: card[field] for field in keep_fields if field in card}
+            if reduced != card:
+                cards[index] = reduced
+                changed = True
+        if changed:
+            trim_steps.append('candidate_cards:compact_keep_fields')
+        return changed
 
     def _truncate_card_field(self, cards: list[dict[str, Any]], field_name: str, limit: int) -> bool:
         changed = False
@@ -553,23 +618,168 @@ class AnalysisLlmAssistService:
         return Template(template).safe_substitute(values)
 
     def _parse_json_object(self, content: str) -> dict[str, Any]:
-        cleaned = content.strip()
-        if cleaned.startswith('```'):
-            cleaned = cleaned.strip('`')
-            if cleaned.startswith('json'):
-                cleaned = cleaned[4:].strip()
-        try:
-            payload = json.loads(cleaned)
-            return payload if isinstance(payload, dict) else {'raw_value': payload}
-        except json.JSONDecodeError:
-            match = _JSON_OBJECT_RE.search(cleaned)
-            if not match:
-                raise
-            payload = json.loads(match.group(0))
-            return payload if isinstance(payload, dict) else {'raw_value': payload}
+        cleaned = self._strip_json_fence(content)
+        candidates = [cleaned]
+        balanced = self._extract_balanced_json_object(cleaned)
+        if balanced and balanced != cleaned:
+            candidates.append(balanced)
+        match = _JSON_OBJECT_RE.search(cleaned)
+        if match and match.group(0) not in candidates:
+            candidates.append(match.group(0))
 
-    def _json(self, payload: Any) -> str:
-        return json.dumps(payload, ensure_ascii=False, indent=2)
+        last_error: json.JSONDecodeError | None = None
+        for candidate in candidates:
+            for variant in self._json_variants(candidate):
+                try:
+                    payload = json.loads(variant)
+                    return payload if isinstance(payload, dict) else {'raw_value': payload}
+                except json.JSONDecodeError as exc:
+                    last_error = exc
+        if last_error:
+            raise last_error
+        raise json.JSONDecodeError('No JSON object found', cleaned, 0)
+
+    def _strip_json_fence(self, content: str) -> str:
+        text = str(content or '').strip()
+        if text.startswith('```'):
+            text = _JSON_FENCE_RE.sub('', text).strip()
+        return text
+
+    def _json_variants(self, text: str) -> list[str]:
+        variants = [text]
+        without_trailing_commas = re.sub(r',\s*([}\]])', r'\1', text)
+        if without_trailing_commas != text:
+            variants.append(without_trailing_commas)
+        return variants
+
+    def _extract_balanced_json_object(self, text: str) -> str | None:
+        start = text.find('{')
+        if start < 0:
+            return None
+        depth = 0
+        in_string = False
+        escaped = False
+        for pos in range(start, len(text)):
+            char = text[pos]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == '\\':
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == '{':
+                depth += 1
+            elif char == '}':
+                depth -= 1
+                if depth == 0:
+                    return text[start:pos + 1]
+        return None
+
+    def _fallback_parse_rerank_response(
+        self,
+        content: str,
+        candidate_cards: list[dict[str, Any]],
+        parse_error: Exception,
+    ) -> dict[str, Any]:
+        card_by_id = {str(card.get('candidate_id') or ''): card for card in candidate_cards}
+
+        def extract_string(key: str) -> str | None:
+            match = re.search(rf'"{re.escape(key)}"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', content)
+            if match:
+                try:
+                    return json.loads('"' + match.group(1) + '"')
+                except Exception:
+                    return match.group(1)
+            return None
+
+        def extract_number(key: str) -> float:
+            match = re.search(rf'"{re.escape(key)}"\s*:\s*(-?\d+(?:\.\d+)?)', content)
+            return self._safe_float(match.group(1)) if match else 0.0
+
+        recommended_candidate_id = extract_string('recommended_candidate_id')
+        recommended_target = extract_string('recommended_target')
+        if not recommended_target and recommended_candidate_id in card_by_id:
+            recommended_target = str(card_by_id[recommended_candidate_id].get('qualname') or '')
+
+        ranked_candidates: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        if recommended_candidate_id in card_by_id:
+            seen.add(str(recommended_candidate_id))
+            ranked_candidates.append({
+                'candidate_id': str(recommended_candidate_id),
+                'rank': 1,
+                'reason': 'Извлечено из невалидного JSON-ответа LLM.',
+            })
+        for match in re.finditer(r'"candidate_id"\s*:\s*"([^"]+)"', content):
+            candidate_id = match.group(1)
+            if candidate_id in card_by_id and candidate_id not in seen:
+                seen.add(candidate_id)
+                ranked_candidates.append({
+                    'candidate_id': candidate_id,
+                    'rank': len(ranked_candidates) + 1,
+                    'reason': 'Извлечено из невалидного JSON-ответа LLM.',
+                })
+            if len(ranked_candidates) >= 5:
+                break
+
+        if not recommended_target and ranked_candidates:
+            recommended_candidate_id = ranked_candidates[0]['candidate_id']
+            recommended_target = str(card_by_id[recommended_candidate_id].get('qualname') or '')
+
+        if not recommended_target and not ranked_candidates:
+            LOGGER.warning(
+                'Failed to parse LLM candidate rerank JSON and fallback extraction found no target: %s; content_excerpt=%r',
+                parse_error,
+                str(content or '')[:1200],
+            )
+            raise parse_error
+
+        operation = extract_string('recommended_operation') or extract_string('operation') or 'unknown'
+        insert_scope = extract_string('value') or 'unknown'
+        parent_qualname = extract_string('parent_qualname')
+        target_role = extract_string('target_role') or 'unknown'
+        LOGGER.warning(
+            'Used fallback extraction for invalid LLM candidate rerank JSON: error=%s recommended_target=%s ranked_candidates=%s content_excerpt=%r',
+            parse_error,
+            recommended_target,
+            [item.get('candidate_id') for item in ranked_candidates],
+            str(content or '')[:1200],
+        )
+        return {
+            'recommended_operation': operation,
+            'operation_confidence': extract_number('operation_confidence'),
+            'operation_reason': extract_string('operation_reason') or 'Извлечено из невалидного JSON-ответа LLM.',
+            'insert_scope': {
+                'value': insert_scope,
+                'confidence': extract_number('confidence'),
+                'reason': extract_string('reason') or 'Извлечено из невалидного JSON-ответа LLM.',
+            },
+            'expected_new_symbol_kind': extract_string('expected_new_symbol_kind') or 'unknown',
+            'parent_qualname': parent_qualname,
+            'recommended_candidate_id': recommended_candidate_id,
+            'recommended_target': recommended_target,
+            'target_role': target_role,
+            'target_confidence': extract_number('target_confidence'),
+            'target_reason': extract_string('target_reason') or 'Извлечено из невалидного JSON-ответа LLM.',
+            'manual_review_required': False,
+            'warnings': [
+                {
+                    'code': 'analysis_llm_rerank_json_recovered',
+                    'message': f'LLM вернула невалидный JSON для rerank; часть полей восстановлена эвристически: {parse_error}',
+                }
+            ],
+            'ranked_candidates': ranked_candidates,
+            'alternatives': [],
+        }
+
+    def _json(self, payload: Any, *, indent: int | None = 2) -> str:
+        if indent is not None and indent > 0:
+            return json.dumps(payload, ensure_ascii=False, indent=indent)
+        return json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
 
     def _signature(self, symbol: SymbolRecord) -> str:
         for line in symbol.source_code.splitlines():

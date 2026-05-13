@@ -23,6 +23,8 @@ class LlmCallResult:
     prompt_chars: int = 0
     system_chars: int = 0
     user_chars: int = 0
+    num_predict: int = 0
+    done_reason: str = ''
 
     def usage_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -43,7 +45,15 @@ class AnalysisLlmClient:
             self.api_base_url = f'{self.base_url}/api'
         self.chat_url = f'{self.api_base_url}/chat'
 
-    def chat_json(self, *, step: str, system_prompt: str, user_prompt: str, max_prompt_chars: int | None = None) -> LlmCallResult:
+    def chat_json(
+        self,
+        *,
+        step: str,
+        system_prompt: str,
+        user_prompt: str,
+        max_prompt_chars: int | None = None,
+        num_predict: int | None = None,
+    ) -> LlmCallResult:
         if not self.base_url:
             raise RuntimeError('analysis.llm_assist.base_url is empty')
         prompt_chars = len(system_prompt) + len(user_prompt)
@@ -53,6 +63,8 @@ class AnalysisLlmClient:
                 f'analysis LLM prompt is too large for {step}: '
                 f'{prompt_chars} chars > {effective_max_prompt_chars} chars'
             )
+
+        effective_num_predict = int(num_predict if num_predict is not None else self.config.analysis_llm_num_predict)
 
         payload: dict[str, Any] = {
             'model': self.config.analysis_llm_model,
@@ -65,7 +77,7 @@ class AnalysisLlmClient:
             'keep_alive': self.config.analysis_llm_keep_alive,
             'options': {
                 'temperature': self.config.analysis_llm_temperature,
-                'num_predict': self.config.analysis_llm_num_predict,
+                'num_predict': effective_num_predict,
                 'num_ctx': self.config.analysis_llm_num_ctx,
             },
         }
@@ -77,13 +89,14 @@ class AnalysisLlmClient:
             headers['Authorization'] = f'Bearer {self.api_key}'
 
         LOGGER.info(
-            'analysis llm %s call: model=%s prompt_chars=%s max_prompt_chars=%s system_chars=%s user_chars=%s',
+            'analysis llm %s call: model=%s prompt_chars=%s max_prompt_chars=%s system_chars=%s user_chars=%s num_predict=%s',
             step,
             self.config.analysis_llm_model,
             prompt_chars,
             effective_max_prompt_chars,
             len(system_prompt),
             len(user_prompt),
+            effective_num_predict,
         )
         started_at = time.perf_counter()
         req = request.Request(
@@ -120,13 +133,16 @@ class AnalysisLlmClient:
             prompt_chars=prompt_chars,
             system_chars=len(system_prompt),
             user_chars=len(user_prompt),
+            num_predict=effective_num_predict,
+            done_reason=str(raw.get('done_reason') or ''),
         )
         LOGGER.info(
-            'analysis llm %s result: prompt_tokens=%s output_tokens=%s total_tokens=%s duration=%.2fs',
+            'analysis llm %s result: prompt_tokens=%s output_tokens=%s total_tokens=%s duration=%.2fs done_reason=%s',
             step,
             result.prompt_tokens,
             result.output_tokens,
             result.prompt_tokens + result.output_tokens,
             duration_sec,
+            result.done_reason,
         )
         return result

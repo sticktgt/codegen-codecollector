@@ -207,6 +207,15 @@ class PostgresIndexStore:
             )
             conn.commit()
 
+    def delete_project(self, project_root: str) -> dict[str, int]:
+        with self._connect() as conn:
+            counts: dict[str, int] = {}
+            for table in ('cc_search_documents', 'cc_relations', 'cc_symbols', 'cc_files'):
+                cursor = conn.execute(f"DELETE FROM {table} WHERE project_root = %s", (project_root,))
+                counts[table] = int(cursor.rowcount or 0)
+            conn.commit()
+        return counts
+
     def get_symbol(self, project_root: str, qualname: str) -> SymbolRecord | None:
         with self._connect() as conn:
             row = conn.execute(

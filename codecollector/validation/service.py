@@ -14,6 +14,7 @@ from codecollector.domain.models import (
     VerificationIssue,
 )
 from codecollector.logger import get_logger
+from codecollector.validation.semantic_checks import find_duplicate_symbol_definitions
 
 LOGGER = get_logger(__name__)
 
@@ -21,9 +22,11 @@ LOGGER = get_logger(__name__)
 class ValidationService:
     def validate_project(self, project_root: Path, changed_files: list[Path]) -> ValidationReport:
         issues: list[ValidationIssue] = []
+        project_root = project_root.resolve()
         for path in changed_files:
             try:
-                ast.parse(path.read_text(encoding='utf-8'))
+                source = path.read_text(encoding='utf-8')
+                ast.parse(source)
             except SyntaxError as exc:
                 LOGGER.exception('AST validation failed for %s: %s', path, exc)
                 issues.append(
@@ -32,6 +35,28 @@ class ValidationService:
                         check_name='ast_parse',
                         message=f'{exc.msg} at line {exc.lineno}',
                         file_path=str(path),
+                    )
+                )
+                continue
+
+            try:
+                relative_path = str(path.resolve().relative_to(project_root))
+            except ValueError:
+                relative_path = str(path)
+            module_name = self._module_name_from_path(relative_path)
+            for duplicate in find_duplicate_symbol_definitions(source, module_name, relative_path):
+                lines = duplicate.get('lines') or []
+                line_text = ', '.join(str(item) for item in lines) if lines else 'unknown'
+                issues.append(
+                    ValidationIssue(
+                        severity='error',
+                        check_name='duplicate_symbol_definition',
+                        message=(
+                            f"Duplicate symbol definition {duplicate['qualname']} "
+                            f"({duplicate['kind']}) at lines {line_text}. "
+                            "Repair should generate a new unique symbol instead of copying an existing one."
+                        ),
+                        file_path=relative_path,
                     )
                 )
         if not issues:
@@ -56,6 +81,15 @@ class ValidationService:
                 )
             )
         return ValidationReport(is_valid=not any(item.severity == 'error' for item in issues), issues=issues)
+
+
+    def _module_name_from_path(self, relative_path: str) -> str:
+        normalized = str(relative_path or '').replace('\\', '/').strip('/')
+        if normalized.endswith('/__init__.py'):
+            normalized = normalized[: -len('/__init__.py')]
+        elif normalized.endswith('.py'):
+            normalized = normalized[:-3]
+        return normalized.replace('/', '.')
 
     def run_post_apply_checks(
         self,
@@ -84,36 +118,36 @@ class ValidationService:
             results['ruff'] = self._run_command([sys.executable, '-m', 'ruff', 'check', '.'], project_root)
 
         if run_recommended_tests and recommended_tests:
-            paths = self._qualnames_to_test_paths(project_root, recommended_tests)
+            paths, resolution_details = self._resolve_test_targets(project_root, recommended_tests)
             LOGGER.info(
                 "resolved verification test targets from %s to pytest paths %s",
                 recommended_tests,
                 paths,
             )
             unresolved_targets = [
-                item for item in (recommended_tests or [])
-                if str(item or "").strip()
-                and not (
-                    (str(item).strip().endswith(".py") and (project_root / str(item).strip().replace("\\", "/")).exists())
-                    or (
-                        str(item).strip().startswith("tests.")
-                        and (
-                            (project_root / ("/".join(str(item).strip().split(".")) + ".py")).exists()
-                            or (
-                                len(str(item).strip().split(".")) >= 3
-                                and (project_root / ("/".join(str(item).strip().split(".")[:-1]) + ".py")).exists()
-                            )
-                        )
-                    )
-                )
+                item.get('target')
+                for item in resolution_details
+                if item.get('status') == 'unresolved'
+            ]
+            fallback_targets = [
+                item
+                for item in resolution_details
+                if item.get('status') == 'fallback_file'
             ]
             if unresolved_targets:
                 LOGGER.warning(
                     "some verification targets were not resolved to pytest paths: unresolved=%s",
                     unresolved_targets,
-                )            
+                )
+            if fallback_targets:
+                LOGGER.warning(
+                    "some verification targets were resolved only to fallback files: fallback=%s",
+                    fallback_targets,
+                )
             if paths:
-                results['pytest_recommended'] = self._run_command([sys.executable, '-m', 'pytest', *paths], project_root)
+                pytest_result = self._run_command([sys.executable, '-m', 'pytest', *paths], project_root)
+                pytest_result['target_resolution'] = resolution_details
+                results['pytest_recommended'] = pytest_result
 
         if run_full_project_tests:
             results['pytest_full'] = self._run_command([sys.executable, '-m', 'pytest'], project_root)
@@ -233,7 +267,16 @@ class ValidationService:
         }
 
     def _qualnames_to_test_paths(self, project_root: Path, recommended_tests: list[str]) -> list[str]:
+        paths, _details = self._resolve_test_targets(project_root, recommended_tests)
+        return paths
+
+    def _resolve_test_targets(
+        self,
+        project_root: Path,
+        recommended_tests: list[str],
+    ) -> tuple[list[str], list[dict[str, Any]]]:
         paths: list[str] = []
+        details: list[dict[str, Any]] = []
         seen: set[str] = set()
 
         for item in recommended_tests:
@@ -241,59 +284,151 @@ class ValidationService:
             if not normalized:
                 continue
 
-            # 1. Уже готовый pytest path, например:
-            #    tests/test_generated_generate_test_AgentSummary.py
-            if normalized.endswith(".py"):
-                file_path = normalized.replace("\\", "/")
-                if (project_root / file_path).exists():
-                    if file_path not in seen:
-                        seen.add(file_path)
-                        paths.append(file_path)
-                    continue
+            resolved_path, detail = self._resolve_single_test_target(project_root, normalized)
+            details.append(detail)
+            if resolved_path and resolved_path not in seen:
+                seen.add(resolved_path)
+                paths.append(resolved_path)
 
-                LOGGER.warning(
-                    "verification target looks like direct test path but file is missing: target=%s resolved=%s",
-                    item,
-                    file_path,
-                )
+        deduped_paths = self._dedupe_resolved_test_targets(paths)
+        if len(deduped_paths) != len(paths):
+            LOGGER.info(
+                "deduplicated pytest targets from %s to %s",
+                paths,
+                deduped_paths,
+            )
+        return deduped_paths, details
+
+    def _dedupe_resolved_test_targets(self, paths: list[str]) -> list[str]:
+        """Remove broad file targets when a more precise node id for the same file exists."""
+        node_files = {path.split('::', 1)[0] for path in paths if '::' in path}
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for path in paths:
+            if '::' not in path and path in node_files:
                 continue
-
-            # 2. Квалифицированное имя тестового модуля/символа:
-            #    tests.test_report_service
-            #    tests.test_report_service.test_build_agent_summary_counts_only_open_assigned
-            parts = normalized.split(".")
-            if parts and parts[0] == "tests" and len(parts) >= 2:
-                candidate_paths: list[str] = []
-
-                # Полный модуль как файл: tests/test_report_service.py
-                module_file_path = "/".join(parts) + ".py"
-                candidate_paths.append(module_file_path)
-
-                # Символ внутри модуля: tests/test_report_service.py
-                parent_module_file_path = "/".join(parts[:-1]) + ".py"
-                if len(parts) >= 3:
-                    candidate_paths.append(parent_module_file_path)
-
-                resolved = False
-                for file_path in candidate_paths:
-                    if (project_root / file_path).exists():
-                        if file_path not in seen:
-                            seen.add(file_path)
-                            paths.append(file_path)
-                        resolved = True
-                        break
-
-                if not resolved:
-                    LOGGER.warning(
-                        "failed to resolve verification target to pytest path: target=%s candidates=%s",
-                        item,
-                        candidate_paths,
-                    )
+            if path in seen:
                 continue
+            seen.add(path)
+            deduped.append(path)
+        return deduped
 
+    def _resolve_single_test_target(self, project_root: Path, target: str) -> tuple[str | None, dict[str, Any]]:
+        normalized = str(target or "").strip().replace("\\", "/")
+        detail: dict[str, Any] = {
+            'target': target,
+            'status': 'unresolved',
+            'resolved': None,
+            'candidates': [],
+        }
+        if not normalized:
+            return None, detail
+
+        if '::' in normalized:
+            file_part = normalized.split('::', 1)[0]
+            if file_part.endswith('.py') and (project_root / file_part).exists():
+                detail.update({'status': 'pytest_node', 'resolved': normalized})
+                return normalized, detail
+            detail['candidates'] = [file_part]
             LOGGER.warning(
-                "unsupported verification target format: target=%s",
-                item,
+                "verification target looks like pytest node id but file is missing: target=%s file=%s",
+                target,
+                file_part,
+            )
+            return None, detail
+
+        if normalized.endswith('.py'):
+            if (project_root / normalized).exists():
+                detail.update({'status': 'file', 'resolved': normalized})
+                return normalized, detail
+            detail['candidates'] = [normalized]
+            LOGGER.warning(
+                "verification target looks like direct test path but file is missing: target=%s resolved=%s",
+                target,
+                normalized,
+            )
+            return None, detail
+
+        parts = [part for part in normalized.split('.') if part]
+        if not parts or parts[0] != 'tests' or len(parts) < 2:
+            LOGGER.warning("unsupported verification target format: target=%s", target)
+            return None, detail
+
+        candidate_files: list[tuple[str, list[str]]] = []
+        for split_at in range(len(parts), 1, -1):
+            file_path = '/'.join(parts[:split_at]) + '.py'
+            suffix_parts = parts[split_at:]
+            candidate_files.append((file_path, suffix_parts))
+
+        detail['candidates'] = [file_path for file_path, _suffix in candidate_files]
+
+        first_existing_file: str | None = None
+        first_existing_suffix: list[str] = []
+        for file_path, suffix_parts in candidate_files:
+            if not (project_root / file_path).exists():
+                continue
+            if first_existing_file is None:
+                first_existing_file = file_path
+                first_existing_suffix = suffix_parts
+            if not suffix_parts:
+                detail.update({'status': 'file', 'resolved': file_path})
+                return file_path, detail
+            node_id = file_path + '::' + '::'.join(suffix_parts)
+            if self._pytest_node_exists(project_root / file_path, suffix_parts):
+                detail.update({'status': 'pytest_node', 'resolved': node_id})
+                return node_id, detail
+
+        if first_existing_file:
+            detail.update(
+                {
+                    'status': 'fallback_file',
+                    'resolved': first_existing_file,
+                    'unresolved_node_suffix': '::'.join(first_existing_suffix),
+                }
+            )
+            LOGGER.warning(
+                "failed to resolve exact pytest node; using fallback file path: target=%s fallback=%s suffix=%s",
+                target,
+                first_existing_file,
+                '::'.join(first_existing_suffix),
+            )
+            return first_existing_file, detail
+
+        LOGGER.warning(
+            "failed to resolve verification target to pytest path: target=%s candidates=%s",
+            target,
+            detail['candidates'],
+        )
+        return None, detail
+
+    def _pytest_node_exists(self, file_path: Path, suffix_parts: list[str]) -> bool:
+        if not suffix_parts:
+            return True
+        try:
+            tree = ast.parse(file_path.read_text(encoding='utf-8'))
+        except (OSError, SyntaxError) as exc:
+            LOGGER.warning("failed to inspect pytest target file: file=%s error=%s", file_path, exc)
+            return False
+
+        first = suffix_parts[0]
+        if len(suffix_parts) == 1:
+            return any(
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == first
+                for node in tree.body
             )
 
-        return paths
+        class_node = next(
+            (node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == first),
+            None,
+        )
+        if class_node is None:
+            return False
+
+        second = suffix_parts[1]
+        if len(suffix_parts) == 2:
+            return any(
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == second
+                for node in class_node.body
+            )
+
+        return False

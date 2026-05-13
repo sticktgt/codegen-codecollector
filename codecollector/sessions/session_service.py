@@ -176,6 +176,32 @@ class SessionService:
         scope = str(value or '').strip()
         return scope if scope in INSERT_SCOPES else None
 
+    def _safe_float(self, value: object) -> float:
+        try:
+            return float(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _expected_new_symbol_kind_from_analysis(self, analysis: dict[str, Any]) -> str | None:
+        payloads = [
+            analysis.get('target_recommendation') or {},
+            analysis.get('search_plan') or {},
+        ]
+        for payload in payloads:
+            if not isinstance(payload, dict):
+                continue
+            value = str(payload.get('expected_new_symbol_kind') or '').strip().lower()
+            if value in {'class', 'function', 'method'}:
+                return value
+            symbols = payload.get('expected_new_symbols') or []
+            if isinstance(symbols, list):
+                for item in symbols:
+                    if isinstance(item, dict):
+                        kind = str(item.get('kind') or '').strip().lower()
+                        if kind in {'class', 'function', 'method'}:
+                            return kind
+        return None
+
     def _target_symbol_payload(self, session_payload: dict[str, Any], selected_target: str | None) -> dict[str, Any]:
         project_id = str(session_payload.get('project_id') or '').strip()
         if not project_id or not selected_target:
@@ -419,6 +445,41 @@ class SessionService:
         )
 
         target_symbol_payload = self._target_symbol_payload(session_payload, resolved_target)
+        expected_new_symbol_kind = self._expected_new_symbol_kind_from_analysis(analysis)
+        if (
+            requested_operation == 'insert_after_symbol'
+            and expected_new_symbol_kind == 'class'
+            and effective_insert_scope != 'module_body'
+        ):
+            previous_scope = effective_insert_scope or 'unknown'
+            effective_insert_scope = 'module_body'
+            session_payload['insert_scope'] = effective_insert_scope
+            target_recommendation['insert_scope'] = {
+                'value': 'module_body',
+                'confidence': max(
+                    self._safe_float((target_recommendation.get('insert_scope') or {}).get('confidence')),
+                    0.9,
+                ),
+                'reason': (
+                    'Новый symbol является class/dataclass, поэтому он вставляется на уровне модуля, '
+                    'а выбранный target используется как anchor.'
+                ),
+            }
+            target_recommendation['expected_new_symbol_kind'] = 'class'
+            module_parent = (
+                str(target_symbol_payload.get('qualname') or '')
+                if str(target_symbol_payload.get('kind') or '') == 'module'
+                else str(target_symbol_payload.get('parent_qualname') or '')
+            )
+            if module_parent:
+                target_recommendation['parent_qualname'] = module_parent
+            target_recommendation['target_role'] = 'anchor'
+            LOGGER.info(
+                'Session generate normalized insert_scope for new class: session_id=%s target=%s old_scope=%s new_scope=module_body',
+                session_id,
+                resolved_target,
+                previous_scope,
+            )
         target_kind = str(target_symbol_payload.get('kind') or '').strip()
         if requested_operation == 'insert_after_symbol' and target_kind == 'method':
             if not effective_insert_scope:

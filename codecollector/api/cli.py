@@ -5,6 +5,7 @@ import argparse
 import json
 import subprocess
 import sys
+import traceback
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -57,8 +58,11 @@ def build_parser() -> argparse.ArgumentParser:
     project_delete.add_argument('--project-id', required=True)
 
     project_onboard = projects_sub.add_parser('onboard')
-    project_onboard.add_argument('--project-id', required=True)
+    project_onboard.add_argument('--project-id')
+    project_onboard.add_argument('--input-root', help='Папка onboarding-пакета: внутри ожидается src/ и опциональный архитектурный файл из onboarding.knowledge.architecture_doc_names')
+    project_onboard.add_argument('--project-name')
     project_onboard.add_argument('--full', action='store_true')
+    project_onboard.add_argument('--skip-architecture-enrichment', action='store_true')
 
     sessions_parser = subparsers.add_parser('sessions')
     sessions_sub = sessions_parser.add_subparsers(dest='sessions_command', required=True)
@@ -202,12 +206,18 @@ def main() -> None:
             return
 
         if args.command == 'projects' and args.projects_command == 'delete':
-            deleted = project_service.delete_project_registration(args.project_id)
-            print(json.dumps({'project_id': args.project_id, 'deleted': deleted}, ensure_ascii=False, indent=2))
+            result = project_service.delete_project(args.project_id)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
             return
 
         if args.command == 'projects' and args.projects_command == 'onboard':
-            result = onboarding_service.onboard_project(args.project_id, full_rebuild=args.full)
+            result = onboarding_service.onboard_project(
+                args.project_id,
+                input_root=Path(args.input_root) if args.input_root else None,
+                project_name=args.project_name,
+                full_rebuild=args.full,
+                use_architecture_enrichment=not args.skip_architecture_enrichment,
+            )
             print(json.dumps(asdict(result), ensure_ascii=False, indent=2))
             return
 
@@ -385,9 +395,39 @@ def main() -> None:
             return
 
     except Exception as exc:
-        LOGGER.exception('CLI command failed: %s', exc)
-        print(json.dumps({'error': str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
-        raise SystemExit(1) from exc
+        LOGGER.error('CLI command failed: %s', exc)
+        print(json.dumps(_error_payload(exc, args), ensure_ascii=False, indent=2))
+        raise SystemExit(1)
+
+
+def _error_payload(exc: Exception, args: argparse.Namespace) -> dict[str, Any]:
+    details = exc.to_dict() if hasattr(exc, 'to_dict') else {}
+    payload: dict[str, Any] = {
+        'status': 'failed',
+        'error_type': exc.__class__.__name__,
+        'error': str(exc),
+        'message': str(exc),
+        'command': getattr(args, 'command', ''),
+        'subcommand': _detect_subcommand(args),
+        'details': details if isinstance(details, dict) else {},
+    }
+    if not isinstance(details, dict) or not details:
+        payload['traceback'] = traceback.format_exception(type(exc), exc, exc.__traceback__)
+    return _json_ready(payload)
+
+
+def _detect_subcommand(args: argparse.Namespace) -> str:
+    for name in (
+        'projects_command',
+        'sessions_command',
+        'workspaces_command',
+        'pipeline_command',
+        'index_command',
+    ):
+        value = getattr(args, name, None)
+        if value:
+            return str(value)
+    return ''
 
 
 def _load_change_request(args: argparse.Namespace, project_name: str) -> ChangeRequest:

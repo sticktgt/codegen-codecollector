@@ -22,6 +22,9 @@ class DescriptionVectorSearchService:
     def sync_documents(self, documents: list[dict[str, str]], project_key: str | None = None) -> None:
         self.backend.sync_documents(documents, project_key=project_key or self.project_key)
 
+    def delete_project_documents(self, project_key: str | None = None) -> int:
+        return self.backend.delete_project_documents(project_key=project_key or self.project_key)
+
     def search(self, query: str, limit: int = 10, project_key: str | None = None) -> dict[str, float]:
         return self.backend.search(query, limit=limit, project_key=project_key or self.project_key)
 

@@ -66,6 +66,25 @@ class RelationRecord:
 
 
 @dataclass(slots=True)
+class RelatedSymbolContext:
+    qualname: str
+    file_path: str
+    module_name: str
+    name: str
+    kind: SymbolKind
+    parent_qualname: str | None
+    relation_kind: RelationKind
+    relation_direction: str
+    relation_source: RelationSource
+    relation_confidence: RelationConfidence
+    role: str
+    origin_qualname: str = ""
+    signature: str = ""
+    docstring: str = ""
+    source_code: str = ""
+
+
+@dataclass(slots=True)
 class SearchCandidate:
     qualname: str
     name: str
@@ -91,6 +110,7 @@ class ContextPack:
     inbound_relations: list[RelationRecord]
     outbound_relations: list[RelationRecord]
     related_tests: list[SymbolRecord]
+    related_symbols: list[RelatedSymbolContext] = field(default_factory=list)
     requirement_ids: list[str] = field(default_factory=list)
     requirement_titles: list[str] = field(default_factory=list)
     knowledge_title: str = ""
