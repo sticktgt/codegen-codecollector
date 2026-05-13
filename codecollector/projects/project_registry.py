@@ -84,6 +84,14 @@ class ProjectRegistry:
             items.append(RegisteredProject.from_dict(self.store.read(path.name)))
         return items
 
+    def list_by_project_root(self, project_root: str) -> list[RegisteredProject]:
+        resolved_root = str(Path(project_root).resolve())
+        return [
+            project
+            for project in self.list()
+            if str(Path(project.project_root).resolve()) == resolved_root
+        ]
+
     def delete(self, project_id: str) -> bool:
         rel = f'{project_id}.json'
         if not self.store.exists(rel):

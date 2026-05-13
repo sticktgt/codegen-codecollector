@@ -1,177 +1,235 @@
 # Репозиторий codecollector
 
-Этот файл фиксирует правила сопровождения текущего состояния `codecollector`. Он предназначен для разработчиков и агентов, которые меняют код, конфигурацию, prompts или документацию проекта.
+Этот файл предназначен для LLM-агентов и разработчиков, которые меняют код, конфигурацию, prompts или документацию `codecollector`. Он фиксирует текущее состояние проекта и правила сопровождения.
 
 ---
 
 ## Назначение проекта
 
-`codecollector` отвечает за orchestration dry-run процесса изменения кода:
+`codecollector` — technical orchestrator нижнего уровня для controlled dry-run изменения кода в локальном проекте.
 
-- индексацию проекта;
-- поиск релевантных символов;
-- LLM-assisted analyze;
-- выбор target для `replace_symbol` или anchor для `insert_after_symbol`;
-- сбор context pack;
+Проект отвечает за:
+
+- регистрацию и onboarding локальных проектов;
+- построение графового и поискового индекса проекта;
+- автоматическую генерацию `.codecollector/knowledge.yaml`;
+- поиск и shortlist target/anchor candidates;
+- LLM-assisted analyze технического change request;
+- выбор target для `replace_symbol` или anchor/container для `insert_after_symbol`;
+- сбор context pack, `allowed_api_surface` и `contract_context`;
 - подбор reference artifacts;
-- подготовку запросов для внешнего `codegenerator`;
+- подготовку structured request и вызов внешнего `codegenerator`;
 - применение результата в staging workspace;
-- верификацию production-кода и сгенерированных тестов;
-- подготовку dry-run результата для ручного review;
-- сохранение run artifacts.
+- project-level verification production-кода и generated tests;
+- orchestration repair;
+- подготовку dry-run merge plan;
+- сохранение run artifacts в `.runs`.
+
+`codecollector` не является верхнеуровневым planner-agent для бизнес-требований и не является web/control layer. UI, CR lifecycle и отображение результата относятся к `codeui`. Генерация production-кода, generated tests и repair artifact относится к `codegenerator`.
 
 ---
 
-## Основные принципы изменений
+## Границы ответственности
 
-При изменении проекта нужно сохранять:
+### Делает codecollector
 
-- простую и понятную orchestration-логику;
-- предсказуемое поведение CLI;
-- явное разделение этапов analyze, selection, generation, apply, verification и merge dry-run;
-- устойчивую структуру run artifacts;
-- локальность изменений в сервисах;
-- читаемость логов и итоговых JSON-ответов.
+- Управляет lifecycle зарегистрированных проектов и session.
+- Индексирует Python-код и строит graph/search/vector индексы.
+- Строит и обновляет `.codecollector/knowledge.yaml` при onboarding.
+- Анализирует технический запрос на изменение кода.
+- Возвращает `request_quality`, operation, insert scope, candidates и target recommendation.
+- Формирует project context для генератора.
+- Вызывает `codegenerator` через файловый JSON-контракт.
+- Применяет artifact только в staging workspace.
+- Выполняет статические и runtime-проверки проекта.
+- Различает production failures и generated-test failures.
+- Готовит merge/apply plan для ручного review.
 
-Не нужно объединять несвязанные обязанности в одном сервисе. Бизнес-решения не должны переноситься в низкоуровневые утилиты. Новые абстракции добавляются только тогда, когда они упрощают текущий код или закрывают актуальный сценарий.
+### Не делает codecollector
 
-Скрытые специальные случаи для конкретных demo-проектов не допускаются.
+- Не редактирует requirements и CR как бизнес-сущности UI.
+- Не хранит UI-состояние и не отображает run artifacts пользователю.
+- Не генерирует production-код самостоятельно вместо `codegenerator`.
+- Не переносит prompt assembly production/test/repair из `codegenerator`.
+- Не принимает финальное решение о merge без человека.
+- Не добавляет project-specific специальные случаи под demo-проекты.
 
 ---
 
-## Analyze и LLM-assisted выбор
+## Основные файлы и зоны кода
+
+- `config.yaml` — конфигурация индексации, поиска, LLM-assisted analyze, codegenerator, verification и onboarding.
+- `codecollector/api/cli.py` — CLI-контракт.
+- `codecollector/projects/` — регистрация проектов.
+- `codecollector/onboarding/` — onboarding проекта и генерация knowledge.
+- `codecollector/indexing/` — Python index builder и storage adapters.
+- `codecollector/search/` — поиск кандидатов.
+- `codecollector/analysis/` — LLM-assisted analyze и rerank.
+- `codecollector/sessions/` — session-based workflow.
+- `codecollector/context/` — context pack, related symbols/tests, contracts.
+- `codecollector/external_codegen/` — подготовка request и вызов `codegenerator`.
+- `codecollector/orchestration/` — pipeline, run artifacts, merge plan.
+- `codecollector/validation/` — semantic checks и runtime verification.
+- `codecollector/workspace/` — staging workspace, diff и apply.
+- `codecollector/overlays/` — чтение knowledge overlay.
+- `codecollector/prompts/` — prompt-шаблоны только для analyze/onboarding enrichment.
+- `.runs/` — артефакты запусков pipeline.
+- `.workspaces/` — staging workspaces.
+- `.state/` — registry projects/sessions.
+
+---
+
+## Общие правила изменений
+
+- Работай локально в сервисе, который отвечает за задачу.
+- Не смешивай analyze, indexing, context, generation, validation и workspace logic без необходимости.
+- Не добавляй скрытые ветки под конкретный demo/project/example.
+- Все настраиваемые лимиты, thresholds и режимы должны приходить из `config.yaml`/`config.py`.
+- Prompt-тексты должны храниться в шаблонах, а не в Python-коде.
+- Новые prompt-шаблоны писать на русском языке.
+- Ошибки внешних вызовов, LLM, subprocess и verification должны логироваться с достаточным контекстом для отладки.
+- JSON-ответы CLI должны оставаться понятными для `codeui` и внешних клиентов. При ошибке CLI должен возвращать структурированный JSON payload, а не печатать traceback как основной результат.
+- Если меняется публичный CLI/result contract, обновляй README.
+- После каждого патча указывай измененные файлы и тестовые сценарии.
+
+---
+
+## Onboarding и knowledge.yaml
+
+Onboarding отвечает за подключение проекта к `codecollector` и подготовку `.codecollector/knowledge.yaml`.
+
+Текущий сценарий:
+
+1. Проект регистрируется с `project_root`, указывающим на корень индексируемого кода.
+2. `projects onboard --project-id ...` строит индекс и базовый knowledge из фактических модулей и symbols.
+3. Для нового проекта можно передать папку onboarding-пакета через `projects onboard --input-root ...`. В этой папке ожидается `src/` — индексируемый код проекта. Архитектурное описание ищется рядом с `src/` по именам из `onboarding.knowledge.architecture_doc_names`, например `ARCHITECT.md` или `ARCHITECTURE.md`.
+4. При наличии архитектурного файла codecollector вызывает LLM из собственного analysis endpoint и дополняет базовый `knowledge.yaml` архитектурной информацией. Если архитектурный файл не найден, onboarding продолжается без LLM-enrichment и пишет warning в лог.
+
+Правила enrichment:
+
+- Индекс и базовый knowledge строятся детерминированно по коду.
+- Информация из архитектурного файла имеет приоритет над автоматически созданными заголовками, описаниями и слоями.
+- LLM-enrichment не должен создавать реальные entries для modules/symbols, которых нет в индексе.
+- Упоминания из архитектурного файла, не найденные в коде, сохраняются как diagnostics/warnings, а не маскируются под существующий код.
+- Для `projects onboard --input-root ...` enrichment по найденному архитектурному файлу является обязательным, если пользователь явно не передал `--skip-architecture-enrichment`. При ошибке enrichment нужно откатить регистрацию нового проекта и индексные данные.
+- Prompt enrichment должен сохранять валидность контекста: сначала передается полный список файлов, затем по возможности полный список symbols; сжатие уменьшает поля всего набора, а не выбирает произвольный top-N.
+- Если валидный контекст не помещается в prompt budget даже после безопасного сжатия, нужно вернуть ошибку и предложить увеличить лимит или отключить enrichment для запуска.
+- В логах должны быть размер prompt, trim steps, `num_predict` и usage LLM: prompt/output/total tokens, duration и `done_reason`.
+- Trace/warnings enrichment должны помогать понять, какие данные были применены или отброшены. Диагностические trace-файлы LLM-enrichment нужно хранить в `.runs/knowledge_enrichment_traces/` проекта codecollector, а не внутри подключаемого проекта.
+
+`knowledge.yaml` должен оставаться совместимым с `OverlayService`: ключи `project`, `modules`, `symbols`, `requirements`, `architecture.layers` не переименовывать без отдельной миграции.
+
+---
+
+## Удаление проекта
+
+`projects delete` удаляет регистрацию проекта и очищает graph/vector данные по `project_root`. Очистка должна быть идемпотентной: отсутствие строк в базе не считается ошибкой. Дополнительный ключ удаления не вводится, даже если несколько регистраций используют один и тот же `project_root`.
+
+## Analyze и target selection
 
 `sessions analyze` может использовать два LLM-assisted этапа:
 
-1. `search_plan` — оценка качества запроса, определение operation, ожидаемых новых symbols и поискового плана;
-2. `candidate_rerank` — выбор target или anchor по candidate cards.
+1. `search_plan` — оценка качества запроса, operation, expected new symbols и поисковый план;
+2. `candidate_rerank` — выбор target/anchor по candidate cards.
 
-Операция может быть передана пользователем или определена автоматически. Явный пользовательский выбор имеет приоритет.
+Поддерживаемые операции:
 
-Поддерживаются операции:
+- `replace_symbol` — выбранный symbol является изменяемым target;
+- `insert_after_symbol` — выбранный symbol является anchor или parent container, новый symbol еще не существует.
 
-- `replace_symbol` — выбранный symbol является target для замены;
-- `insert_after_symbol` — выбранный symbol является anchor для вставки нового кода.
+Если запрос недостаточный, результат должен содержать:
 
-Если запрос недостаточный, результат должен содержать `request_quality.status=insufficient`, `manual_review_required=true` и список `missing_information`. Для такого запроса генерация должна быть заблокирована. Правильное действие пользователя — переписать запрос и заново выполнить analyze.
+- `request_quality.status=insufficient`;
+- `manual_review_required=true`;
+- `missing_information`;
+- рекомендацию переписать запрос и заново выполнить analyze.
 
-`select-target` не используется для исправления недостаточного запроса. Он нужен для ручного выбора target или anchor в рамках достаточно конкретного запроса.
-
-Prompt-тексты для analyze должны храниться в `codecollector/prompts`. Числовые лимиты, prompt budget и threshold должны храниться в `config.yaml`.
-
-Подключение analyze к Ollama-compatible endpoint задается локально в `codecollector/config.yaml`. Настройки LLM не наследуются из `codegenerator`.
-
-Новые эвристики определения operation не должны становиться основным механизмом выбора. Эвристики допустимы только как fallback при недоступности или неуверенности LLM.
+Для такого запроса generation должен быть заблокирован. `select-target` не используется как обход недостаточного запроса.
 
 ---
 
-## Кандидаты analyze
+## Candidates и LLM rerank
 
-Внутренний recall-набор может быть шире списка, возвращаемого пользователю. Размеры управляются настройками:
+Внутренний recall-набор может быть шире списка, возвращаемого наружу. Размеры управляются конфигурацией:
 
 - `analysis.recall.max_recall_candidates`;
 - `analysis.candidate_context.max_candidate_cards`;
 - `analysis.result.max_candidates`.
 
-В LLM rerank передаются расширенные candidate cards. Через API возвращается top-N список для выбора пользователем.
-
-Кандидаты, оцененные LLM, должны получать поля:
+Кандидаты, оцененные LLM, должны явно содержать признаки:
 
 - `ranked_by_llm`;
 - `llm_recommended`;
 - `llm_rank`;
 - `llm_reason`.
 
-Если LLM rerank пропущен, эти поля должны явно отражать, что кандидат не был оценен LLM.
+Если LLM rerank пропущен, поля должны явно отражать, что candidate не был оценен LLM.
 
 ---
 
-## Prompt budget и логирование analyze
+## Context pack, Allowed API Surface и Contract context
 
-Analyze должен логировать и возвращать в JSON:
+`codecollector` отвечает за структурный отбор project context, но не за generation prompt `codegenerator`.
 
-- количество project files и project symbols в search plan context;
-- размеры prompt по каждому LLM-этапу;
-- `max_prompt_chars` для этапа;
-- `trim_steps`;
-- количество recall candidates;
-- количество candidate cards;
-- `prompt_tokens`;
-- `output_tokens`;
-- `total_tokens`;
-- `duration_sec`;
-- итоговое `analysis_usage`.
+Context pack включает target/anchor, parent, class members, module outline, related tests, recommended tests, related production symbols, inbound/outbound relations, contract context, allowed API surface и reference artifacts.
 
-Если prompt превышает лимит, допустимо структурно уменьшать project map или candidate cards. Уменьшение должно быть отражено в `trim_steps`.
+`Allowed API Surface` строится консервативно:
 
----
+- `self.x` из `__init__` учитывается, если тип понятен;
+- методы dependency допускаются только если они видны в related symbols, graph index или source excerpts;
+- цепочки вроде `self.service.repository` допускаются только при видимом подтверждении;
+- неизвестные методы dependency не добавляются.
 
-## Сбор контекста и prompt для codegenerator
-
-`codecollector` отвечает за структурный отбор контекста, а не за низкоуровневое символьное сжатие prompt.
-
-Допустимые способы уменьшения контекста:
-
-- ограничить количество related tests;
-- ограничить количество reference artifacts;
-- не включать полный файл, если достаточно target symbol;
-- включать полный файл для `generate-test`, когда это нужно для импортов и проверки теста;
-- передавать ограниченный reference-контекст в `generate-test`, если он есть и разрешен конфигурацией.
-
-Не нужно удалять полезный контекст заранее без превышения разумного лимита.
-
-Если есть example test source, он может использоваться как fallback или дополнительная опора. Он не должен дублировать related tests и не должен доминировать над реальным контекстом проекта.
-
-Связность prompt важнее агрессивного уменьшения размера.
+`Contract context` — это фактический project context, а не reference artifact. Он нужен для сигнатур, import path, source excerpts, проверки обязательных аргументов и подсказок repair.
 
 ---
 
 ## Вызов codegenerator
 
-`codecollector` вызывает внешний `codegenerator` через файловый JSON request.
+`codecollector` вызывает внешний `codegenerator` через structured JSON request.
 
-Поддерживаются режимы:
+Поддерживаемые режимы внешнего генератора:
 
 - `generate`;
 - `generate-test`;
 - `repair`.
 
-При подготовке `repair` нужно сохранять исходную operation, включая `insert_after_symbol`, в `previous_artifact.operation`. Repair не должен превращать вставку нового symbol в замену anchor-symbol.
+Правила:
 
-Для `generate-test` с `insert_after_symbol` объектом тестирования считается сгенерированный symbol, а выбранный target остается anchor.
+- `codecollector` не должен генерировать production/test artifact самостоятельно.
+- Для `repair` нужно сохранять исходные `operation`, `insert_scope`, `parent_qualname` и previous artifact.
+- Для `generate-test` при `insert_after_symbol` объектом тестирования считается сгенерированный symbol, а выбранный target остается anchor/container.
+- `import_changes` применяются на стороне codecollector при staging patch.
 
 ---
 
-## Верификация
+## Verification и статусы
 
-Структурные проверки обязательны.
+Структурные проверки обязательны. Отчет должен быть понятен без чтения исходного кода.
 
-Отчет о verification должен быть понятен без чтения исходного кода. Ошибки production-кода и ошибки generated test должны различаться.
+Production checks включают AST/compile/runtime checks и `patch_static_semantics`.
+Generated test checks включают `generated_test_static_semantics`, `generated_test_relevance` и runtime failure, если ошибка относится только к generated test.
 
 Нужно различать статусы:
 
-- `verification_failed`;
-- `generated_test_verification_failed`.
+- `ready_for_merge_review` — результат готов к ручному review;
+- `verification_failed` — ошибка production-кода или основных проверок;
+- `generated_test_verification_failed` — production artifact может быть корректным, но generated test не прошел проверки;
+- `repair_verification_failed`;
+- `repair_no_effective_change`;
+- `failed`;
+- `needs_user_decision`;
+- `applied`;
+- `generated`;
+- `incomplete`.
 
-Это различие должно быть согласовано в:
-
-- `result_summary.status`;
-- `session.status`;
-- итоговом payload run;
-- `merge_plan.summary_lines`;
-- `apply_result.impact.notes`.
-
-Если после всех проверок и попытки `repair` падает только сгенерированный тест, результат должен явно отражать ошибку generated test. Production-код не должен описываться как некорректный, если проблема подтверждена только в generated test.
-
-Если `generate-test` завершился ошибкой и не вернул тестовый артефакт, это должно сохраняться в `generated_test_apply` и `warnings`. Такой случай не должен маскироваться под обычный `no_generated_tests`.
+Если падает только generated test, production-код не должен описываться как некорректный.
 
 ---
 
-## Генерация и блокировка недостаточных запросов
+## Блокировка generation
 
-Если analyze вернул `request_quality.status=insufficient`, session не готова к generation.
-
-`sessions generate` должен возвращать JSON с:
+Если analyze вернул `request_quality.status=insufficient`, `sessions generate` должен возвращать business-state JSON:
 
 - `generation_blocked=true`;
 - `block_reason=insufficient_request`;
@@ -179,76 +237,58 @@ Analyze должен логировать и возвращать в JSON:
 - `missing_information`;
 - `recommended_action=rewrite_request_and_run_analyze_again`.
 
-Pipeline не должен запускаться для такой session. UI может блокировать кнопку генерации по этому ответу.
+Pipeline не запускается для такой session.
 
 ---
 
-## Логирование pipeline
-
-В логах должно быть видно:
-
-- какой target или anchor выбран;
-- какая operation используется;
-- источник operation;
-- какие related tests переданы;
-- есть ли example test source;
-- использовался ли full file;
-- какие части контекста были урезаны;
-- какой итоговый размер request собран;
-- почему выбран конкретный режим контекста;
-- какие reference artifacts выбраны;
-- какие проверки были запущены;
-- какие generated tests применены или почему они не применены.
-
-Логирование должно помогать разбирать реальные ошибки генерации тестов и кода, а не только фиксировать факт вызова внешнего генератора.
-
----
-
-## Run artifacts
-
-Структура run artifacts должна оставаться устойчивой.
+## Run artifacts и диагностика
 
 В `.runs/` должны сохраняться:
 
-- request и result внешних вызовов;
-- stderr внешнего генератора;
+- generation/repair/test request и result;
+- stderr/stdout внешних вызовов;
 - итоговый `pipeline_run_*.json`;
-- usage и timing LLM-вызовов;
+- usage и timing;
 - verification report;
 - generated test diagnostics;
 - merge plan;
-- предупреждения и причины пропущенных этапов.
+- warnings и причины пропуска этапов.
 
-Run artifacts являются основным материалом для отладки и анализа качества pipeline.
+В логах должны быть видны:
+
+- выбранный target/anchor и его роль;
+- operation, insert_scope и источники выбора;
+- контекст и reference artifacts;
+- prompt sizes, token usage и trim steps;
+- command, cwd, duration и returncode subprocess;
+- verification issues;
+- причины repair и результат repair.
 
 ---
 
 ## Документация
 
-При обновлении документации по `codecollector` нужно соблюдать следующие правила:
+Документация проекта должна:
 
-- описывать только текущее состояние проекта;
-- писать по-русски;
-- не добавлять историю изменений между версиями;
+- описывать только текущее состояние as-is;
+- быть на русском языке;
+- не содержать changelog и истории инкрементов;
 - не ссылаться на предыдущие версии;
-- держать одну тему в одном месте;
-- сохранять значимые факты при реструктуризации;
-- оставлять только актуальные примеры;
-- явно описывать ограничения и открытые задачи, если они относятся к текущему состоянию;
-- описывать статусы `session` и `result_summary` консистентно и в одном месте для каждой сущности.
+- фиксировать фактический CLI/result contract;
+- оставаться понятной следующему разработчику или агенту.
 
-Документация не должна содержать рассуждения о возможных вариантах поведения. В ней фиксируется фактический текущий контракт.
+README обновляется, если меняется пользовательский workflow, CLI, JSON-контракт, структура artifacts, onboarding или конфигурация.
 
 ---
 
-## Что не нужно делать
+## Что не делать
 
 Не нужно:
 
-- усложнять prompt assembly ради одного кейса;
-- размазывать одну и ту же логику по нескольким классам без причины;
-- добавлять новые абстракции без текущей пользы;
-- добавлять скрытые специальные случаи для demo-проектов;
+- переносить обязанности `codeui` или `codegenerator` в `codecollector`;
+- использовать `select-target` как исправление недостаточного запроса;
 - подменять project context reference-контекстом;
-- использовать `select-target` как обходной путь для недостаточного запроса;
-- описывать production-код как некорректный, если упал только generated test.
+- добавлять demo-specific rules;
+- хранить лимиты и prompt-фрагменты в коде, если они должны быть настраиваемыми;
+- описывать production-код как некорректный, если ошибка относится только к generated test;
+- менять JSON-контракт без обновления интеграции и документации.

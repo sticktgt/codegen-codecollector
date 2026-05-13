@@ -86,13 +86,18 @@ class PGVectorDescriptionSearchService:
         ]
         store.add_documents(docs, ids=[item['doc_id'] for item in documents])
 
-    def _delete_existing_project_docs(self, project_key: str) -> None:
+    def _delete_existing_project_docs(self, project_key: str) -> int:
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 "DELETE FROM langchain_pg_embedding WHERE cmetadata->>'project_root' = %s",
                 (project_key,),
             )
+            deleted = int(cur.rowcount or 0)
             conn.commit()
+        return deleted
+
+    def delete_project_documents(self, project_key: str | None = None) -> int:
+        return self._delete_existing_project_docs(project_key or self.project_key)
 
     def search(self, query: str, limit: int = 10, project_key: str | None = None) -> dict[str, float]:
         project_key = project_key or self.project_key

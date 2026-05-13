@@ -1,0 +1,276 @@
+version: 1
+project:
+  title: Support App Demo
+  description: Демонстрационный Python-проект для поиска мест изменения, сборки context
+    pack и безопасного применения заранее подготовленных артефактов.
+modules:
+  support_app.__init__:
+    title: init
+    description: Модуль support_app.__init__.
+    layer: ''
+  support_app.api.__init__:
+    title: init
+    description: Модуль support_app.api.__init__.
+    layer: api
+  support_app.api.controllers:
+    title: Контроллеры demo API
+    description: Адаптируют входные запросы к сервисному слою и формируют ответы API-уровня.
+    layer: api
+  support_app.domain.__init__:
+    title: init
+    description: Модуль support_app.domain.__init__.
+    layer: domain
+  support_app.domain.models:
+    title: Модели предметной области
+    description: Хранит dataclass-модели тикета, краткой карточки и сводки по агенту.
+    layer: domain
+  support_app.services.__init__:
+    title: init
+    description: Модуль support_app.services.__init__.
+    layer: services
+  support_app.services.notification_service:
+    title: Уведомления о назначении
+    description: Формирует текстовые сообщения после назначения тикета агенту.
+    layer: services
+  support_app.services.report_service:
+    title: Отчетные функции
+    description: Строит сводки и проекции по списку тикетов.
+    layer: services
+  support_app.services.ticket_service:
+    title: Сервис работы с тикетами
+    description: Создает, назначает и закрывает тикеты, используя репозиторий и уведомления.
+    layer: services
+  support_app.storage.__init__:
+    title: init
+    description: Модуль support_app.storage.__init__.
+    layer: storage
+  support_app.storage.ticket_repository:
+    title: Репозиторий тикетов
+    description: Хранит тикеты в памяти и предоставляет операции выборки.
+    layer: storage
+  tests.test_report_service:
+    title: test report service
+    description: Модуль tests.test_report_service.
+    layer: ''
+  tests.test_ticket_service:
+    title: test ticket service
+    description: Модуль tests.test_ticket_service.
+    layer: ''
+symbols:
+  support_app.api.controllers.TicketController:
+    title: TicketController
+    description: Адаптирует внешние payload-запросы к сервисному слою demo-приложения.
+    keywords:
+    - TicketController
+  support_app.api.controllers.TicketController.__init__:
+    title: Init
+    description: Метод support_app.api.controllers.TicketController.__init__.
+    keywords:
+    - init
+    - TicketController
+  support_app.api.controllers.TicketController.agent_summary_endpoint:
+    title: Agent summary endpoint
+    description: Возвращает краткую сводку по открытым тикетам выбранного агента.
+    keywords:
+    - agent summary endpoint
+    - TicketController
+  support_app.api.controllers.TicketController.assign_ticket_endpoint:
+    title: API-обработчик назначения тикета
+    description: Принимает команду назначения тикета и возвращает ответ API-уровня.
+    keywords:
+    - endpoint назначения
+    - api назначения тикета
+    requirements:
+    - REQ-DEMO-001
+  support_app.api.controllers.TicketController.create_ticket_endpoint:
+    title: Create ticket endpoint
+    description: Создает тикет из входного payload и делегирует сохранение сервису.
+    keywords:
+    - create ticket endpoint
+    - TicketController
+  support_app.domain.models.AgentSummary:
+    title: AgentSummary
+    description: Сводка по количеству открытых и срочных тикетов агента.
+    keywords:
+    - AgentSummary
+  support_app.domain.models.Ticket:
+    title: Ticket
+    description: Полное представление тикета службы поддержки.
+    keywords:
+    - Ticket
+  support_app.domain.models.TicketSummary:
+    title: TicketSummary
+    description: Короткая карточка тикета для списков и компактных ответов.
+    keywords:
+    - TicketSummary
+  support_app.services.notification_service.build_assignment_message:
+    title: Текст уведомления о назначении
+    description: Формирует короткий текст уведомления после назначения тикета агенту.
+    keywords:
+    - уведомление
+    - сообщение о назначении
+    - assignment message
+    requirements:
+    - REQ-DEMO-001
+  support_app.services.report_service.build_agent_summary:
+    title: Сводка по агенту
+    description: Формирует краткую сводку по открытым тикетам агента с учетом срочных
+      тикетов.
+    keywords:
+    - сводка по агенту
+    - отчет по агенту
+    - summary агента
+    requirements:
+    - REQ-DEMO-002
+  support_app.services.report_service.build_priority_label:
+    title: Русскоязычная метка приоритета
+    description: Преобразует системное значение приоритета тикета в человекочитаемую
+      русскоязычную метку для UI и отчетов.
+    keywords:
+    - приоритет тикета
+    - русская метка приоритета
+    - label priority
+    requirements:
+    - REQ-DEMO-003
+  support_app.services.report_service.count_open_by_priority:
+    title: Count open by priority
+    description: Функция support_app.services.report_service.count_open_by_priority.
+    keywords:
+    - count open by priority
+  support_app.services.report_service.to_ticket_summaries:
+    title: To ticket summaries
+    description: Функция support_app.services.report_service.to_ticket_summaries.
+    keywords:
+    - to ticket summaries
+  support_app.services.ticket_service.TicketService:
+    title: TicketService
+    description: Инкапсулирует основную бизнес-логику работы с тикетами.
+    keywords:
+    - TicketService
+  support_app.services.ticket_service.TicketService.__init__:
+    title: Init
+    description: Метод support_app.services.ticket_service.TicketService.__init__.
+    keywords:
+    - init
+    - TicketService
+  support_app.services.ticket_service.TicketService.assign_ticket:
+    title: Назначение тикета агенту
+    description: Назначает тикет выбранному агенту, сохраняет изменения в репозитории
+      и формирует уведомление.
+    keywords:
+    - назначение тикета
+    - назначить тикет агенту
+    - уведомление о назначении
+    requirements:
+    - REQ-DEMO-001
+  support_app.services.ticket_service.TicketService.close_ticket:
+    title: Close ticket
+    description: Переводит тикет в состояние `closed` и возвращает обновленный объект.
+    keywords:
+    - close ticket
+    - TicketService
+  support_app.services.ticket_service.TicketService.create_ticket:
+    title: Create ticket
+    description: Сохраняет новый тикет в репозитории и возвращает сохраненный объект.
+    keywords:
+    - create ticket
+    - TicketService
+  support_app.services.ticket_service.TicketService.list_open_tickets:
+    title: List open tickets
+    description: Возвращает краткие карточки только для открытых тикетов.
+    keywords:
+    - list open tickets
+    - TicketService
+  support_app.storage.ticket_repository.TicketRepository:
+    title: TicketRepository
+    description: Хранит тикеты в памяти и предоставляет базовые операции выборки.
+    keywords:
+    - TicketRepository
+  support_app.storage.ticket_repository.TicketRepository.__init__:
+    title: Init
+    description: Метод support_app.storage.ticket_repository.TicketRepository.__init__.
+    keywords:
+    - init
+    - TicketRepository
+  support_app.storage.ticket_repository.TicketRepository.get:
+    title: Get
+    description: Возвращает тикет по идентификатору или `None`, если он не найден.
+    keywords:
+    - get
+    - TicketRepository
+  support_app.storage.ticket_repository.TicketRepository.list_all:
+    title: List all
+    description: Возвращает все тикеты, которые сейчас хранятся в репозитории.
+    keywords:
+    - list all
+    - TicketRepository
+  support_app.storage.ticket_repository.TicketRepository.list_by_agent:
+    title: List by agent
+    description: Возвращает тикеты, назначенные указанному агенту.
+    keywords:
+    - list by agent
+    - TicketRepository
+  support_app.storage.ticket_repository.TicketRepository.save:
+    title: Save
+    description: Сохраняет тикет по его идентификатору и возвращает сохраненный объект.
+    keywords:
+    - save
+    - TicketRepository
+  tests.test_report_service.test_build_agent_summary_counts_only_open_assigned:
+    title: Test build agent summary counts only open assigned
+    description: Функция tests.test_report_service.test_build_agent_summary_counts_only_open_assigned.
+    keywords:
+    - test build agent summary counts only open assigned
+  tests.test_report_service.test_count_open_by_priority_only_counts_open:
+    title: Test count open by priority only counts open
+    description: Функция tests.test_report_service.test_count_open_by_priority_only_counts_open.
+    keywords:
+    - test count open by priority only counts open
+  tests.test_ticket_service.test_assign_ticket_returns_message:
+    title: Test assign ticket returns message
+    description: Функция tests.test_ticket_service.test_assign_ticket_returns_message.
+    keywords:
+    - test assign ticket returns message
+  tests.test_ticket_service.test_list_open_tickets_filters_closed_items:
+    title: Test list open tickets filters closed items
+    description: Функция tests.test_ticket_service.test_list_open_tickets_filters_closed_items.
+    keywords:
+    - test list open tickets filters closed items
+requirements:
+  REQ-DEMO-001:
+    title: Назначение тикета агенту
+    description: Пользователь должен иметь возможность назначить тикет агенту и получить
+      уведомление о назначении.
+    linked_symbols:
+    - support_app.services.ticket_service.TicketService.assign_ticket
+    - support_app.services.notification_service.build_assignment_message
+    - support_app.api.controllers.TicketController.assign_ticket_endpoint
+  REQ-DEMO-003:
+    title: Человекочитаемая метка приоритета
+    description: Система должна уметь показывать русскоязычную метку приоритета тикета
+      для UI и отчетных представлений.
+    linked_symbols:
+    - support_app.services.report_service.build_priority_label
+  REQ-DEMO-002:
+    title: Получение краткой сводки по агенту
+    description: Пользователь должен иметь возможность получить краткую сводку по
+      открытым тикетам выбранного агента.
+    linked_symbols:
+    - support_app.services.report_service.build_agent_summary
+    - support_app.api.controllers.TicketController.agent_summary_endpoint
+architecture:
+  layers:
+    api:
+    - support_app.api.__init__
+    - support_app.api.controllers
+    services:
+    - support_app.services.__init__
+    - support_app.services.notification_service
+    - support_app.services.report_service
+    - support_app.services.ticket_service
+    storage:
+    - support_app.storage.__init__
+    - support_app.storage.ticket_repository
+    domain:
+    - support_app.domain.__init__
+    - support_app.domain.models

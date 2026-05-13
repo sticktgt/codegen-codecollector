@@ -20,6 +20,72 @@ def _json_size(payload: dict[str, Any]) -> int:
     return len(json.dumps(payload, ensure_ascii=False))
 
 
+
+
+def _truncate_source(value: str, limit: int) -> tuple[str, bool]:
+    if limit <= 0 or len(value) <= limit:
+        return value, False
+    suffix = f"\n# ... truncated, original_chars={len(value)}"
+    keep = max(0, limit - len(suffix))
+    return value[:keep] + suffix, True
+
+
+def _select_related_symbols(
+    context_pack: ContextPack,
+    *,
+    limit: int,
+    source_chars: int,
+) -> tuple[list[dict[str, Any]], int]:
+    selected: list[dict[str, Any]] = []
+    total_chars = 0
+
+    confidence_rank = {'high': 0, 'medium': 1, 'low': 2}
+    direction_rank = {'outbound': 0, 'inbound': 1}
+    relation_rank = {
+        'calls': 0,
+        'exposed_by_controller': 1,
+        'imports': 2,
+        'belongs_to_layer': 3,
+    }
+
+    related_symbols = sorted(
+        list(context_pack.related_symbols or []),
+        key=lambda item: (
+            confidence_rank.get(str(item.relation_confidence), 9),
+            direction_rank.get(str(item.relation_direction), 9),
+            relation_rank.get(str(item.relation_kind), 9),
+            item.file_path,
+            item.origin_qualname,
+            item.qualname,
+        ),
+    )
+
+    for item in related_symbols[:max(0, limit)]:
+        source_excerpt, truncated = _truncate_source(str(item.source_code or ''), source_chars)
+        payload = {
+            'qualname': item.qualname,
+            'file_path': item.file_path,
+            'module_name': item.module_name,
+            'name': item.name,
+            'kind': item.kind,
+            'parent_qualname': item.parent_qualname,
+            'role': item.role,
+            'origin_qualname': item.origin_qualname,
+            'relation_kind': item.relation_kind,
+            'relation_direction': item.relation_direction,
+            'relation_source': item.relation_source,
+            'relation_confidence': item.relation_confidence,
+            'signature': item.signature,
+            'docstring': item.docstring,
+            'source_excerpt': source_excerpt,
+            'truncated': truncated,
+        }
+        selected.append(payload)
+        total_chars += len(source_excerpt)
+
+    return selected, total_chars
+
+
 def _select_related_tests(context_pack: ContextPack, limit: int = 1) -> tuple[list[dict[str, Any]], int]:
     selected: list[dict[str, Any]] = []
     total_chars = 0
@@ -44,6 +110,451 @@ def _select_related_tests(context_pack: ContextPack, limit: int = 1) -> tuple[li
     return selected, total_chars
 
 
+
+def _request_indicates_new_dataclass_or_class(change_request: ChangeRequest) -> bool:
+    text = ' '.join(
+        [
+            change_request.title or '',
+            change_request.description or '',
+            *[str(item) for item in (change_request.constraints or [])],
+        ]
+    ).casefold()
+    if 'dataclass' in text or 'data class' in text:
+        return True
+    return ('класс' in text or 'модел' in text) and ('адрес' in text or 'address' in text)
+
+
+def _module_parent_qualname_for_insert_anchor(target: SymbolRecord) -> str:
+    if target.kind == 'module':
+        return target.qualname
+    return str(target.parent_qualname or target.module_name or '')
+
+
+def _normalize_insert_target_metadata(
+    *,
+    change_request: ChangeRequest,
+    target: SymbolRecord,
+    operation: str,
+    insert_scope: str | None,
+) -> tuple[str | None, str, str]:
+    normalized_insert_scope = str(insert_scope or '').strip() or None
+    parent_qualname = ''
+    expected_new_symbol_kind = ''
+
+    if operation != 'insert_after_symbol':
+        return normalized_insert_scope, parent_qualname, expected_new_symbol_kind
+
+    request_wants_new_class = _request_indicates_new_dataclass_or_class(change_request)
+    if normalized_insert_scope == 'class_body' and request_wants_new_class:
+        LOGGER.info(
+            'Normalizing insert metadata for new class/dataclass: target=%s target_kind=%s insert_scope=class_body -> module_body',
+            target.qualname,
+            target.kind,
+        )
+        normalized_insert_scope = 'module_body'
+
+    if normalized_insert_scope == 'class_body':
+        if target.kind == 'method':
+            parent_qualname = str(target.parent_qualname or '')
+        elif target.kind == 'class':
+            parent_qualname = target.qualname
+        expected_new_symbol_kind = 'method'
+    elif normalized_insert_scope == 'module_body':
+        parent_qualname = _module_parent_qualname_for_insert_anchor(target)
+        expected_new_symbol_kind = 'class' if request_wants_new_class else 'function'
+
+    return normalized_insert_scope, parent_qualname, expected_new_symbol_kind
+
+def _same_file_module_source(context_pack: ContextPack) -> str:
+    target = context_pack.target
+    for item in [target, *context_pack.neighbors]:
+        if item.file_path == target.file_path and item.kind == 'module' and item.source_code:
+            return item.source_code
+    return ''
+
+
+def _build_parent_context_payload(
+    context_pack: ContextPack,
+    *,
+    parent_qualname: str,
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    if not parent_qualname:
+        return None, []
+
+    target = context_pack.target
+    parent_symbol = next(
+        (item for item in [target, *context_pack.neighbors] if item.qualname == parent_qualname),
+        None,
+    )
+    parent_symbol_payload = None
+    if parent_symbol is not None:
+        parent_symbol_payload = {
+            'qualname': parent_symbol.qualname,
+            'name': parent_symbol.name,
+            'kind': parent_symbol.kind,
+            'docstring': parent_symbol.docstring,
+            'source': parent_symbol.source_code,
+        }
+
+    class_members: list[dict[str, Any]] = []
+    for item in [target, *context_pack.neighbors]:
+        if item.parent_qualname == parent_qualname and item.kind == 'method':
+            first_line = (item.source_code or '').strip().splitlines()[0] if item.source_code else item.name
+            class_members.append({
+                'qualname': item.qualname,
+                'name': item.name,
+                'kind': item.kind,
+                'signature': first_line.strip(),
+                'docstring': item.docstring,
+            })
+
+    return parent_symbol_payload, class_members
+
+
+def _allowed_api_surface_from_previous_request(previous_generation_request: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(previous_generation_request, dict):
+        return None
+    project_context = previous_generation_request.get('project_context')
+    if not isinstance(project_context, dict):
+        return None
+    allowed_api_surface = project_context.get('allowed_api_surface')
+    if not isinstance(allowed_api_surface, dict):
+        return None
+    if not allowed_api_surface.get('dependencies') and not allowed_api_surface.get('free_functions'):
+        return None
+    return allowed_api_surface
+
+
+def _annotation_base_name(annotation: Any) -> str:
+    name = _annotation_name_for_allowed_surface(annotation)
+    return str(name or '').rsplit('.', 1)[-1]
+
+
+def _annotation_item_type_name(annotation: Any) -> str:
+    import ast
+
+    if isinstance(annotation, ast.Subscript):
+        value_name = _annotation_base_name(annotation.value)
+        if value_name in {'list', 'List', 'Sequence', 'Iterable', 'set', 'Set', 'tuple', 'Tuple'}:
+            slice_node = annotation.slice
+            if isinstance(slice_node, ast.Tuple) and slice_node.elts:
+                slice_node = slice_node.elts[0]
+            return _annotation_base_name(slice_node)
+    return ''
+
+
+def _literal_default_for_requirement(node: Any) -> str:
+    import ast
+
+    if node is None:
+        return ''
+    try:
+        return ast.unparse(node)
+    except Exception:
+        return ''
+
+
+def _class_field_info_from_source(source: str) -> dict[str, Any]:
+    import ast
+
+    tree = _parse_python_tree_for_allowed_surface(source)
+    if tree is None:
+        return {}
+
+    class_node = next((node for node in getattr(tree, 'body', []) if isinstance(node, ast.ClassDef)), None)
+    if class_node is None:
+        return {}
+
+    fields: dict[str, dict[str, Any]] = {}
+    for child in class_node.body:
+        if isinstance(child, ast.AnnAssign) and isinstance(child.target, ast.Name):
+            name = child.target.id
+            fields[name] = {
+                'name': name,
+                'annotation': _annotation_name_for_allowed_surface(child.annotation),
+                'has_default': child.value is not None,
+                'default': _literal_default_for_requirement(child.value),
+            }
+        elif isinstance(child, ast.Assign):
+            for target in child.targets:
+                if isinstance(target, ast.Name):
+                    name = target.id
+                    fields.setdefault(name, {
+                        'name': name,
+                        'annotation': '',
+                        'has_default': True,
+                        'default': _literal_default_for_requirement(child.value),
+                    })
+
+    init_node = next(
+        (
+            child
+            for child in class_node.body
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child.name == '__init__'
+        ),
+        None,
+    )
+    init_args: list[dict[str, Any]] = []
+    if init_node is not None:
+        positional = [arg for arg in [*init_node.args.posonlyargs, *init_node.args.args] if arg.arg != 'self']
+        defaults = list(init_node.args.defaults or [])
+        defaults_by_arg: dict[str, Any] = {}
+        if defaults:
+            for arg, default in zip(positional[-len(defaults):], defaults):
+                defaults_by_arg[arg.arg] = default
+        for arg in [*positional, *init_node.args.kwonlyargs]:
+            has_default = arg.arg in defaults_by_arg
+            default_node = defaults_by_arg.get(arg.arg)
+            init_args.append({
+                'name': arg.arg,
+                'annotation': _annotation_name_for_allowed_surface(arg.annotation),
+                'has_default': has_default,
+                'default': _literal_default_for_requirement(default_node),
+            })
+
+    constructor_fields = init_args if init_args else list(fields.values())
+    return {
+        'class_name': class_node.name,
+        'fields': list(fields.values()),
+        'field_names': sorted(fields),
+        'constructor_fields': constructor_fields,
+        'constructor_field_names': [item['name'] for item in constructor_fields if item.get('name')],
+        'required_constructor_fields': [
+            item['name']
+            for item in constructor_fields
+            if item.get('name') and not item.get('has_default')
+        ],
+    }
+
+
+def _build_contract_attribute_requirements(related_symbols: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Infer fields read by production contracts from visible source excerpts.
+
+    This is intentionally conservative: if we cannot connect a collection item
+    variable to a visible item type and class/model source, we do not emit a
+    requirement instead of guessing.
+    """
+    import ast
+
+    symbols = [dict(item) for item in related_symbols if isinstance(item, dict)]
+    class_info_by_name: dict[str, dict[str, Any]] = {}
+    class_qualname_by_name: dict[str, str] = {}
+    for item in symbols:
+        if str(item.get('kind') or '') != 'class':
+            continue
+        source = str(item.get('source_excerpt') or item.get('source_code') or item.get('source') or '')
+        info = _class_field_info_from_source(source)
+        class_name = str(info.get('class_name') or item.get('name') or item.get('qualname', '').rsplit('.', 1)[-1])
+        if not class_name or not info.get('field_names'):
+            continue
+        class_info_by_name[class_name] = info
+        class_qualname_by_name[class_name] = str(item.get('qualname') or '')
+
+    requirements: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    for item in symbols:
+        if str(item.get('kind') or '') not in {'function', 'method'}:
+            continue
+        source = str(item.get('source_excerpt') or item.get('source_code') or item.get('source') or '')
+        if not source:
+            continue
+        tree = _parse_python_tree_for_allowed_surface(source)
+        if tree is None:
+            continue
+        fn = next((node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))), None)
+        if fn is None:
+            continue
+
+        collection_param_items: dict[str, str] = {}
+        object_param_types: dict[str, str] = {}
+        for arg in [*fn.args.posonlyargs, *fn.args.args, *fn.args.kwonlyargs]:
+            if arg.arg == 'self':
+                continue
+            item_type = _annotation_item_type_name(arg.annotation)
+            if item_type:
+                collection_param_items[arg.arg] = item_type
+            else:
+                type_name = _annotation_base_name(arg.annotation)
+                if type_name:
+                    object_param_types[arg.arg] = type_name
+
+        var_bindings: dict[str, dict[str, str]] = {}
+        for param_name, type_name in object_param_types.items():
+            if type_name in class_info_by_name:
+                var_bindings[param_name] = {'parameter': param_name, 'item_type': type_name}
+
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.For, ast.AsyncFor)) and isinstance(node.target, ast.Name) and isinstance(node.iter, ast.Name):
+                item_type = collection_param_items.get(node.iter.id)
+                if item_type in class_info_by_name:
+                    var_bindings[node.target.id] = {'parameter': node.iter.id, 'item_type': item_type}
+            elif isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+                for generator in node.generators:
+                    if isinstance(generator.target, ast.Name) and isinstance(generator.iter, ast.Name):
+                        item_type = collection_param_items.get(generator.iter.id)
+                        if item_type in class_info_by_name:
+                            var_bindings[generator.target.id] = {'parameter': generator.iter.id, 'item_type': item_type}
+
+        fields_by_key: dict[tuple[str, str], set[str]] = {}
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Attribute) or not isinstance(node.value, ast.Name):
+                continue
+            binding = var_bindings.get(node.value.id)
+            if not binding:
+                continue
+            field_name = str(node.attr or '').strip()
+            if not field_name or field_name.startswith('_'):
+                continue
+            fields_by_key.setdefault((binding['parameter'], binding['item_type']), set()).add(field_name)
+
+        for (parameter, item_type), fields in sorted(fields_by_key.items()):
+            info = class_info_by_name.get(item_type) or {}
+            known_fields = set(info.get('field_names') or [])
+            required_fields = sorted(field for field in fields if not known_fields or field in known_fields)
+            if not required_fields:
+                continue
+            key = (str(item.get('qualname') or ''), parameter, item_type)
+            if key in seen:
+                continue
+            seen.add(key)
+            requirements.append({
+                'contract_qualname': str(item.get('qualname') or ''),
+                'contract_name': str(item.get('name') or ''),
+                'parameter': parameter,
+                'item_type': item_type,
+                'item_qualname': class_qualname_by_name.get(item_type, ''),
+                'required_fields': required_fields,
+                'model_fields': list(info.get('field_names') or []),
+                'constructor_fields': list(info.get('constructor_field_names') or []),
+                'required_constructor_fields': list(info.get('required_constructor_fields') or []),
+                'source': 'contract_source_attribute_reads',
+            })
+
+    return requirements
+
+
+
+def _has_required_contract_reuse_signal(change_request: ChangeRequest) -> bool:
+    text = " ".join([
+        str(change_request.title or ""),
+        str(change_request.description or ""),
+        " ".join(str(item) for item in (change_request.constraints or [])),
+        " ".join(str(item) for item in (change_request.notes or [])),
+    ]).casefold()
+    if not text.strip():
+        return False
+    reuse_markers = (
+        "использ",
+        "переиспольз",
+        "reuse",
+        "use existing",
+        "existing",
+    )
+    existing_contract_markers = (
+        "существ",
+        "сервис",
+        "service",
+        "контракт",
+        "contract",
+        "функц",
+        "helper",
+    )
+    avoid_duplicate_markers = (
+        "не дублир",
+        "не копир",
+        "не повтор",
+        "do not duplicate",
+        "without duplicating",
+    )
+    return (
+        any(marker in text for marker in reuse_markers)
+        and any(marker in text for marker in existing_contract_markers)
+    ) or any(marker in text for marker in avoid_duplicate_markers)
+
+
+def _request_contract_topic_tokens(change_request: ChangeRequest) -> set[str]:
+    text = " ".join([
+        str(change_request.title or ""),
+        str(change_request.description or ""),
+        " ".join(str(item) for item in (change_request.constraints or [])),
+        " ".join(str(item) for item in (change_request.notes or [])),
+    ]).casefold()
+    tokens: set[str] = set()
+    if any(item in text for item in ("стат", "summary", "summar", "свод", "отчет", "отчёт", "report")):
+        tokens.update({"stat", "stats", "statistics", "summary", "summar", "report"})
+    if any(item in text for item in ("тикет", "ticket")):
+        tokens.add("ticket")
+    return tokens
+
+
+def _contract_matches_request_topic(contract: dict[str, Any], topic_tokens: set[str]) -> bool:
+    if not topic_tokens:
+        return True
+    haystack = " ".join(
+        str(contract.get(key) or "")
+        for key in ("name", "qualname", "signature", "origin_qualname")
+    ).casefold()
+    return any(token in haystack for token in topic_tokens)
+
+
+def _build_required_contracts(
+    *,
+    change_request: ChangeRequest,
+    allowed_api_surface: dict[str, Any],
+    related_symbols: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Infer production contracts that generated code must call.
+
+    This is intentionally conservative. It only emits requirements when the
+    user explicitly asks to reuse an existing service/contract or avoid
+    duplicated business logic, and when a visible free production function is
+    available in the allowed API surface. Dependency methods are not made
+    mandatory here because they are often plumbing calls rather than the
+    business contract requested by the user.
+    """
+    if not _has_required_contract_reuse_signal(change_request):
+        return []
+
+    topic_tokens = _request_contract_topic_tokens(change_request)
+    free_functions = [
+        dict(item)
+        for item in (allowed_api_surface.get('free_functions') or [])
+        if isinstance(item, dict) and str(item.get('name') or item.get('qualname') or '').strip()
+    ]
+    if not free_functions:
+        return []
+
+    selected = [item for item in free_functions if _contract_matches_request_topic(item, topic_tokens)]
+    if not selected and len(free_functions) == 1:
+        selected = free_functions
+    if not selected:
+        return []
+
+    related_by_qualname = {str(item.get('qualname') or ''): item for item in related_symbols if isinstance(item, dict)}
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in selected:
+        qualname = str(item.get('qualname') or '').strip()
+        name = str(item.get('name') or qualname.rsplit('.', 1)[-1]).strip()
+        if not qualname and not name:
+            continue
+        key = qualname or name
+        if key in seen:
+            continue
+        seen.add(key)
+        related = related_by_qualname.get(qualname, {}) if qualname else {}
+        result.append({
+            'qualname': qualname,
+            'name': name,
+            'signature': str(item.get('signature') or related.get('signature') or ''),
+            'reason': 'user_requested_existing_contract_reuse',
+            'source': 'allowed_api_surface.free_functions',
+            'origin_qualname': str(item.get('origin_qualname') or ''),
+        })
+    return result
+
+
 @dataclass(slots=True)
 class CodeGeneratorCallResult:
     request_path: str
@@ -54,6 +565,257 @@ class CodeGeneratorCallResult:
     trace_path: str | None = None
     stdout_path: str | None = None
     stderr_path: str | None = None
+
+
+
+
+
+def _parse_python_tree_for_allowed_surface(source: str) -> Any | None:
+    import ast
+
+    try:
+        return ast.parse(source or "")
+    except SyntaxError:
+        return None
+
+
+def _annotation_name_for_allowed_surface(annotation: Any) -> str:
+    import ast
+
+    if annotation is None:
+        return ""
+    if isinstance(annotation, ast.Name):
+        return annotation.id
+    if isinstance(annotation, ast.Attribute):
+        parts = [annotation.attr]
+        value = annotation.value
+        while isinstance(value, ast.Attribute):
+            parts.append(value.attr)
+            value = value.value
+        if isinstance(value, ast.Name):
+            parts.append(value.id)
+        return ".".join(reversed(parts))
+    if isinstance(annotation, ast.Subscript):
+        return _annotation_name_for_allowed_surface(annotation.value)
+    if isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
+        return annotation.value
+    try:
+        return ast.unparse(annotation)
+    except Exception:
+        return ""
+
+
+def _self_attribute_types_from_source(source: str) -> dict[str, str]:
+    import ast
+
+    tree = _parse_python_tree_for_allowed_surface(source)
+    if tree is None:
+        return {}
+
+    result: dict[str, str] = {}
+    for class_node in getattr(tree, "body", []):
+        if not isinstance(class_node, ast.ClassDef):
+            continue
+
+        init_node = next(
+            (
+                child
+                for child in class_node.body
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and child.name == "__init__"
+            ),
+            None,
+        )
+        if init_node is None:
+            continue
+
+        arg_types = {
+            arg.arg: _annotation_name_for_allowed_surface(arg.annotation).rsplit(".", 1)[-1]
+            for arg in [
+                *init_node.args.posonlyargs,
+                *init_node.args.args,
+                *init_node.args.kwonlyargs,
+            ]
+            if arg.arg != "self"
+        }
+
+        for node in ast.walk(init_node):
+            if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Name):
+                continue
+            type_name = arg_types.get(node.value.id, "")
+            if not type_name:
+                continue
+            for target in node.targets:
+                if (
+                    isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == "self"
+                ):
+                    result[target.attr] = type_name
+
+    return result
+
+
+def _call_display_name_for_allowed_surface(func: Any) -> str:
+    import ast
+
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        parts = [func.attr]
+        value = func.value
+        while isinstance(value, ast.Attribute):
+            parts.append(value.attr)
+            value = value.value
+        if isinstance(value, ast.Name):
+            parts.append(value.id)
+        return ".".join(reversed(parts))
+    return ""
+
+
+def _visible_call_paths_from_sources(sources: list[str]) -> list[dict[str, str]]:
+    import ast
+
+    calls: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    for source in sources:
+        tree = _parse_python_tree_for_allowed_surface(source)
+        if tree is None:
+            continue
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+
+            display = _call_display_name_for_allowed_surface(node.func)
+            if not display or not display.startswith("self."):
+                continue
+
+            parts = display.split(".")
+            if len(parts) < 3:
+                continue
+
+            access_path = ".".join(parts[:-1])
+            method_name = parts[-1]
+            key = (access_path, method_name)
+            if key in seen:
+                continue
+
+            seen.add(key)
+            calls.append(
+                {
+                    "access_path": access_path,
+                    "method": method_name,
+                    "example": display,
+                    "line": str(getattr(node, "lineno", "")),
+                }
+            )
+
+    return calls
+
+
+def _allowed_method_payload(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "name": str(item.get("name") or "").strip(),
+        "qualname": str(item.get("qualname") or "").strip(),
+        "signature": str(item.get("signature") or "").strip(),
+        "file_path": str(item.get("file_path") or "").strip(),
+        "origin_qualname": str(item.get("origin_qualname") or "").strip(),
+        "relation": "/".join(
+            part
+            for part in [
+                str(item.get("relation_direction") or "").strip(),
+                str(item.get("relation_kind") or "").strip(),
+                str(item.get("relation_confidence") or "").strip(),
+            ]
+            if part
+        ),
+    }
+
+
+def _build_allowed_api_surface(
+    *,
+    target_source: str,
+    parent_source: str,
+    neighbor_sources: list[str],
+    related_symbols: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Build conservative allowed API surface from visible context only.
+
+    Rules:
+    - self.<attr> dependencies are included only when the type is visible in __init__ annotations.
+    - methods are included only when visible in related_symbols.
+    - nested paths such as self.service.repository are included only when such calls already appear
+      in visible source snippets.
+    - no guessing.
+    """
+    sources = [source for source in [target_source, parent_source, *neighbor_sources] if source]
+
+    self_attr_types: dict[str, str] = {}
+    for source in sources:
+        self_attr_types.update(_self_attribute_types_from_source(source))
+
+    methods_by_type: dict[str, list[dict[str, Any]]] = {}
+    free_functions: list[dict[str, Any]] = []
+
+    for raw_item in related_symbols:
+        item = dict(raw_item)
+        kind = str(item.get("kind") or "").strip()
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+
+        if kind == "method":
+            parent_type = str(item.get("parent_qualname") or "").rsplit(".", 1)[-1]
+            if parent_type:
+                methods_by_type.setdefault(parent_type, []).append(_allowed_method_payload(item))
+        elif kind == "function":
+            free_functions.append(_allowed_method_payload(item))
+
+    dependency_by_path: dict[str, dict[str, Any]] = {}
+
+    for attr_name, type_name in self_attr_types.items():
+        allowed_methods = methods_by_type.get(type_name, [])
+        if allowed_methods:
+            dependency_by_path[f"self.{attr_name}"] = {
+                "access_path": f"self.{attr_name}",
+                "type_name": type_name,
+                "source": "target_or_parent_init",
+                "allowed_methods": allowed_methods,
+                "origin_examples": [],
+            }
+
+    visible_calls = _visible_call_paths_from_sources(sources)
+    for call in visible_calls:
+        access_path = call["access_path"]
+        method_name = call["method"]
+
+        if access_path in dependency_by_path:
+            dependency_by_path[access_path]["origin_examples"].append(call)
+            continue
+
+        owner_types = [
+            type_name
+            for type_name, methods in methods_by_type.items()
+            if any(method.get("name") == method_name for method in methods)
+        ]
+        if len(owner_types) != 1:
+            continue
+
+        owner_type = owner_types[0]
+        dependency_by_path[access_path] = {
+            "access_path": access_path,
+            "type_name": owner_type,
+            "source": "visible_call_path",
+            "allowed_methods": methods_by_type.get(owner_type, []),
+            "origin_examples": [call],
+        }
+
+    return {
+        "dependencies": list(dependency_by_path.values()),
+        "free_functions": free_functions,
+    }
 
 
 
@@ -84,6 +846,8 @@ def build_generation_request(
 
     related_tests: list[dict[str, Any]] = []
     related_test_chars = 0
+    related_symbols: list[dict[str, Any]] = []
+    related_symbol_chars = 0
     reference_artifacts: list[dict[str, Any]] = []
     reference_chars = 0
 
@@ -91,6 +855,16 @@ def build_generation_request(
         'generate': config.codegenerator_generate_related_tests_max_items,
         'generate_test': config.codegenerator_generate_test_related_tests_max_items,
         'repair': config.codegenerator_repair_related_tests_max_items,
+    }
+    related_symbol_limits = {
+        'generate': config.codegenerator_generate_related_symbols_max_items,
+        'generate_test': config.codegenerator_generate_test_related_symbols_max_items,
+        'repair': config.codegenerator_repair_related_symbols_max_items,
+    }
+    related_symbol_char_limits = {
+        'generate': config.codegenerator_generate_related_symbol_chars,
+        'generate_test': config.codegenerator_generate_test_related_symbol_chars,
+        'repair': config.codegenerator_repair_related_symbol_chars,
     }
     reference_limits = {
         'generate': config.codegenerator_generate_reference_max_items,
@@ -104,6 +878,21 @@ def build_generation_request(
             context_pack,
             limit=related_test_limit,
         )
+
+    related_symbol_limit = max(0, int(related_symbol_limits.get(mode, 0) or 0))
+    related_symbol_char_limit = max(0, int(related_symbol_char_limits.get(mode, 0) or 0))
+    if related_symbol_limit > 0 and related_symbol_char_limit > 0:
+        related_symbols, related_symbol_chars = _select_related_symbols(
+            context_pack,
+            limit=related_symbol_limit,
+            source_chars=related_symbol_char_limit,
+        )
+
+    all_related_symbols, _all_related_symbol_chars = _select_related_symbols(
+        context_pack,
+        limit=len(context_pack.related_symbols or []),
+        source_chars=related_symbol_char_limit or 700,
+    )
 
     selected_reference_items = list(context_pack.reference_artifacts[:max(0, int(reference_limits.get(mode, 0) or 0))])
     LOGGER.info(
@@ -156,32 +945,30 @@ def build_generation_request(
         LOGGER.info('No reference artifacts selected for request payload')
     if not related_tests:
         LOGGER.info('No related tests selected for request payload')
+    if not related_symbols:
+        LOGGER.info('No related production symbols selected for request payload')
 
-    estimated_context_chars = len(target_source) + related_test_chars + reference_chars + len(full_file_source)
+    estimated_context_chars = len(target_source) + related_test_chars + related_symbol_chars + reference_chars + len(full_file_source)
     LOGGER.info(
-        'Context assembly mode=%s estimated_context_chars=%s related_test_limit=%s reference_limit=%s related_test_chars=%s reference_chars=%s full_file_chars=%s',
+        'Context assembly mode=%s estimated_context_chars=%s related_test_limit=%s related_symbol_limit=%s reference_limit=%s related_test_chars=%s related_symbol_chars=%s reference_chars=%s full_file_chars=%s',
         mode,
         estimated_context_chars,
         related_test_limit,
+        related_symbol_limit,
         max(0, int(reference_limits.get(mode, 0) or 0)),
         related_test_chars,
+        related_symbol_chars,
         reference_chars,
         len(full_file_source),
     )
 
     normalized_operation = _validate_operation(operation)
-    normalized_insert_scope = str(insert_scope or '').strip() or None
-    parent_qualname = ''
-    expected_new_symbol_kind = ''
-    if normalized_operation == 'insert_after_symbol':
-        if normalized_insert_scope == 'class_body':
-            if target.kind == 'method':
-                parent_qualname = str(target.parent_qualname or '')
-            elif target.kind == 'class':
-                parent_qualname = target.qualname
-            expected_new_symbol_kind = 'method'
-        elif normalized_insert_scope == 'module_body':
-            expected_new_symbol_kind = 'class' if 'dataclass' in (change_request.title + ' ' + change_request.description).casefold() else 'function'
+    normalized_insert_scope, parent_qualname, expected_new_symbol_kind = _normalize_insert_target_metadata(
+        change_request=change_request,
+        target=target,
+        operation=normalized_operation,
+        insert_scope=insert_scope,
+    )
 
     parent_symbol_payload = None
     class_members: list[dict[str, Any]] = []
@@ -206,6 +993,33 @@ def build_generation_request(
                     'docstring': item.docstring,
                 })
 
+    allowed_api_surface = _build_allowed_api_surface(
+        target_source=target.source_code or '',
+        parent_source=(parent_symbol_payload or {}).get('source', '') if parent_symbol_payload else '',
+        neighbor_sources=[str(item.source_code or '') for item in context_pack.neighbors],
+        related_symbols=all_related_symbols,
+    )
+    contract_attribute_requirements = _build_contract_attribute_requirements(all_related_symbols)
+    if contract_attribute_requirements:
+        LOGGER.info(
+            'Contract attribute requirements inferred: mode=%s count=%s contracts=%s',
+            mode,
+            len(contract_attribute_requirements),
+            [item.get('contract_qualname') for item in contract_attribute_requirements],
+        )
+    required_contracts = _build_required_contracts(
+        change_request=change_request,
+        allowed_api_surface=allowed_api_surface,
+        related_symbols=all_related_symbols,
+    )
+    if required_contracts:
+        LOGGER.info(
+            'Required contracts inferred: mode=%s count=%s contracts=%s',
+            mode,
+            len(required_contracts),
+            [item.get('qualname') or item.get('name') for item in required_contracts],
+        )
+
     project_context = {
         'module_outline': [
             {
@@ -228,6 +1042,16 @@ def build_generation_request(
         'parent_symbol': parent_symbol_payload,
         'class_members': class_members,
         'related_tests': related_tests,
+        'related_symbols': related_symbols,
+        'contract_context': {
+            'related_symbols': related_symbols,
+            'previous_changes': [],
+            'contract_attribute_requirements': contract_attribute_requirements,
+            'required_contracts': required_contracts,
+        },
+        'contract_attribute_requirements': contract_attribute_requirements,
+        'required_contracts': required_contracts,
+        'allowed_api_surface': allowed_api_surface,
         'recommended_tests': list(context_pack.recommended_tests),
     }
     context_pack.reference_summary = {
@@ -261,6 +1085,7 @@ def build_generation_request(
         'generated_code_artifact': generated_code_artifact or {},
         'options': {
             'generate_test_mode': config.codegenerator_test_generation_mode,
+            'required_contracts_count': len(required_contracts),
         },
     }
     metrics = {
@@ -270,15 +1095,21 @@ def build_generation_request(
         'full_file_included': full_file_included,
         'related_tests_count': len(related_tests),
         'related_test_chars': related_test_chars,
+        'related_symbols_count': len(related_symbols),
+        'related_symbol_chars': related_symbol_chars,
+        'related_symbol_limit': related_symbol_limit,
+        'related_symbol_char_limit': related_symbol_char_limit,
         'reference_artifacts_count': len(reference_artifacts),
         'reference_chars': reference_chars,
+        'contract_attribute_requirements_count': len(contract_attribute_requirements),
+        'required_contracts_count': len(required_contracts),
         'request_chars': _json_size(request),
         'estimated_context_chars': estimated_context_chars,
         'related_test_limit': related_test_limit,
         'reference_limit': max(0, int(reference_limits.get(mode, 0) or 0)),
     }
     LOGGER.info(
-        'Prepared generation request: mode=%s request_chars=%s target_source_chars=%s full_file_included=%s full_file_chars=%s related_tests=%s related_test_chars=%s reference_artifacts=%s reference_chars=%s related_test_limit=%s reference_limit=%s estimated_context_chars=%s',
+        'Prepared generation request: mode=%s request_chars=%s target_source_chars=%s full_file_included=%s full_file_chars=%s related_tests=%s related_test_chars=%s related_symbols=%s related_symbol_chars=%s reference_artifacts=%s reference_chars=%s related_test_limit=%s related_symbol_limit=%s reference_limit=%s estimated_context_chars=%s',
         mode,
         metrics['request_chars'],
         metrics['target_source_chars'],
@@ -286,9 +1117,12 @@ def build_generation_request(
         len(full_file_source),
         len(request['project_context']['related_tests']),
         metrics['related_test_chars'],
+        len(request['project_context']['contract_context']['related_symbols']),
+        metrics['related_symbol_chars'],
         len(request['reference_context']['reference_artifacts']),
         metrics['reference_chars'],
         related_test_limit,
+        related_symbol_limit,
         max(0, int(reference_limits.get(mode, 0) or 0)),
         estimated_context_chars,
     )
@@ -372,10 +1206,11 @@ def invoke_generate_test(run_dir: Path, config: AppConfig, request_payload: dict
     request_chars = _json_size(request_payload)
 
     LOGGER.info(
-        'Prepared generation request for test generation: mode=%s request_chars=%s related_tests=%s reference_artifacts=%s',
+        'Prepared generation request for test generation: mode=%s request_chars=%s related_tests=%s related_symbols=%s reference_artifacts=%s',
         request_payload.get('mode'),
         request_chars,
         len(((request_payload.get('project_context') or {}).get('related_tests') or [])),
+        len((((request_payload.get('project_context') or {}).get('contract_context') or {}).get('related_symbols') or [])),
         len(((request_payload.get('reference_context') or {}).get('reference_artifacts') or [])),
     )
 
@@ -430,6 +1265,7 @@ def build_repair_request(
     config: AppConfig | None = None,
     requested_operation: str = 'replace_symbol',
     insert_scope: str | None = None,
+    previous_generation_request: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     target = context_pack.target
     failure_summary = verification_summary.get('failure_summary', {}) if isinstance(verification_summary, dict) else {}
@@ -438,24 +1274,12 @@ def build_repair_request(
     error_type = 'apply_failed' if stage == 'apply' else 'verification_failed'
     normalized_operation = _validate_operation(requested_operation)
 
-    normalized_insert_scope = str(insert_scope or '').strip() or None
-    parent_qualname = ''
-    expected_new_symbol_kind = ''
-
-    if normalized_operation == 'insert_after_symbol':
-        if normalized_insert_scope == 'class_body':
-            if target.kind == 'method':
-                parent_qualname = str(target.parent_qualname or '')
-            elif target.kind == 'class':
-                parent_qualname = target.qualname
-            expected_new_symbol_kind = 'method'
-        elif normalized_insert_scope == 'module_body':
-            expected_new_symbol_kind = (
-                'class'
-                if 'dataclass' in (change_request.title + ' ' + change_request.description).casefold()
-                else 'function'
-            )
-
+    normalized_insert_scope, parent_qualname, expected_new_symbol_kind = _normalize_insert_target_metadata(
+        change_request=change_request,
+        target=target,
+        operation=normalized_operation,
+        insert_scope=insert_scope,
+    )
 
     related_tests_limit = max(
         0,
@@ -465,13 +1289,69 @@ def build_repair_request(
         0,
         int((config.codegenerator_repair_reference_max_items if config is not None else 1) or 0),
     )
+    related_symbol_limit = max(
+        0,
+        int((config.codegenerator_repair_related_symbols_max_items if config is not None else 3) or 0),
+    )
+    related_symbol_char_limit = max(
+        0,
+        int((config.codegenerator_repair_related_symbol_chars if config is not None else 500) or 0),
+    )
 
     related_tests = _select_related_tests(
         context_pack,
         limit=related_tests_limit,
     )[0]
+    related_symbols = _select_related_symbols(
+        context_pack,
+        limit=related_symbol_limit,
+        source_chars=related_symbol_char_limit,
+    )[0]
 
     selected_reference_artifacts = list(context_pack.reference_artifacts[:repair_reference_limit])
+
+    parent_symbol_payload, class_members = _build_parent_context_payload(
+        context_pack,
+        parent_qualname=parent_qualname,
+    )
+
+    full_file_source = ''
+    full_file_truncated = False
+    if config is not None and bool(config.codegenerator_include_full_file_for_repair):
+        full_file_source, full_file_truncated = _truncate_source(
+            _same_file_module_source(context_pack),
+            max(0, int(config.codegenerator_repair_full_file_chars or 0)),
+        )
+
+    all_related_symbols, _all_related_symbol_chars = _select_related_symbols(
+        context_pack,
+        limit=len(context_pack.related_symbols or []),
+        source_chars=related_symbol_char_limit or 700,
+    )
+    allowed_api_surface = _allowed_api_surface_from_previous_request(previous_generation_request)
+    allowed_api_surface_source = 'previous_generation_request' if allowed_api_surface else 'rebuilt_from_context_pack'
+    if allowed_api_surface is None:
+        allowed_api_surface = _build_allowed_api_surface(
+            target_source=target.source_code or '',
+            parent_source=(parent_symbol_payload or {}).get('source', '') if parent_symbol_payload else '',
+            neighbor_sources=[str(item.source_code or '') for item in context_pack.neighbors],
+            related_symbols=all_related_symbols,
+        )
+    contract_attribute_requirements = _build_contract_attribute_requirements(all_related_symbols)
+    previous_project_context = (previous_generation_request or {}).get('project_context') if isinstance(previous_generation_request, dict) else {}
+    required_contracts = []
+    if isinstance(previous_project_context, dict):
+        required_contracts = [
+            dict(item)
+            for item in (previous_project_context.get('required_contracts') or [])
+            if isinstance(item, dict)
+        ]
+    if not required_contracts:
+        required_contracts = _build_required_contracts(
+            change_request=change_request,
+            allowed_api_surface=allowed_api_surface,
+            related_symbols=all_related_symbols,
+        )
 
     previous_artifact = dict(previous_result_payload.get('code_artifact') or {})
     previous_artifact['operation'] = normalized_operation
@@ -479,25 +1359,28 @@ def build_repair_request(
     previous_artifact.setdefault('target_file', target.file_path)
     if normalized_operation == 'insert_after_symbol':
         previous_artifact['insert_after'] = previous_artifact.get('insert_after') or target_qualname
-    previous_artifact['insert_scope'] = previous_artifact.get('insert_scope') or normalized_insert_scope
-
-    if expected_new_symbol_kind:
-        previous_artifact['expected_new_symbol_kind'] = (
-            previous_artifact.get('expected_new_symbol_kind') or expected_new_symbol_kind
-        )
-    if parent_qualname:
-        previous_artifact['parent_qualname'] = (
-            previous_artifact.get('parent_qualname') or parent_qualname
-        )
+        previous_artifact['insert_scope'] = normalized_insert_scope
+        if expected_new_symbol_kind:
+            previous_artifact['expected_new_symbol_kind'] = expected_new_symbol_kind
+        if parent_qualname:
+            previous_artifact['parent_qualname'] = parent_qualname
+    else:
+        previous_artifact['insert_scope'] = previous_artifact.get('insert_scope') or normalized_insert_scope
 
     LOGGER.info(
-        'Prepared repair request: target=%s requested_operation=%s stage=%s related_tests=%s reference_artifacts=%s previous_artifact_has_code=%s',
+        'Prepared repair request: target=%s requested_operation=%s stage=%s related_tests=%s related_symbols=%s reference_artifacts=%s previous_artifact_has_code=%s full_file_chars=%s full_file_truncated=%s allowed_surface_source=%s dependencies=%s free_functions=%s',
         target_qualname,
         normalized_operation,
         stage,
         len(related_tests),
+        len(related_symbols),
         len(selected_reference_artifacts),
         bool(previous_artifact.get('code')),
+        len(full_file_source),
+        full_file_truncated,
+        allowed_api_surface_source,
+        len(allowed_api_surface.get('dependencies') or []),
+        len(allowed_api_surface.get('free_functions') or []),
     )
 
     return {
@@ -534,7 +1417,8 @@ def build_repair_request(
                 }
                 for item in context_pack.neighbors
             ],
-            'full_file_source': '',
+            'full_file_source': full_file_source,
+            'full_file_truncated': full_file_truncated,
             'target_symbol': {
                 'qualname': target.qualname,
                 'name': target.name,
@@ -543,7 +1427,19 @@ def build_repair_request(
                 'source': target.source_code,
                 'truncated': False,
             },
+            'parent_symbol': parent_symbol_payload,
+            'class_members': class_members,
             'related_tests': related_tests,
+            'related_symbols': related_symbols,
+            'contract_context': {
+                'related_symbols': related_symbols,
+                'previous_changes': [],
+                'contract_attribute_requirements': contract_attribute_requirements,
+                'required_contracts': required_contracts,
+            },
+            'contract_attribute_requirements': contract_attribute_requirements,
+            'required_contracts': required_contracts,
+            'allowed_api_surface': allowed_api_surface,
             'recommended_tests': list(context_pack.recommended_tests),
         },
         'reference_context': {
@@ -573,6 +1469,13 @@ def build_repair_request(
             'insert_scope': normalized_insert_scope,
             'expected_new_symbol_kind': expected_new_symbol_kind,
             'parent_qualname': parent_qualname,
+            'allowed_api_surface_source': allowed_api_surface_source,
+            'allowed_api_surface_dependencies_count': len(allowed_api_surface.get('dependencies') or []),
+            'allowed_api_surface_free_functions_count': len(allowed_api_surface.get('free_functions') or []),
+            'contract_attribute_requirements_count': len(contract_attribute_requirements),
+            'required_contracts_count': len(required_contracts),
+            'full_file_included': bool(full_file_source),
+            'full_file_truncated': full_file_truncated,
         },
     }
 
@@ -608,13 +1511,25 @@ def invoke_repair(run_dir: Path, config: AppConfig, request_payload: dict[str, A
 
 
 def patch_artifact_from_result(result_payload: dict[str, Any], fallback_target_qualname: str) -> PatchArtifact:
+    status = result_payload.get('status')
+    if status != 'ok':
+        planner_result = result_payload.get('planner_result') or {}
+        reason = (
+            result_payload.get('message')
+            or planner_result.get('reason')
+            or result_payload.get('error_type')
+            or status
+        )
+        next_step = planner_result.get('suggested_next_step')
+        if next_step and str(next_step) not in str(reason):
+            reason = f'{reason}. Suggested next step: {next_step}'
+        raise ValueError(f"codegenerator returned non-ok status: {status} ({reason})")
+
     artifact = result_payload.get('code_artifact') or {}
     operation = _validate_operation(str(artifact.get('operation', 'replace_symbol')))
     code = artifact.get('code')
     if not code:
         raise ValueError('codegenerator result does not contain code_artifact.code')
-    if result_payload.get('status') != 'ok':
-        raise ValueError(f"codegenerator returned non-ok status: {result_payload.get('status')} ({result_payload.get('message')})")
     return PatchArtifact(
         target_qualname=str(artifact.get('target_qualname') or fallback_target_qualname),
         replacement_code=str(code),

@@ -42,6 +42,7 @@ JSON-формат ответа:
 - Для insert_after_symbol ищем anchor-symbol, после которого нужно добавить новый symbol.
 - Если пользователь просит добавить функцию/helper на уровне модуля, используй insert_scope=module_body и expected_new_symbols.kind=function.
 - Если пользователь явно просит добавить метод в класс, используй insert_scope=class_body и expected_new_symbols.kind=method.
+- Если пользователь использует слово "функция" в смысле новой возможности/обработчика, но в project_map похожий слой реализован методами класса/controller, предпочитай insert_scope=class_body и expected_new_symbols.kind=method.
 - Если непонятно, функция это или метод класса, используй insert_scope=unknown и manual_review_required=true.
 - search_queries должны быть короткими: 2-5 слов, максимум 4 запроса.
 - project_map может быть неполным: отсутствие symbol в нем не доказывает отсутствие в проекте.

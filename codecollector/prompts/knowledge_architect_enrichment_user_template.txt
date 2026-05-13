@@ -1,0 +1,32 @@
+Извлеки архитектурные знания для knowledge.yaml.
+
+Входной JSON:
+$payload_json
+
+Правила:
+- Архитектурный документ — приоритетный источник описаний, ролей, слоев и потоков.
+- Используй в modules только значения из known_modules[].module.
+- Используй в symbols только значения из known_symbols[].qualname.
+- Не перечисляй все symbols подряд. Заполняй symbols только для ключевых классов или функций, которые явно описаны в архитектурном документе и важны для понимания проекта.
+- Для методов заполняй symbols только если метод отдельно и явно описан в архитектурном документе.
+- Неизвестные файлы, модули и symbols не добавляй в modules, symbols, architecture.layers или components. Не возвращай unmatched_mentions: codecollector выполнит диагностику неизвестных ссылок автоматически.
+- Не придумывай функции, классы, методы, тесты, модули и связи.
+- Пиши кратко, прикладно и на русском языке.
+- Ответ должен быть компактным: короткие title, description, layer, keywords; без повторения очевидных деталей из known_symbols.
+- Верни только один валидный JSON-объект.
+- Не используй markdown-блоки, комментарии, trailing commas или поясняющий текст вне JSON.
+
+Схема ответа:
+{
+  "project": {"title": "...", "description": "..."},
+  "modules": {"known.module": {"title": "...", "description": "...", "layer": "...", "keywords": ["..."]}},
+  "symbols": {"known.module.Symbol": {"title": "...", "description": "...", "keywords": ["..."]}},
+  "architecture": {
+    "style": "...",
+    "patterns": ["..."],
+    "layers": {"layer_name": ["known.module"]},
+    "components": [{"name": "...", "module": "known.module", "qualname": "known.module.Symbol", "layer": "...", "responsibilities": ["..."]}],
+    "flows": [{"name": "...", "steps": ["..."]}]
+  },
+  "warnings": ["..."]
+}

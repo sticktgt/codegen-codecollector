@@ -203,6 +203,16 @@ class AnalyzeService:
                 candidates=candidates,
                 target_recommendation=target_recommendation,
             )
+            target_recommendation = self._normalize_insert_scope_for_expected_new_symbol(
+                services=services,
+                requested_operation=effective_operation,
+                recommended_target=recommended_target,
+                target_recommendation=target_recommendation,
+                search_plan=search_plan,
+            )
+            post_processed_scope = self._insert_scope_from_payload(target_recommendation)
+            if post_processed_scope:
+                effective_insert_scope = post_processed_scope
         record_timing('target_resolution_sec', target_resolution_started_at)
         manual_review_required = self._manual_review_required(
             search_plan,
@@ -495,6 +505,80 @@ class AnalyzeService:
             return recommended
         return None
 
+    def _normalize_insert_scope_for_expected_new_symbol(
+        self,
+        *,
+        services: ProjectServices,
+        requested_operation: str,
+        recommended_target: str,
+        target_recommendation: dict[str, Any],
+        search_plan: dict[str, Any],
+    ) -> dict[str, Any]:
+        if requested_operation != 'insert_after_symbol':
+            return target_recommendation
+        expected_kind = self._expected_new_symbol_kind(target_recommendation, search_plan)
+        if expected_kind != 'class':
+            return target_recommendation
+
+        target_symbol = services.store.get_symbol(str(services.project_root), recommended_target)
+        if target_symbol is None:
+            return target_recommendation
+        module_parent = target_symbol.qualname if target_symbol.kind == 'module' else str(target_symbol.parent_qualname or '')
+        if not module_parent:
+            return target_recommendation
+
+        current_scope = self._insert_scope_from_payload(target_recommendation)
+        if current_scope == 'module_body' and target_recommendation.get('parent_qualname') == module_parent:
+            return target_recommendation
+
+        updated = dict(target_recommendation)
+        old_scope = current_scope or 'unknown'
+        updated['insert_scope'] = {
+            'value': 'module_body',
+            'confidence': max(
+                self._safe_float((target_recommendation.get('insert_scope') or {}).get('confidence')),
+                0.9,
+            ),
+            'reason': (
+                'Новый symbol является class/dataclass, поэтому он должен быть добавлен на уровне модуля, '
+                'даже если anchor — существующий class.'
+            ),
+        }
+        updated['expected_new_symbol_kind'] = 'class'
+        updated['parent_qualname'] = module_parent
+        updated['target_role'] = 'anchor'
+        post_processing = dict(updated.get('post_processing') or {})
+        post_processing['symbol_kind_scope_adjusted'] = {
+            'from': old_scope,
+            'to': 'module_body',
+            'reason': 'new_class_symbols_are_inserted_at_module_level',
+            'parent_qualname': module_parent,
+        }
+        updated['post_processing'] = post_processing
+        LOGGER.info(
+            'Analyze normalized insert scope for new class: target=%s old_scope=%s new_scope=module_body parent=%s',
+            recommended_target,
+            old_scope,
+            module_parent,
+        )
+        return updated
+
+    def _expected_new_symbol_kind(self, *payloads: dict[str, Any]) -> str | None:
+        for payload in payloads:
+            if not isinstance(payload, dict):
+                continue
+            value = str(payload.get('expected_new_symbol_kind') or '').strip().lower()
+            if value in {'class', 'function', 'method'}:
+                return value
+            symbols = payload.get('expected_new_symbols') or []
+            if isinstance(symbols, list):
+                for item in symbols:
+                    if isinstance(item, dict):
+                        kind = str(item.get('kind') or '').strip().lower()
+                        if kind in {'class', 'function', 'method'}:
+                            return kind
+        return None
+
     def _post_process_recommended_target(
         self,
         *,
@@ -513,6 +597,7 @@ class AnalyzeService:
             return recommended_target, candidates, target_recommendation
 
         old_target = recommended_target
+        old_target_symbol = services.store.get_symbol(str(services.project_root), old_target)
         reason = (
             f'Для insert_after_symbol выбран последний top-level symbol в файле {anchor_symbol.file_path}: '
             f'{anchor_symbol.qualname}. Исходная LLM-рекомендация anchor была {old_target}.'
@@ -523,12 +608,45 @@ class AnalyzeService:
         target_recommendation['recommended_candidate_id'] = None
         target_recommendation['target_role'] = 'anchor'
         target_recommendation['target_reason'] = reason
-        target_recommendation['post_processing'] = {
+        post_processing: dict[str, Any] = {
             'kind': 'insert_after_last_top_level_symbol_in_file',
             'original_recommended_target': old_target,
             'recommended_target': anchor_symbol.qualname,
             'file_path': anchor_symbol.file_path,
         }
+
+        # If LLM selected a method as the closest anchor but post-processing promoted it
+        # to the parent class, keep the insertion model consistent with the visible
+        # project pattern: add a new method inside that class rather than a top-level
+        # function after the class. This is target-selection normalization, not code
+        # validation, and it prevents a class-anchor/module_body mismatch.
+        if (
+            old_target_symbol is not None
+            and old_target_symbol.kind == 'method'
+            and anchor_symbol.kind == 'class'
+            and insert_scope in {None, 'module_body'}
+        ):
+            target_recommendation['insert_scope'] = {
+                'value': 'class_body',
+                'confidence': max(
+                    self._safe_float((target_recommendation.get('insert_scope') or {}).get('confidence')),
+                    0.85,
+                ),
+                'reason': (
+                    'Изначально выбран method-anchor внутри класса; после нормализации anchor стал parent class, '
+                    'поэтому новый symbol должен быть методом этого класса.'
+                ),
+            }
+            target_recommendation['expected_new_symbol_kind'] = 'method'
+            target_recommendation['parent_qualname'] = anchor_symbol.qualname
+            target_recommendation['target_role'] = 'parent_class'
+            post_processing['insert_scope_adjusted'] = {
+                'from': insert_scope or 'unknown',
+                'to': 'class_body',
+                'reason': 'method_anchor_promoted_to_parent_class',
+            }
+
+        target_recommendation['post_processing'] = post_processing
 
         updated_candidates = self._promote_anchor_candidate(candidates, anchor_symbol, reason)
         LOGGER.info(
