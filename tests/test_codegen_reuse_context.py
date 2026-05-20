@@ -1,0 +1,240 @@
+from pathlib import Path
+
+from codecollector.config import load_config
+from codecollector.domain.models import ChangeRequest, ContextPack, SymbolRecord
+from codecollector.external_codegen.adapter import build_generation_request
+
+
+def test_generation_request_includes_same_class_methods_and_analyze_reuse_hint(tmp_path: Path) -> None:
+    source = '''from pathlib import Path
+
+class NoteStorage:
+    def __init__(self, base_dir: Path) -> None:
+        self.base_dir = base_dir
+
+    def find_note_file_by_id(self, note_id: str) -> Path:
+        """Find note file by id."""
+        return self.base_dir / f"{note_id}.note"
+
+    def load(self, note_id: str):
+        """Load note by id."""
+        raise NotImplementedError
+'''
+    module_dir = tmp_path / 'note'
+    module_dir.mkdir()
+    (module_dir / 'note_storage.py').write_text(source, encoding='utf-8')
+
+    target = SymbolRecord(
+        file_path='note/note_storage.py',
+        module_name='note.note_storage',
+        name='load',
+        qualname='note.note_storage.NoteStorage.load',
+        kind='method',
+        parent_qualname='note.note_storage.NoteStorage',
+        start_line=9,
+        end_line=11,
+        docstring='Load note by id.',
+        source_code='    def load(self, note_id: str):\n        raise NotImplementedError',
+    )
+    context_pack = ContextPack(
+        target=target,
+        neighbors=[],
+        inbound_relations=[],
+        outbound_relations=[],
+        related_tests=[],
+        related_symbols=[],
+    )
+    change_request = ChangeRequest(
+        title='Загрузка заметки из файла',
+        description='Использовать существующую логику поиска файла и восстановить заметку.',
+        project='demo',
+        context_hints={
+            'reuse_existing_logic': {
+                'mode': 'recommended',
+                'confidence': 0.82,
+                'reason': 'Use existing helper for file lookup.',
+                'contracts': [
+                    {
+                        'qualname': 'note.note_storage.NoteStorage.find_note_file_by_id',
+                        'role': 'same_class_helper',
+                        'reason': 'Finds a note file by id.',
+                    }
+                ],
+            }
+        },
+    )
+
+    request = build_generation_request(
+        tmp_path,
+        change_request,
+        target.qualname,
+        context_pack,
+        load_config(),
+        mode='generate',
+        operation='replace_symbol',
+        insert_scope='class_body',
+    )
+
+    same_class_methods = request['project_context']['same_class_methods']
+    assert same_class_methods
+    helper = next(item for item in same_class_methods if item['qualname'] == 'note.note_storage.NoteStorage.find_note_file_by_id')
+    assert 'reuse_recommended' not in helper
+    assert 'find_note_file_by_id' in helper['source_excerpt']
+
+    reuse = request['project_context']['reuse_existing_logic']
+    assert reuse['mode'] == 'recommended'
+    assert reuse['contracts'][0]['qualname'] == 'note.note_storage.NoteStorage.find_note_file_by_id'
+
+
+def test_generation_request_includes_same_class_methods_without_auto_reuse_recommendation(tmp_path: Path) -> None:
+    source = '''from pathlib import Path
+
+class NoteStorage:
+    def __init__(self, base_dir: Path) -> None:
+        self.base_dir = base_dir
+
+    def find_note_file_by_id(self, note_id: str) -> Path:
+        """Ищет файл заметки по идентификатору внутри хранилища."""
+        return self.base_dir / f"{note_id}.note"
+
+    def generate_filename(self, note) -> str:
+        """Генерирует имя файла заметки."""
+        return "demo.note"
+
+    def load(self, note_id: str):
+        """Загружает заметку по идентификатору."""
+        raise NotImplementedError
+'''
+    module_dir = tmp_path / 'note'
+    module_dir.mkdir()
+    (module_dir / 'note_storage.py').write_text(source, encoding='utf-8')
+
+    target = SymbolRecord(
+        file_path='note/note_storage.py',
+        module_name='note.note_storage',
+        name='load',
+        qualname='note.note_storage.NoteStorage.load',
+        kind='method',
+        parent_qualname='note.note_storage.NoteStorage',
+        start_line=15,
+        end_line=17,
+        docstring='Загружает заметку по идентификатору.',
+        source_code='    def load(self, note_id: str):\n        raise NotImplementedError',
+    )
+    context_pack = ContextPack(
+        target=target,
+        neighbors=[],
+        inbound_relations=[],
+        outbound_relations=[],
+        related_tests=[],
+        related_symbols=[],
+    )
+    change_request = ChangeRequest(
+        title='Загрузка заметки из файла',
+        description='Метод должен найти файл заметки по идентификатору через существующую логику поиска файла и восстановить заметку.',
+        project='demo',
+    )
+
+    request = build_generation_request(
+        tmp_path,
+        change_request,
+        target.qualname,
+        context_pack,
+        load_config(),
+        mode='generate',
+        operation='replace_symbol',
+        insert_scope='class_body',
+    )
+
+    same_class_methods = request['project_context']['same_class_methods']
+    assert any(item['qualname'] == 'note.note_storage.NoteStorage.find_note_file_by_id' for item in same_class_methods)
+    assert not any(item.get('reuse_recommended') for item in same_class_methods)
+
+
+def test_repair_request_preserves_same_class_methods_from_generation_request(tmp_path: Path) -> None:
+    from codecollector.external_codegen.adapter import build_repair_request
+
+    target = SymbolRecord(
+        file_path='note/note_storage.py',
+        module_name='note.note_storage',
+        name='load',
+        qualname='note.note_storage.NoteStorage.load',
+        kind='method',
+        parent_qualname='note.note_storage.NoteStorage',
+        start_line=10,
+        end_line=12,
+        docstring='Load note by id.',
+        source_code='    def load(self, note_id: str):\n        raise NotImplementedError',
+    )
+    context_pack = ContextPack(
+        target=target,
+        neighbors=[],
+        inbound_relations=[],
+        outbound_relations=[],
+        related_tests=[],
+        related_symbols=[],
+    )
+    change_request = ChangeRequest(
+        title='Загрузка заметки из файла',
+        description='Метод должен найти файл заметки через существующую логику поиска файла и восстановить заметку.',
+        project='demo',
+    )
+    previous_generation_request = {
+        'project_context': {
+            'same_class_methods': [
+                {
+                    'qualname': 'note.note_storage.NoteStorage.find_note_file_by_id',
+                    'name': 'find_note_file_by_id',
+                    'kind': 'method',
+                    'signature': 'def find_note_file_by_id(self, note_id: str) -> Path:',
+                    'docstring': 'Find note file by id.',
+                    'source_excerpt': 'def find_note_file_by_id(self, note_id: str) -> Path:\n    ...',
+                }
+            ],
+            'reuse_existing_logic': {
+                'mode': 'recommended',
+                'confidence': 0.75,
+                'reason': 'Use existing helper.',
+                'contracts': [
+                    {
+                        'qualname': 'note.note_storage.NoteStorage.find_note_file_by_id',
+                        'role': 'same_class_helper',
+                        'reason': 'Finds a note file by id.',
+                    }
+                ],
+            },
+            'allowed_api_surface': {},
+            'required_contracts': [],
+            'required_class_members': [],
+            'model_surfaces': [],
+        }
+    }
+    previous_result_payload = {
+        'request_id': 'generate-load',
+        'code_artifact': {
+            'operation': 'replace_symbol',
+            'target_qualname': target.qualname,
+            'target_file': target.file_path,
+            'code': 'def load(self, note_id: str):\n    return self._find_file(note_id)',
+        },
+    }
+    verification_summary = {
+        'failure_summary': {'stage': 'verification'},
+        'failed_blocks': [],
+    }
+
+    request = build_repair_request(
+        change_request=change_request,
+        target_qualname=target.qualname,
+        previous_result_payload=previous_result_payload,
+        context_pack=context_pack,
+        verification_summary=verification_summary,
+        requested_operation='replace_symbol',
+        insert_scope='class_body',
+        previous_generation_request=previous_generation_request,
+    )
+
+    project_context = request['project_context']
+    assert project_context['same_class_methods'][0]['qualname'] == 'note.note_storage.NoteStorage.find_note_file_by_id'
+    assert project_context['reuse_existing_logic']['mode'] == 'recommended'
+    assert project_context['reuse_existing_logic']['contracts'][0]['qualname'] == 'note.note_storage.NoteStorage.find_note_file_by_id'

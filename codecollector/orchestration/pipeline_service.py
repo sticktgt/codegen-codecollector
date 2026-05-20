@@ -31,6 +31,7 @@ from codecollector.external_codegen.adapter import (
     build_repair_request,
     invoke_repair,
     ensure_expected_operation,
+    invoke_generated_test_failure_review,
 )
 
 from codecollector.validation.semantic_checks import (
@@ -169,6 +170,7 @@ class PipelineService:
         build_report: dict[str, Any] | None = None
         context_pack: ContextPack | None = None
         repair_generation: ExternalGenerationCall | None = None
+        generated_test_review: dict[str, Any] | None = None
         apply_result: ApplyResult | None = None
         verification_result: VerificationReport | None = None
         merge_plan: MergePlan | None = None
@@ -285,6 +287,7 @@ class PipelineService:
                 generated_test_apply=None,
                 verification_report=verification_result,
                 repair_generation=repair_generation,
+                generated_test_review=generated_test_review,
                 apply_result=apply_result,
                 merge_plan=merge_plan,
                 steps=steps,
@@ -310,6 +313,7 @@ class PipelineService:
                     generated_test_apply=None,
                     verification_report=verification_result,
                     repair_generation=repair_generation,
+                    generated_test_review=generated_test_review,
                     apply_result=apply_result,
                     merge_plan=merge_plan,
                     steps=steps,
@@ -373,6 +377,7 @@ class PipelineService:
         generated_test_apply: dict[str, Any] | None = None
         verification_report: VerificationReport | None = None
         repair_generation: ExternalGenerationCall | None = None
+        generated_test_review: dict[str, Any] | None = None
         apply_result: ApplyResult | None = None
         merge_plan: MergePlan | None = None
         result: PipelineRunResult | None = None
@@ -454,6 +459,8 @@ class PipelineService:
             ensure_expected_operation(external_code_result_payload, requested_operation)
 
             required_contracts = self._required_contracts_from_generation_request(run_dir)
+            required_class_members = self._required_class_members_from_generation_request(run_dir)
+            model_surfaces = self._model_surfaces_from_generation_request(run_dir)
 
             final_payload = external_code_result_payload
             generated_tests: list[dict[str, str]] = []
@@ -571,6 +578,8 @@ class PipelineService:
                     related_symbols=list(context_pack.related_symbols or []),
                     import_changes=list((final_payload.get('code_artifact') or {}).get('import_changes') or []),
                     required_contracts=required_contracts,
+                    required_class_members=required_class_members,
+                    model_surfaces=model_surfaces,
                 ),
             )
 
@@ -649,6 +658,9 @@ class PipelineService:
                             parent_qualname=self._parent_qualname_for_insert_scope(context_pack, insert_scope),
                             related_symbols=list(context_pack.related_symbols or []),
                             import_changes=list((final_payload.get('code_artifact') or {}).get('import_changes') or []),
+                            required_contracts=required_contracts,
+                            required_class_members=required_class_members,
+                            model_surfaces=model_surfaces,
                         ),
                     )
 
@@ -686,6 +698,7 @@ class PipelineService:
                         generated_test_apply=generated_test_apply,
                         verification_report=verification_report,
                         repair_generation=repair_generation,
+                        generated_test_review=generated_test_review,
                         apply_result=apply_result,
                         merge_plan=merge_plan,
                         steps=steps,
@@ -775,16 +788,27 @@ class PipelineService:
                             ),
                         )
                     else:
+                        candidate_test_files = [item['file_path'] for item in generated_tests]
                         generated_test_apply = {
                             'applied_tests': [],
                             'count': 0,
                             'skipped': True,
                             'reason': 'generated_test_semantic_checks_failed',
-                            'candidate_test_files': [item['file_path'] for item in generated_tests],
+                            'candidate_test_files': candidate_test_files,
+                            'excluded_files': list(candidate_test_files),
+                            'verification_failed': True,
+                            'merge_recommended': False,
                         }
+                        removed_rejected_tests = self._remove_rejected_generated_test_files(
+                            apply_result.workspace_path,
+                            candidate_test_files,
+                        )
+                        if removed_rejected_tests:
+                            generated_test_apply['removed_files'] = removed_rejected_tests
                         LOGGER.warning(
-                            "generated tests rejected by semantic checks candidate_files=%s static_issues=%s relevance_issues=%s",
+                            "generated tests rejected by semantic checks candidate_files=%s removed_files=%s static_issues=%s relevance_issues=%s",
                             generated_test_apply['candidate_test_files'],
+                            removed_rejected_tests,
                             [issue.code for issue in generated_test_static_block.issues],
                             [issue.code for issue in generated_test_relevance_block.issues],
                         )
@@ -932,7 +956,34 @@ class PipelineService:
                 )
                 if special_note not in notes:
                     notes.append(special_note)
-                    apply_result.impact.notes = notes            
+                    apply_result.impact.notes = notes
+
+                if external_test_generation is not None:
+                    try:
+                        generated_test_review = self._run_step(
+                            steps,
+                            'generated_test_failure_review',
+                            'Выполнить advisory review после ошибки generated test',
+                            lambda: self._external_generated_test_failure_review(
+                                run_dir=run_dir,
+                                change_request=change_request,
+                                selected_target=selected_target,
+                                context_pack=context_pack,
+                                final_payload=final_payload,
+                                apply_result=apply_result,
+                                external_test_generation=external_test_generation,
+                                generated_test_apply=generated_test_apply,
+                                verification_report=verification_report,
+                            ),
+                        )
+                    except Exception as review_exc:
+                        generated_test_review = {
+                            'status': 'error',
+                            'error_type': type(review_exc).__name__,
+                            'message': str(review_exc),
+                        }
+                        warnings.append(f'Generated test failure review failed: {review_exc}')
+                        LOGGER.warning('Generated test failure review failed: %s', review_exc)
 
             merge_plan = self._run_step(
                 steps,
@@ -956,6 +1007,7 @@ class PipelineService:
                 generated_test_apply=generated_test_apply,
                 verification_report=verification_report,
                 repair_generation=repair_generation,
+                generated_test_review=generated_test_review,
                 apply_result=apply_result,
                 merge_plan=merge_plan,
                 steps=steps,
@@ -982,6 +1034,7 @@ class PipelineService:
                     generated_test_apply=generated_test_apply,
                     verification_report=verification_report,
                     repair_generation=repair_generation,
+                    generated_test_review=generated_test_review,
                     apply_result=apply_result,
                     merge_plan=merge_plan,
                     steps=steps,
@@ -1135,10 +1188,48 @@ class PipelineService:
         generated_test_apply: dict[str, Any] | None = None,
     ) -> list[str]:
         return [
-            str(item or '').strip().replace('\\', '/').lower()
+            str(item or '').strip().replace('\\', '/')
             for item in list((generated_test_apply or {}).get('applied_tests') or [])
             if str(item or '').strip()
         ]
+
+    def _normalize_generated_test_rel_path(self, rel_path: str) -> str | None:
+        value = str(rel_path or '').strip().replace('\\', '/')
+        if not value:
+            return None
+        path = Path(value)
+        if path.is_absolute() or '..' in path.parts:
+            return None
+        return value
+
+    def _remove_rejected_generated_test_files(
+        self,
+        workspace_path: Path,
+        candidate_test_files: list[str] | tuple[str, ...] | None,
+    ) -> list[str]:
+        removed: list[str] = []
+        for item in list(candidate_test_files or []):
+            rel = self._normalize_generated_test_rel_path(str(item or ''))
+            if rel is None:
+                LOGGER.warning(
+                    "skip removing rejected generated test with unsafe path=%r workspace=%s",
+                    item,
+                    workspace_path,
+                )
+                continue
+            path = workspace_path / rel
+            try:
+                if path.exists() and path.is_file():
+                    path.unlink()
+                    removed.append(rel)
+            except OSError as exc:
+                LOGGER.warning(
+                    "failed to remove rejected generated test file=%s error=%s",
+                    path,
+                    exc,
+                )
+        return removed
+
 
     def _pytest_failed_paths_from_output(self, output: str) -> set[str]:
         failed_paths: set[str] = set()
@@ -1180,6 +1271,7 @@ class PipelineService:
             return False
 
         generated_paths = set(self._generated_test_applied_paths(generated_test_apply))
+        generated_paths_lower = {path.lower() for path in generated_paths}
         if not generated_paths:
             return False
 
@@ -1207,7 +1299,8 @@ class PipelineService:
         generated_names = {Path(path).name.lower() for path in generated_paths}
 
         for failed_path in failed_paths:
-            if failed_path in generated_paths:
+            failed_path_lower = failed_path.lower()
+            if failed_path in generated_paths or failed_path_lower in generated_paths_lower:
                 continue
             if Path(failed_path).name.lower() in generated_names:
                 continue
@@ -1270,6 +1363,7 @@ class PipelineService:
         generated_test_apply: dict[str, Any] | None = None,
         verification_report: VerificationReport | None = None,
         repair_generation: ExternalGenerationCall | None = None,
+        generated_test_review: dict[str, Any] | None = None,
         apply_result: ApplyResult | None = None,
         merge_plan: MergePlan | None = None,
         warnings: list[str] | None = None,
@@ -1313,6 +1407,7 @@ class PipelineService:
             generated_test_apply=generated_test_apply,
             verification_report=verification_report,
             repair_generation=repair_generation,
+            generated_test_review=generated_test_review,
             apply_result=apply_result,
             merge_plan=merge_plan,
             steps=steps,
@@ -1330,6 +1425,116 @@ class PipelineService:
         if target.kind == 'method':
             return target.parent_qualname
         return None
+
+
+    def _compact_generated_test_review_verification_context(self, verification_report: VerificationReport) -> dict[str, Any]:
+        failed_blocks: list[dict[str, Any]] = []
+        advisory_warnings: list[dict[str, Any]] = []
+
+        for block in verification_report.blocks:
+            details = block.details if isinstance(block.details, dict) else {}
+            contract_warning_payload = details.get('possible_existing_method_contract_lost')
+            if isinstance(contract_warning_payload, dict):
+                warnings = contract_warning_payload.get('warnings')
+                if isinstance(warnings, list):
+                    advisory_warnings.extend(
+                        item for item in warnings if isinstance(item, dict)
+                    )
+
+            if block.ok:
+                continue
+
+            compact_details: dict[str, Any] = {}
+            for key in ('command', 'returncode', 'stdout', 'stderr', 'ok'):
+                if key in details:
+                    compact_details[key] = details[key]
+            if contract_warning_payload:
+                compact_details['possible_existing_method_contract_lost'] = contract_warning_payload
+
+            failed_blocks.append(
+                {
+                    'name': block.name,
+                    'severity': block.severity,
+                    'issues': [asdict(issue) for issue in block.issues],
+                    'details': compact_details,
+                }
+            )
+
+        return {
+            'verdict': verification_report.verdict,
+            'passed': verification_report.passed,
+            'summary': {
+                'production_failed': bool((verification_report.summary or {}).get('production_failed')),
+                'generated_test_failed': bool((verification_report.summary or {}).get('generated_test_failed')),
+                'generated_test_runtime_only': bool((verification_report.summary or {}).get('generated_test_runtime_only')),
+                'generated_test_failed_files': list((verification_report.summary or {}).get('generated_test_failed_files') or []),
+                'generated_test_excluded_files': list((verification_report.summary or {}).get('generated_test_excluded_files') or []),
+            },
+            'failed_blocks': failed_blocks,
+            'advisory_warnings': advisory_warnings,
+        }
+
+    def _external_generated_test_failure_review(
+        self,
+        *,
+        run_dir: Path,
+        change_request: ChangeRequest,
+        selected_target: str,
+        context_pack: ContextPack,
+        final_payload: dict[str, Any],
+        apply_result: ApplyResult,
+        external_test_generation: ExternalGenerationCall,
+        generated_test_apply: dict[str, Any] | None,
+        verification_report: VerificationReport,
+    ) -> dict[str, Any]:
+        test_result = external_test_generation.result_summary or {}
+        test_artifact_summary = test_result.get('test_artifact_summary') if isinstance(test_result, dict) else {}
+        test_artifact_payload = self._load_json_file(Path(external_test_generation.result_path)).get('test_artifact') or {}
+        code_artifact = (final_payload.get('code_artifact') or {}) if isinstance(final_payload, dict) else {}
+        production_diff = ''
+        try:
+            production_diff = apply_result.diff.unified_diff
+        except Exception:
+            production_diff = ''
+        request_payload = {
+            'request_id': f'review-generated-test-{selected_target.split(".")[-1]}',
+            'mode': 'review_generated_test_failure',
+            'change_request': {
+                'title': change_request.title,
+                'description': change_request.description,
+                'constraints': list(change_request.constraints),
+                'notes': list(change_request.notes),
+            },
+            'target': {
+                'qualname': selected_target,
+                'file_path': context_pack.target.file_path,
+                'kind': context_pack.target.kind,
+                'operation': code_artifact.get('operation'),
+            },
+            'production_artifact': {
+                'code': code_artifact.get('code') or '',
+                'diff': production_diff,
+                'changed_files': list(apply_result.impact.changed_files or []),
+                'symbols_in_changed_files': list(apply_result.impact.symbols_in_changed_files or []),
+            },
+            'generated_test': {
+                'file_path': test_artifact_payload.get('file_path') or (test_artifact_summary or {}).get('file_path') or '',
+                'source_code': test_artifact_payload.get('source_code') or '',
+                'apply': dict(generated_test_apply or {}),
+            },
+            'verification_context': self._compact_generated_test_review_verification_context(verification_report),
+        }
+        call_result = invoke_generated_test_failure_review(run_dir, self.project_services.config, request_payload)
+        return dict(call_result.result_payload or {})
+
+    def _load_json_file(self, path: Path) -> dict[str, Any]:
+        try:
+            if path.exists():
+                data = json.loads(path.read_text(encoding='utf-8'))
+                return data if isinstance(data, dict) else {}
+        except Exception as exc:
+            LOGGER.warning('Failed to load JSON file %s: %s', path, exc)
+        return {}
 
     def _external_generate_test(
         self,
@@ -1475,6 +1680,32 @@ class PipelineService:
         return [
             dict(item)
             for item in (project_context.get('required_contracts') or [])
+            if isinstance(item, dict)
+        ]
+
+    def _required_class_members_from_generation_request(self, run_dir: Path) -> list[dict[str, Any]]:
+        payload = self._read_generation_request_payload(run_dir)
+        if not isinstance(payload, dict):
+            return []
+        project_context = payload.get('project_context')
+        if not isinstance(project_context, dict):
+            return []
+        return [
+            dict(item)
+            for item in (project_context.get('required_class_members') or [])
+            if isinstance(item, dict)
+        ]
+
+    def _model_surfaces_from_generation_request(self, run_dir: Path) -> list[dict[str, Any]]:
+        payload = self._read_generation_request_payload(run_dir)
+        if not isinstance(payload, dict):
+            return []
+        project_context = payload.get('project_context')
+        if not isinstance(project_context, dict):
+            return []
+        return [
+            dict(item)
+            for item in (project_context.get('model_surfaces') or [])
             if isinstance(item, dict)
         ]
 

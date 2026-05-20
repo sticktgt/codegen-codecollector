@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, asdict
 from pathlib import Path
+import re
 import time
 from typing import Any
 
@@ -194,6 +195,42 @@ class AnalyzeService:
 
         target_resolution_started_at = time.perf_counter()
         recommended_target = self._recommended_target(candidates, target_recommendation)
+        stub_override = self._prefer_existing_stub_target_for_implementation(
+            services=services,
+            base_query=query,
+            candidates=candidates,
+            target_recommendation=target_recommendation,
+            requested_operation=effective_operation,
+            user_operation=requested_operation,
+        )
+        if stub_override is not None:
+            recommended_target, candidates, target_recommendation = stub_override
+            effective_operation = 'replace_symbol'
+            operation_source = 'stub_replace_override'
+            operation_confidence = self._safe_float(target_recommendation.get('operation_confidence')) or 0.88
+            operation_reason = str(target_recommendation.get('operation_reason') or operation_reason or '').strip() or None
+            override_scope = self._insert_scope_from_payload(target_recommendation)
+            if override_scope:
+                effective_insert_scope = override_scope
+        else:
+            replace_stub_override = self._accept_recommended_replace_stub_over_insert(
+                services=services,
+                base_query=query,
+                candidates=candidates,
+                target_recommendation=target_recommendation,
+                recommended_target=recommended_target,
+                requested_operation=effective_operation,
+                user_operation=requested_operation,
+            )
+            if replace_stub_override is not None:
+                recommended_target, candidates, target_recommendation = replace_stub_override
+                effective_operation = 'replace_symbol'
+                operation_source = 'stub_replace_override'
+                operation_confidence = self._safe_float(target_recommendation.get('operation_confidence')) or 0.9
+                operation_reason = str(target_recommendation.get('operation_reason') or operation_reason or '').strip() or None
+                override_scope = self._insert_scope_from_payload(target_recommendation)
+                if override_scope:
+                    effective_insert_scope = override_scope
         if recommended_target:
             recommended_target, candidates, target_recommendation = self._post_process_recommended_target(
                 services=services,
@@ -504,6 +541,311 @@ class AnalyzeService:
         if any(candidate.qualname == recommended for candidate in candidates):
             return recommended
         return None
+
+    def _accept_recommended_replace_stub_over_insert(
+        self,
+        *,
+        services: ProjectServices,
+        base_query: str,
+        candidates: list[SearchCandidate],
+        target_recommendation: dict[str, Any],
+        recommended_target: str | None,
+        requested_operation: str,
+        user_operation: str | None,
+    ) -> tuple[str, list[SearchCandidate], dict[str, Any]] | None:
+        """Accept an LLM replace-symbol recommendation for a matching stub.
+
+        This guards the post-processing order: when the user or search plan still
+        says insert_after_symbol, but the reranker has already found a concrete
+        unimplemented method/function and recommends replace_symbol, analyze must
+        not normalize that method into a class/module anchor for insertion.
+        """
+        if requested_operation != 'insert_after_symbol':
+            return None
+        if not self._looks_like_implementation_request(base_query):
+            return None
+        rerank_operation = self._normalize_operation(str(target_recommendation.get('recommended_operation') or ''))
+        if rerank_operation != 'replace_symbol':
+            return None
+        target = str(target_recommendation.get('recommended_target') or recommended_target or '').strip()
+        if not target:
+            return None
+        candidate = next((item for item in candidates if item.qualname == target), None)
+        if candidate is None or candidate.kind not in {'method', 'function'}:
+            return None
+        symbol = services.store.get_symbol(str(services.project_root), target)
+        if symbol is None or symbol.kind not in {'method', 'function'}:
+            return None
+        if not self._is_unimplemented_stub(symbol.source_code):
+            return None
+        if self._stub_relevance_score(base_query, candidate, symbol) < 0.12:
+            return None
+
+        reason = (
+            'LLM-rerank выбрал replace_symbol для существующего method/function stub с '
+            'NotImplementedError/TODO, совпадающего с запросом по смыслу. Analyze сохраняет '
+            'этот target как заменяемый symbol и не переводит его в anchor для insert_after_symbol.'
+        )
+        updated_recommendation = dict(target_recommendation or {})
+        updated_recommendation.update(
+            {
+                'recommended_operation': 'replace_symbol',
+                'operation_confidence': max(self._safe_float(updated_recommendation.get('operation_confidence')), 0.9),
+                'operation_reason': reason,
+                'recommended_target': symbol.qualname,
+                'target_role': 'target',
+                'target_confidence': max(self._safe_float(updated_recommendation.get('target_confidence')), 0.9),
+                'target_reason': reason,
+                'manual_review_required': False,
+                'expected_new_symbol_kind': symbol.kind,
+                'parent_qualname': symbol.parent_qualname,
+                'insert_scope': {
+                    'value': 'class_body' if symbol.kind == 'method' else 'module_body',
+                    'confidence': 0.95,
+                    'reason': 'Для replace_symbol сохраняется текущая структура существующего stub-symbol.',
+                },
+            }
+        )
+        post_processing = dict(updated_recommendation.get('post_processing') or {})
+        post_processing['llm_replace_stub_kept_over_insert'] = {
+            'from_operation': requested_operation,
+            'to_operation': 'replace_symbol',
+            'target': symbol.qualname,
+            'reason': 'rerank_selected_matching_notimplemented_stub',
+            'user_operation': self._normalize_operation(user_operation or '') or None,
+        }
+        if self._normalize_operation(user_operation or '') == 'insert_after_symbol':
+            warnings_list = list(updated_recommendation.get('warnings') or [])
+            warnings_list.append(
+                {
+                    'code': 'user_operation_overridden_by_existing_stub',
+                    'message': (
+                        'Пользовательская операция insert_after_symbol заменена на replace_symbol, '
+                        'потому что rerank нашел существующий релевантный stub с NotImplementedError/TODO. '
+                        'Это предотвращает добавление второго API рядом с заглушкой.'
+                    ),
+                }
+            )
+            updated_recommendation['warnings'] = warnings_list
+        updated_recommendation['post_processing'] = post_processing
+        updated_candidates = self._promote_replacement_candidate(candidates, candidate, reason)
+        LOGGER.info(
+            'Analyze kept rerank replace-symbol stub recommendation over insert-after: target=%s',
+            symbol.qualname,
+        )
+        return symbol.qualname, updated_candidates, updated_recommendation
+
+    def _prefer_existing_stub_target_for_implementation(
+        self,
+        *,
+        services: ProjectServices,
+        base_query: str,
+        candidates: list[SearchCandidate],
+        target_recommendation: dict[str, Any],
+        requested_operation: str,
+        user_operation: str | None,
+    ) -> tuple[str, list[SearchCandidate], dict[str, Any]] | None:
+        """Prefer replacing an existing stub over inserting a new symbol.
+
+        This is a conservative deterministic correction for CRs phrased as
+        "implement X" when the project already contains a relevant method or
+        function stub with NotImplementedError/TODO. It avoids creating a second
+        API next to a clearly intended placeholder implementation.
+        """
+        if requested_operation != 'insert_after_symbol':
+            return None
+        normalized_user_operation = self._normalize_operation(user_operation or '')
+        if normalized_user_operation and normalized_user_operation != 'insert_after_symbol':
+            return None
+        if not self._looks_like_implementation_request(base_query):
+            return None
+
+        best: tuple[float, SearchCandidate, SymbolRecord] | None = None
+        for candidate in candidates:
+            if candidate.kind not in {'method', 'function'}:
+                continue
+            symbol = services.store.get_symbol(str(services.project_root), candidate.qualname)
+            if symbol is None or not self._is_unimplemented_stub(symbol.source_code):
+                continue
+            relevance = self._stub_relevance_score(base_query, candidate, symbol)
+            if relevance < 0.12:
+                continue
+            score = relevance + max(0.0, float(candidate.score or 0.0)) / 100.0 + max(0.0, float(candidate.confidence or 0.0)) / 10.0
+            if best is None or score > best[0]:
+                best = (score, candidate, symbol)
+
+        if best is None:
+            return None
+
+        _, candidate, symbol = best
+        reason = (
+            'Запрос сформулирован как реализация поведения, и в найденных кандидатах есть существующий '
+            'method/function stub с NotImplementedError, который совпадает с запросом по смыслу. '
+            'Чтобы не добавлять второй API рядом с заглушкой, analyze выбирает replace_symbol для этой заглушки.'
+        )
+        updated_recommendation = dict(target_recommendation or {})
+        updated_recommendation.update(
+            {
+                'recommended_operation': 'replace_symbol',
+                'operation_confidence': max(self._safe_float(updated_recommendation.get('operation_confidence')), 0.88),
+                'operation_reason': reason,
+                'recommended_target': symbol.qualname,
+                'target_role': 'target',
+                'target_confidence': max(float(candidate.confidence or 0.0), 0.88),
+                'target_reason': reason,
+                'manual_review_required': False,
+                'expected_new_symbol_kind': symbol.kind,
+                'parent_qualname': symbol.parent_qualname,
+                'insert_scope': {
+                    'value': 'class_body' if symbol.kind == 'method' else 'module_body',
+                    'confidence': 0.9,
+                    'reason': 'Для replace_symbol сохраняется текущая структура существующего stub-symbol.',
+                },
+            }
+        )
+        post_processing = dict(updated_recommendation.get('post_processing') or {})
+        post_processing['existing_stub_preferred_over_insert'] = {
+            'from_operation': requested_operation,
+            'to_operation': 'replace_symbol',
+            'target': symbol.qualname,
+            'reason': 'implementation_request_with_matching_notimplemented_stub',
+            'user_operation': normalized_user_operation or None,
+        }
+        if normalized_user_operation == 'insert_after_symbol':
+            existing_warnings = updated_recommendation.get('warnings')
+            warnings_list = list(existing_warnings) if isinstance(existing_warnings, list) else []
+            warnings_list.append(
+                {
+                    'code': 'user_operation_overridden_by_existing_stub',
+                    'message': (
+                        'Пользовательская операция insert_after_symbol заменена на replace_symbol, '
+                        'потому что найден существующий релевантный stub с NotImplementedError/TODO. '
+                        'Это предотвращает добавление второго API рядом с заглушкой.'
+                    ),
+                }
+            )
+            updated_recommendation['warnings'] = warnings_list
+        updated_recommendation['post_processing'] = post_processing
+        updated_candidates = self._promote_replacement_candidate(candidates, candidate, reason)
+        LOGGER.info(
+            'Analyze preferred existing stub for implementation request: operation=%s target=%s',
+            'replace_symbol',
+            symbol.qualname,
+        )
+        return symbol.qualname, updated_candidates, updated_recommendation
+
+    def _looks_like_implementation_request(self, text: str) -> bool:
+        normalized = str(text or '').strip().lower()
+        if not normalized:
+            return False
+        stems = (
+            'реализ',
+            'дореализ',
+            'заполн',
+            'убрать заглуш',
+            'заменить заглуш',
+            'добавить реализац',
+            'нужно реализ',
+        )
+        return any(stem in normalized for stem in stems)
+
+    def _is_unimplemented_stub(self, source_code: str) -> bool:
+        source = str(source_code or '')
+        if not source.strip():
+            return False
+        lowered = source.lower()
+        return (
+            'notimplementederror' in lowered
+            or 'todo: реализ' in lowered
+            or 'todo реализ' in lowered
+            or 'метод требует реализации' in lowered
+            or 'требует реализации' in lowered
+        )
+
+    def _stub_relevance_score(self, base_query: str, candidate: SearchCandidate, symbol: SymbolRecord) -> float:
+        query_tokens = self._meaningful_tokens(base_query)
+        candidate_text = ' '.join(
+            [
+                candidate.name,
+                candidate.qualname,
+                candidate.docstring,
+                candidate.knowledge_title,
+                symbol.docstring,
+            ]
+        )
+        candidate_tokens = self._meaningful_tokens(candidate_text)
+        if not query_tokens or not candidate_tokens:
+            return 0.0
+        overlap = query_tokens & candidate_tokens
+        return len(overlap) / max(1, min(len(query_tokens), len(candidate_tokens)))
+
+    def _meaningful_tokens(self, text: str) -> set[str]:
+        raw_tokens = re.findall(r'[A-Za-zА-Яа-яЁё0-9_]+', str(text or '').lower())
+        stop_words = {
+            'и', 'или', 'в', 'во', 'на', 'по', 'для', 'из', 'с', 'со', 'к', 'как', 'что', 'это',
+            'the', 'a', 'an', 'and', 'or', 'to', 'of', 'in', 'on', 'for', 'by', 'with',
+            'реализовать', 'реализует', 'реализация', 'добавить', 'создать', 'метод', 'функция',
+            'должен', 'должна', 'должно', 'нужно', 'требуется', 'полный', 'полного',
+        }
+        result: set[str] = set()
+        for token in raw_tokens:
+            if len(token) < 3 or token in stop_words:
+                continue
+            result.add(token)
+        return result
+
+    def _promote_replacement_candidate(
+        self,
+        candidates: list[SearchCandidate],
+        selected: SearchCandidate,
+        reason: str,
+    ) -> list[SearchCandidate]:
+        promoted = SearchCandidate(
+            qualname=selected.qualname,
+            name=selected.name,
+            kind=selected.kind,
+            file_path=selected.file_path,
+            score=selected.score,
+            confidence=max(float(selected.confidence or 0.0), 0.88),
+            relevance_category='высокая',
+            reasons=self._dedupe([f'Stub post-processing: {reason}', *selected.reasons])[:8],
+            docstring=selected.docstring,
+            knowledge_title=selected.knowledge_title,
+            requirements=list(selected.requirements),
+            ranked_by_llm=True,
+            llm_recommended=True,
+            llm_rank=1,
+            llm_reason=reason,
+        )
+        result = [promoted]
+        rank = 2
+        for candidate in candidates:
+            if candidate.qualname == selected.qualname:
+                continue
+            if candidate.ranked_by_llm:
+                result.append(
+                    SearchCandidate(
+                        qualname=candidate.qualname,
+                        name=candidate.name,
+                        kind=candidate.kind,
+                        file_path=candidate.file_path,
+                        score=candidate.score,
+                        confidence=candidate.confidence,
+                        relevance_category=candidate.relevance_category,
+                        reasons=candidate.reasons,
+                        docstring=candidate.docstring,
+                        knowledge_title=candidate.knowledge_title,
+                        requirements=candidate.requirements,
+                        ranked_by_llm=True,
+                        llm_recommended=False,
+                        llm_rank=rank,
+                        llm_reason=candidate.llm_reason,
+                    )
+                )
+                rank += 1
+            else:
+                result.append(candidate)
+        return result
 
     def _normalize_insert_scope_for_expected_new_symbol(
         self,

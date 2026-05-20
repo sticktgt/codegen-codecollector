@@ -39,7 +39,8 @@ JSON-формат ответа:
 - Если user_operation задана человеком, верни ее как operation.value, но можешь добавить предупреждение в reason/warnings.
 - Если user_insert_scope задан человеком, верни его как insert_scope.value, но можешь добавить предупреждение в reason/warnings.
 - Для replace_symbol ищем существующий symbol, который нужно заменить целиком.
-- Для insert_after_symbol ищем anchor-symbol, после которого нужно добавить новый symbol.
+- Если запрос звучит как «реализовать/дореализовать/заполнить» поведение, и в проекте уже есть существующий method/function stub с NotImplementedError/TODO, совпадающий по смыслу, предпочитай replace_symbol этого stub, а не insert_after_symbol.
+- Для insert_after_symbol ищем anchor-symbol, после которого нужно добавить новый symbol; используй insert_after_symbol только когда нужно добавить новый API, а не заполнить существующую заглушку.
 - Если пользователь просит добавить функцию/helper на уровне модуля, используй insert_scope=module_body и expected_new_symbols.kind=function.
 - Если пользователь явно просит добавить метод в класс, используй insert_scope=class_body и expected_new_symbols.kind=method.
 - Если пользователь использует слово "функция" в смысле новой возможности/обработчика, но в project_map похожий слой реализован методами класса/controller, предпочитай insert_scope=class_body и expected_new_symbols.kind=method.
