@@ -57,6 +57,10 @@ def build_parser() -> argparse.ArgumentParser:
     project_delete = projects_sub.add_parser('delete')
     project_delete.add_argument('--project-id', required=True)
 
+    project_reindex = projects_sub.add_parser('reindex')
+    project_reindex.add_argument('--project-id', required=True)
+    project_reindex.add_argument('--full', action='store_true')
+
     project_onboard = projects_sub.add_parser('onboard')
     project_onboard.add_argument('--project-id')
     project_onboard.add_argument('--input-root', help='Папка onboarding-пакета: внутри ожидается src/ и опциональный архитектурный файл из onboarding.knowledge.architecture_doc_names')
@@ -208,6 +212,36 @@ def main() -> None:
         if args.command == 'projects' and args.projects_command == 'delete':
             result = project_service.delete_project(args.project_id)
             print(json.dumps(result, ensure_ascii=False, indent=2))
+            return
+
+        if args.command == 'projects' and args.projects_command == 'reindex':
+            project = project_service.get_project(args.project_id)
+            services = ProjectServices(Path(project.project_root), tool_root=config.root_path, config=config)
+            report = services.build_index(full_rebuild=args.full)
+            symbols = services.store.list_symbols(str(services.project_root))
+            payload = {
+                'project_id': project.project_id,
+                'project_root': project.project_root,
+                'status': 'ready',
+                'full_rebuild': bool(args.full),
+                'indexed_files': report.indexed_files,
+                'unchanged_files': report.unchanged_files,
+                'deleted_files': report.deleted_files,
+                'search_documents_count': report.search_documents_count,
+                'search_documents_changed': report.search_documents_changed,
+                'graph_indexing_ms': report.graph_indexing_ms,
+                'search_documents_sync_ms': report.search_documents_sync_ms,
+                'vector_index_sync_ms': report.vector_index_sync_ms,
+                'embedded_documents_count': report.embedded_documents_count,
+                'vector_sync_mode': report.vector_sync_mode,
+                'reference_documents_count': report.reference_documents_count,
+                'reference_documents_changed': report.reference_documents_changed,
+                'reference_sync_ms': report.reference_sync_ms,
+                'reference_vector_sync_ms': report.reference_vector_sync_ms,
+                'symbol_count': len([item for item in symbols if item.kind != 'module']),
+                'module_count': len([item for item in symbols if item.kind == 'module']),
+            }
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
             return
 
         if args.command == 'projects' and args.projects_command == 'onboard':

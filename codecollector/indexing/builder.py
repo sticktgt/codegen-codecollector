@@ -30,6 +30,9 @@ class BuildReport:
     reference_documents_changed: bool = False
     reference_sync_ms: int = 0
     reference_vector_sync_ms: int = 0
+    embedded_documents_count: int = 0
+    vector_sync_mode: str = ''
+    search_documents_change_reason: str = ''
 
 
 class PythonIndexBuilder:

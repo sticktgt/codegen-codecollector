@@ -520,12 +520,20 @@ class SessionService:
         if not requirements:
             raise ValueError(f'Session {session_id} does not contain input requirements')
         first_req = requirements[0]
+        reuse_existing_logic = {}
+        if isinstance(analysis, dict):
+            reuse_existing_logic = (analysis.get('target_recommendation') or {}).get('reuse_existing_logic') or {}
+            if not isinstance(reuse_existing_logic, dict):
+                reuse_existing_logic = {}
         change_request = ChangeRequest(
             title=str(first_req.get('title', '')).strip(),
             description=str(first_req.get('description', '')).strip(),
             constraints=[str(item) for item in first_req.get('constraints', []) or []],
             notes=[str(item) for item in first_req.get('notes', []) or []],
             project=str(project.project_name),
+            context_hints={
+                'reuse_existing_logic': reuse_existing_logic,
+            } if reuse_existing_logic else {},
         )
         if not change_request.title or not change_request.description:
             raise ValueError(f'Session {session_id} contains invalid change request payload')

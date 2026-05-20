@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -327,6 +328,70 @@ def _class_field_info_from_source(source: str) -> dict[str, Any]:
     }
 
 
+def _raw_related_symbol_payloads(context_pack: ContextPack) -> list[dict[str, Any]]:
+    """Return untruncated related symbol payloads for structural context blocks."""
+    result: list[dict[str, Any]] = []
+    for item in context_pack.related_symbols or []:
+        result.append({
+            'qualname': item.qualname,
+            'file_path': item.file_path,
+            'module_name': item.module_name,
+            'name': item.name,
+            'kind': item.kind,
+            'parent_qualname': item.parent_qualname,
+            'role': item.role,
+            'origin_qualname': item.origin_qualname,
+            'relation_kind': item.relation_kind,
+            'relation_direction': item.relation_direction,
+            'relation_source': item.relation_source,
+            'relation_confidence': item.relation_confidence,
+            'signature': item.signature,
+            'docstring': item.docstring,
+            'source_excerpt': item.source_code or '',
+            'truncated': False,
+        })
+    return result
+
+
+def _build_model_surfaces(symbols: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Build visible model/class surface from related class symbols.
+
+    The block is used by code generation and test generation to avoid alias
+    fields like title when the visible model constructor accepts topic.
+    """
+    surfaces: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for item in symbols or []:
+        if str(item.get('kind') or '') != 'class':
+            continue
+        source = str(item.get('source_excerpt') or item.get('source_code') or item.get('source') or '')
+        info = _class_field_info_from_source(source)
+        class_name = str(info.get('class_name') or item.get('name') or item.get('qualname', '').rsplit('.', 1)[-1]).strip()
+        qualname = str(item.get('qualname') or '').strip()
+        key = qualname or class_name
+        if not class_name or not key or key in seen:
+            continue
+        field_names = list(info.get('field_names') or [])
+        constructor_names = list(info.get('constructor_field_names') or [])
+        # Keep the surface only when we have some concrete structural data.
+        if not field_names and not constructor_names:
+            continue
+        seen.add(key)
+        all_fields = sorted(set(field_names) | set(constructor_names))
+        surfaces.append({
+            'name': class_name,
+            'qualname': qualname,
+            'fields': all_fields,
+            'model_fields': field_names,
+            'constructor_fields': constructor_names,
+            'required_constructor_fields': list(info.get('required_constructor_fields') or []),
+            'source': 'related_class_symbol',
+        })
+
+    return surfaces
+
+
 def _build_contract_attribute_requirements(related_symbols: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Infer fields read by production contracts from visible source excerpts.
 
@@ -435,6 +500,115 @@ def _build_contract_attribute_requirements(related_symbols: list[dict[str, Any]]
 
 
 
+def _request_mentions_member_removal(change_request: ChangeRequest, member_name: str) -> bool:
+    """Return True only for explicit, local removal instructions.
+
+    This is intentionally narrow: by default replace_symbol for a class must
+    preserve the public class surface. Phrases like ``убрать NotImplementedError
+    из save_note`` mean "implement the method", not "remove save_note".
+    """
+    import re
+
+    if not member_name:
+        return False
+
+    raw_text = " ".join([
+        str(change_request.title or ""),
+        str(change_request.description or ""),
+        " ".join(str(item) for item in (change_request.constraints or [])),
+        " ".join(str(item) for item in (change_request.notes or [])),
+    ])
+    text = raw_text.casefold()
+    member = re.escape(member_name.casefold())
+
+    if not re.search(rf"(?<![\w.]){member}(?![\w.])", text):
+        return False
+
+    # Explicit removal patterns. Keep these narrow to avoid interpreting
+    # "убрать NotImplementedError из <method>" as a request to delete a method.
+    explicit_patterns = [
+        rf"(?:удалить|удали|удаляем|remove|delete|drop)\s+(?:метод|method|member)?\s*{member}(?![\w.])",
+        rf"(?:убрать|убери|исключить|исключи)\s+(?:метод|method|member)\s+{member}(?![\w.])",
+        rf"(?<![\w.]){member}(?![\w.])\s+(?:больше\s+)?(?:не\s+нужен|не\s+нужна|не\s+нужно|не\s+использовать)",
+        rf"(?:не\s+реализовывать|не\s+оставлять|не\s+сохранять)\s+(?:метод|method|member)?\s*{member}(?![\w.])",
+    ]
+    for pattern in explicit_patterns:
+        if re.search(pattern, text):
+            return True
+
+    return False
+
+
+def _public_class_member_names_from_source(source: str, class_name: str) -> list[str]:
+    import ast
+
+    try:
+        tree = ast.parse(source or "")
+    except SyntaxError:
+        return []
+    for node in getattr(tree, "body", []):
+        if not isinstance(node, ast.ClassDef) or node.name != class_name:
+            continue
+        names: list[str] = []
+        for child in node.body:
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                name = str(child.name or "")
+                if name == "__init__" or (name and not name.startswith("_")):
+                    names.append(name)
+        return names
+    return []
+
+
+def _build_required_class_members(
+    *,
+    context_pack: ContextPack,
+    change_request: ChangeRequest,
+    operation: str,
+) -> list[dict[str, Any]]:
+    """Build a conservative public-surface contract for class replacement.
+
+    For replace_symbol on a class, generated code should not silently delete
+    existing public methods. The class source/index is the source of truth; the
+    user request may only explicitly opt out of keeping a member.
+    """
+    target = context_pack.target
+    if str(operation or "") != "replace_symbol" or target.kind != "class":
+        return []
+
+    names: list[str] = []
+    seen: set[str] = set()
+    for item in [target, *context_pack.neighbors]:
+        if item.parent_qualname != target.qualname or item.kind != "method":
+            continue
+        name = str(item.name or "")
+        if not name or (name.startswith("_") and name != "__init__"):
+            continue
+        if name not in seen:
+            seen.add(name)
+            names.append(name)
+
+    if not names:
+        for name in _public_class_member_names_from_source(target.source_code or "", target.name):
+            if name not in seen:
+                seen.add(name)
+                names.append(name)
+
+    members: list[dict[str, Any]] = []
+    for name in names:
+        user_requested_removal = _request_mentions_member_removal(change_request, name)
+        payload = {
+            "name": name,
+            "kind": "method",
+            "sources": ["existing_class_member"],
+            "required": not user_requested_removal,
+        }
+        if user_requested_removal:
+            payload["exclusion_reason"] = "user_requested_removal"
+        members.append(payload)
+
+    return members
+
+
 def _has_required_contract_reuse_signal(change_request: ChangeRequest) -> bool:
     text = " ".join([
         str(change_request.title or ""),
@@ -496,6 +670,141 @@ def _contract_matches_request_topic(contract: dict[str, Any], topic_tokens: set[
         for key in ("name", "qualname", "signature", "origin_qualname")
     ).casefold()
     return any(token in haystack for token in topic_tokens)
+
+
+def _normalize_reuse_existing_logic_hint(change_request: ChangeRequest) -> dict[str, Any]:
+    """Return analyze-provided reuse recommendation without making it mandatory.
+
+    The hint is produced by analyze and is used only to enrich generation context.
+    It must not be inferred from raw request text here.
+    """
+    raw_hints = getattr(change_request, 'context_hints', {}) or {}
+    raw = raw_hints.get('reuse_existing_logic') if isinstance(raw_hints, dict) else {}
+    if not isinstance(raw, dict):
+        return {'mode': 'none', 'confidence': 0.0, 'reason': '', 'contracts': []}
+    mode = str(raw.get('mode') or 'none').strip().lower()
+    if mode not in {'required', 'recommended', 'none'}:
+        mode = 'none'
+    try:
+        confidence = float(raw.get('confidence') or 0.0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    contracts: list[dict[str, Any]] = []
+    for item in raw.get('contracts') or []:
+        if not isinstance(item, dict):
+            continue
+        qualname = str(item.get('qualname') or '').strip()
+        if not qualname:
+            continue
+        contracts.append({
+            'qualname': qualname,
+            'role': str(item.get('role') or '').strip(),
+            'reason': str(item.get('reason') or '').strip(),
+        })
+    if not contracts:
+        mode = 'none'
+    return {
+        'mode': mode,
+        'confidence': max(0.0, min(1.0, confidence)),
+        'reason': str(raw.get('reason') or '').strip(),
+        'contracts': contracts,
+        'source': 'analyze',
+    }
+
+
+def _method_signature_from_ast(node: Any) -> str:
+    try:
+        import ast
+        args = []
+        for arg in list(getattr(node.args, 'posonlyargs', [])) + list(getattr(node.args, 'args', [])):
+            name = str(getattr(arg, 'arg', '') or '')
+            if not name:
+                continue
+            if getattr(arg, 'annotation', None) is not None:
+                try:
+                    name += f": {ast.unparse(arg.annotation)}"
+                except Exception:
+                    pass
+            args.append(name)
+        if getattr(node.args, 'vararg', None) is not None:
+            args.append('*' + str(node.args.vararg.arg))
+        if getattr(node.args, 'kwonlyargs', None):
+            if not getattr(node.args, 'vararg', None):
+                args.append('*')
+            for arg in node.args.kwonlyargs:
+                name = str(getattr(arg, 'arg', '') or '')
+                if getattr(arg, 'annotation', None) is not None:
+                    try:
+                        name += f": {ast.unparse(arg.annotation)}"
+                    except Exception:
+                        pass
+                args.append(name)
+        if getattr(node.args, 'kwarg', None) is not None:
+            args.append('**' + str(node.args.kwarg.arg))
+        suffix = ''
+        if getattr(node, 'returns', None) is not None:
+            try:
+                suffix = f" -> {ast.unparse(node.returns)}"
+            except Exception:
+                suffix = ''
+        return f"def {node.name}({', '.join(args)}){suffix}:"
+    except Exception:
+        return f"def {getattr(node, 'name', '')}(...)"
+
+
+def _same_class_methods_from_source(
+    *,
+    project_root: Path,
+    target: Any,
+    max_items: int = 12,
+    source_chars: int = 900,
+) -> list[dict[str, Any]]:
+    """Extract sibling methods of the target class from the current source file.
+
+    This gives generation a compact view of same-class helpers even when graph
+    relations do not yet connect the target method to newly-added helpers.
+    """
+    parent_qualname = str(getattr(target, 'parent_qualname', '') or '')
+    target_qualname = str(getattr(target, 'qualname', '') or '')
+    if str(getattr(target, 'kind', '') or '') == 'class':
+        parent_qualname = target_qualname
+    if not parent_qualname:
+        return []
+    class_name = parent_qualname.rsplit('.', 1)[-1]
+    source_path = (project_root / str(getattr(target, 'file_path', '') or '')).resolve()
+    try:
+        text = source_path.read_text(encoding='utf-8')
+    except Exception:
+        return []
+    try:
+        import ast
+        tree = ast.parse(text)
+    except Exception:
+        return []
+    module_name = str(getattr(target, 'module_name', '') or parent_qualname.rsplit('.', 1)[0])
+    methods: list[dict[str, Any]] = []
+    for node in getattr(tree, 'body', []):
+        if not isinstance(node, ast.ClassDef) or node.name != class_name:
+            continue
+        for child in getattr(node, 'body', []):
+            if not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            qualname = f'{module_name}.{class_name}.{child.name}'
+            if qualname == target_qualname:
+                continue
+            segment = ast.get_source_segment(text, child) or ''
+            if source_chars > 0 and len(segment) > source_chars:
+                segment = segment[:source_chars] + f"\n# ... truncated, original_chars={len(ast.get_source_segment(text, child) or '')}"
+            methods.append({
+                'qualname': qualname,
+                'name': child.name,
+                'kind': 'method',
+                'signature': _method_signature_from_ast(child),
+                'docstring': ast.get_docstring(child) or '',
+                'source_excerpt': segment,
+            })
+        break
+    return methods[:max_items]
 
 
 def _build_required_contracts(
@@ -999,13 +1308,35 @@ def build_generation_request(
         neighbor_sources=[str(item.source_code or '') for item in context_pack.neighbors],
         related_symbols=all_related_symbols,
     )
-    contract_attribute_requirements = _build_contract_attribute_requirements(all_related_symbols)
+    raw_related_symbols = _raw_related_symbol_payloads(context_pack)
+    model_surfaces = _build_model_surfaces(raw_related_symbols)
+    if model_surfaces:
+        LOGGER.info(
+            'Model surfaces inferred: mode=%s count=%s models=%s',
+            mode,
+            len(model_surfaces),
+            [item.get('qualname') or item.get('name') for item in model_surfaces],
+        )
+    contract_attribute_requirements = _build_contract_attribute_requirements(raw_related_symbols)
     if contract_attribute_requirements:
         LOGGER.info(
             'Contract attribute requirements inferred: mode=%s count=%s contracts=%s',
             mode,
             len(contract_attribute_requirements),
             [item.get('contract_qualname') for item in contract_attribute_requirements],
+        )
+    required_class_members = _build_required_class_members(
+        context_pack=context_pack,
+        change_request=change_request,
+        operation=normalized_operation,
+    )
+    if required_class_members:
+        LOGGER.info(
+            'Required class members inferred: mode=%s target=%s count=%s members=%s',
+            mode,
+            target.qualname,
+            len(required_class_members),
+            [item.get('name') for item in required_class_members if item.get('required', True)],
         )
     required_contracts = _build_required_contracts(
         change_request=change_request,
@@ -1018,6 +1349,18 @@ def build_generation_request(
             mode,
             len(required_contracts),
             [item.get('qualname') or item.get('name') for item in required_contracts],
+        )
+
+    reuse_existing_logic = _normalize_reuse_existing_logic_hint(change_request)
+    same_class_methods = _same_class_methods_from_source(project_root=project_root, target=target)
+    if same_class_methods:
+        LOGGER.info(
+            'Same-class method context inferred: mode=%s target=%s count=%s reuse_mode=%s reuse_contracts=%s',
+            mode,
+            target.qualname,
+            len(same_class_methods),
+            reuse_existing_logic.get('mode'),
+            [item.get('qualname') for item in (reuse_existing_logic.get('contracts') or [])],
         )
 
     project_context = {
@@ -1048,10 +1391,15 @@ def build_generation_request(
             'previous_changes': [],
             'contract_attribute_requirements': contract_attribute_requirements,
             'required_contracts': required_contracts,
+            'model_surfaces': model_surfaces,
         },
         'contract_attribute_requirements': contract_attribute_requirements,
         'required_contracts': required_contracts,
+        'required_class_members': required_class_members,
+        'model_surfaces': model_surfaces,
         'allowed_api_surface': allowed_api_surface,
+        'same_class_methods': same_class_methods,
+        'reuse_existing_logic': reuse_existing_logic,
         'recommended_tests': list(context_pack.recommended_tests),
     }
     context_pack.reference_summary = {
@@ -1086,6 +1434,7 @@ def build_generation_request(
         'options': {
             'generate_test_mode': config.codegenerator_test_generation_mode,
             'required_contracts_count': len(required_contracts),
+            'required_class_members_count': len(required_class_members),
         },
     }
     metrics = {
@@ -1103,6 +1452,7 @@ def build_generation_request(
         'reference_chars': reference_chars,
         'contract_attribute_requirements_count': len(contract_attribute_requirements),
         'required_contracts_count': len(required_contracts),
+        'required_class_members_count': len(required_class_members),
         'request_chars': _json_size(request),
         'estimated_context_chars': estimated_context_chars,
         'related_test_limit': related_test_limit,
@@ -1337,8 +1687,37 @@ def build_repair_request(
             neighbor_sources=[str(item.source_code or '') for item in context_pack.neighbors],
             related_symbols=all_related_symbols,
         )
-    contract_attribute_requirements = _build_contract_attribute_requirements(all_related_symbols)
+    raw_related_symbols = _raw_related_symbol_payloads(context_pack)
+    model_surfaces = []
     previous_project_context = (previous_generation_request or {}).get('project_context') if isinstance(previous_generation_request, dict) else {}
+    if isinstance(previous_project_context, dict):
+        model_surfaces = [
+            dict(item)
+            for item in (previous_project_context.get('model_surfaces') or [])
+            if isinstance(item, dict)
+        ]
+    if not model_surfaces:
+        model_surfaces = _build_model_surfaces(raw_related_symbols)
+    if model_surfaces:
+        LOGGER.info(
+            'Model surfaces inferred for repair: count=%s models=%s',
+            len(model_surfaces),
+            [item.get('qualname') or item.get('name') for item in model_surfaces],
+        )
+    contract_attribute_requirements = _build_contract_attribute_requirements(raw_related_symbols)
+    required_class_members: list[dict[str, Any]] = []
+    if isinstance(previous_project_context, dict):
+        required_class_members = [
+            dict(item)
+            for item in (previous_project_context.get('required_class_members') or [])
+            if isinstance(item, dict)
+        ]
+    if not required_class_members:
+        required_class_members = _build_required_class_members(
+            context_pack=context_pack,
+            change_request=change_request,
+            operation=normalized_operation,
+        )
     required_contracts = []
     if isinstance(previous_project_context, dict):
         required_contracts = [
@@ -1351,6 +1730,31 @@ def build_repair_request(
             change_request=change_request,
             allowed_api_surface=allowed_api_surface,
             related_symbols=all_related_symbols,
+        )
+
+    same_class_methods: list[dict[str, Any]] = []
+    reuse_existing_logic: dict[str, Any] = {'mode': 'none', 'confidence': 0.0, 'reason': '', 'contracts': []}
+    if isinstance(previous_project_context, dict):
+        same_class_methods = [
+            dict(item)
+            for item in (previous_project_context.get('same_class_methods') or [])
+            if isinstance(item, dict)
+        ]
+        raw_reuse_existing_logic = previous_project_context.get('reuse_existing_logic')
+        if isinstance(raw_reuse_existing_logic, dict):
+            reuse_existing_logic = dict(raw_reuse_existing_logic)
+            reuse_existing_logic.setdefault('mode', 'none')
+            reuse_existing_logic.setdefault('confidence', 0.0)
+            reuse_existing_logic.setdefault('reason', '')
+            if not isinstance(reuse_existing_logic.get('contracts'), list):
+                reuse_existing_logic['contracts'] = []
+    if same_class_methods:
+        LOGGER.info(
+            'Same-class method context reused for repair: target=%s count=%s reuse_mode=%s reuse_contracts=%s',
+            target_qualname,
+            len(same_class_methods),
+            reuse_existing_logic.get('mode'),
+            [item.get('qualname') for item in (reuse_existing_logic.get('contracts') or [])],
         )
 
     previous_artifact = dict(previous_result_payload.get('code_artifact') or {})
@@ -1436,10 +1840,15 @@ def build_repair_request(
                 'previous_changes': [],
                 'contract_attribute_requirements': contract_attribute_requirements,
                 'required_contracts': required_contracts,
+                'model_surfaces': model_surfaces,
             },
             'contract_attribute_requirements': contract_attribute_requirements,
             'required_contracts': required_contracts,
+            'required_class_members': required_class_members,
+            'model_surfaces': model_surfaces,
             'allowed_api_surface': allowed_api_surface,
+            'same_class_methods': same_class_methods,
+            'reuse_existing_logic': reuse_existing_logic,
             'recommended_tests': list(context_pack.recommended_tests),
         },
         'reference_context': {
@@ -1474,6 +1883,8 @@ def build_repair_request(
             'allowed_api_surface_free_functions_count': len(allowed_api_surface.get('free_functions') or []),
             'contract_attribute_requirements_count': len(contract_attribute_requirements),
             'required_contracts_count': len(required_contracts),
+            'required_class_members_count': len(required_class_members),
+            'model_surfaces_count': len(model_surfaces),
             'full_file_included': bool(full_file_source),
             'full_file_truncated': full_file_truncated,
         },
@@ -1567,3 +1978,63 @@ def _write_payload(path: Path, payload: dict[str, Any], request_format: str) -> 
         path.write_text(yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding='utf-8')
     else:
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+
+
+def invoke_generated_test_failure_review(run_dir: Path, config: AppConfig, request_payload: dict[str, Any]) -> CodeGeneratorCallResult:
+    """Invoke codegenerator advisory review for generated-test-only failures."""
+    codegen_root = Path(config.codegenerator_root_dir).resolve()
+    request_format = config.codegenerator_request_format.lower()
+    if request_format not in {'json', 'yaml'}:
+        raise ValueError(f'Unsupported codegenerator request format: {request_format}')
+    request_path = run_dir / f'generated_test_review_request.{request_format}'
+    result_path = run_dir / 'generated_test_review_result.json'
+    stdout_path = run_dir / 'codegenerator_generated_test_review_stdout.txt'
+    stderr_path = run_dir / 'codegenerator_generated_test_review_stderr.txt'
+    _write_payload(request_path, request_payload, request_format)
+    command = [
+        config.codegenerator_python,
+        '-m',
+        'codegenerator',
+        'review-generated-test-failure',
+        '--request-file',
+        str(request_path),
+        '--config',
+        str((codegen_root / config.codegenerator_config_path).resolve()),
+    ]
+    LOGGER.info('Invoking codegenerator generated-test failure review: %s', ' '.join(command))
+    completed = subprocess.run(command, cwd=str(codegen_root), capture_output=True, text=True)
+    stdout = completed.stdout or ''
+    stderr = completed.stderr or ''
+    stdout_path.write_text(stdout, encoding='utf-8')
+    stderr_path.write_text(stderr, encoding='utf-8')
+    if stderr.strip():
+        LOGGER.info('codegenerator generated-test review stderr saved to %s', stderr_path)
+    if completed.returncode != 0:
+        raise RuntimeError(f'codegenerator generated-test review failed with exit code {completed.returncode}. stdout={stdout_path} stderr={stderr_path}')
+    if not stdout.strip():
+        raise RuntimeError(f'codegenerator generated-test review returned empty stdout. stderr={stderr_path}')
+    try:
+        result_payload = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f'codegenerator generated-test review returned invalid JSON on stdout: {exc}. stdout={stdout_path} stderr={stderr_path}') from exc
+    result_path.write_text(json.dumps(result_payload, ensure_ascii=False, indent=2), encoding='utf-8')
+    llm_usage = result_payload.get('llm_usage') or {}
+    if llm_usage:
+        LOGGER.info(
+            'codegenerator generated-test review usage prompt_tokens=%s output_tokens=%s total_tokens=%s calls=%s total_duration=%.2fs',
+            llm_usage.get('prompt_tokens'),
+            llm_usage.get('output_tokens'),
+            llm_usage.get('total_tokens'),
+            llm_usage.get('calls'),
+            float(llm_usage.get('total_duration_sec', 0.0) or 0.0),
+        )
+    return CodeGeneratorCallResult(
+        request_path=str(request_path),
+        result_path=str(result_path),
+        command=command,
+        request_payload=request_payload,
+        result_payload=result_payload,
+        trace_path=result_payload.get('trace_path'),
+        stdout_path=str(stdout_path),
+        stderr_path=str(stderr_path),
+    )

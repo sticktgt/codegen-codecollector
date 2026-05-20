@@ -60,24 +60,43 @@ class ProjectServices:
         report.graph_indexing_ms = int((time.perf_counter() - started_at) * 1000)
         self.store.replace_knowledge_relations(str(self.project_root), self.overlays.knowledge_relations())
         self._context_cache.clear()
-        sync_stats = self._sync_search_documents()
+        skip_search_sync_reason = ''
+        if not full_rebuild and report.indexed_files == 0 and report.deleted_files == 0:
+            skip_search_sync_reason = 'skipped_no_index_changes'
+            LOGGER.info(
+                'Search document sync skipped for %s: reason=%s indexed_files=%s deleted_files=%s unchanged_files=%s',
+                self.project_root,
+                skip_search_sync_reason,
+                report.indexed_files,
+                report.deleted_files,
+                report.unchanged_files,
+            )
+            sync_stats = self._skip_search_documents_sync(skip_search_sync_reason)
+        else:
+            sync_stats = self._sync_search_documents()
         report.search_documents_sync_ms = sync_stats['search_documents_sync_ms']
         report.vector_index_sync_ms = sync_stats['vector_index_sync_ms']
         report.search_documents_count = sync_stats['search_documents_count']
         report.search_documents_changed = sync_stats['search_documents_changed']
+        report.embedded_documents_count = int(sync_stats.get('embedded_documents_count', 0) or 0)
+        report.vector_sync_mode = str(sync_stats.get('vector_sync_mode', '') or '')
+        report.search_documents_change_reason = str(sync_stats.get('search_documents_change_reason', '') or '')
         ref_stats = self.reference_library_service.sync_documents()
         report.reference_documents_count = int(ref_stats['reference_documents_count'])
         report.reference_documents_changed = bool(ref_stats['reference_documents_changed'])
         report.reference_sync_ms = int(ref_stats.get('reference_sync_ms', 0))
         report.reference_vector_sync_ms = int(ref_stats.get('reference_vector_sync_ms', 0))
         LOGGER.info(
-            'Build timings for %s: graph_indexing_ms=%s search_documents_sync_ms=%s vector_index_sync_ms=%s search_documents_count=%s changed=%s reference_sync_ms=%s reference_vector_sync_ms=%s reference_docs=%s reference_changed=%s',
+            'Build timings for %s: graph_indexing_ms=%s search_documents_sync_ms=%s vector_index_sync_ms=%s search_documents_count=%s changed=%s change_reason=%s embedded_docs=%s vector_sync_mode=%s reference_sync_ms=%s reference_vector_sync_ms=%s reference_docs=%s reference_changed=%s',
             self.project_root,
             report.graph_indexing_ms,
             report.search_documents_sync_ms,
             report.vector_index_sync_ms,
             report.search_documents_count,
             report.search_documents_changed,
+            report.search_documents_change_reason,
+            report.embedded_documents_count,
+            report.vector_sync_mode,
             report.reference_sync_ms,
             report.reference_vector_sync_ms,
             report.reference_documents_count,
@@ -222,7 +241,19 @@ class ProjectServices:
             LOGGER.exception('Failed to read embedding usage summary from vector_search_service')
             return None 
 
-    def _sync_search_documents(self) -> dict[str, int | bool]:
+    def _skip_search_documents_sync(self, reason: str) -> dict[str, int | bool | str]:
+        existing_count = len(self.store.list_search_documents(str(self.project_root)))
+        return {
+            'search_documents_sync_ms': 0,
+            'vector_index_sync_ms': 0,
+            'search_documents_count': existing_count,
+            'search_documents_changed': False,
+            'embedded_documents_count': 0,
+            'vector_sync_mode': reason,
+            'search_documents_change_reason': reason,
+        }
+
+    def _sync_search_documents(self) -> dict[str, int | bool | str]:
         documents: list[dict[str, str]] = []
         for symbol in self.store.list_symbols(str(self.project_root)):
             if symbol.kind == 'module':
@@ -258,15 +289,54 @@ class ProjectServices:
         normalized_new = sorted(documents, key=lambda item: item['doc_id'])
         normalized_existing = sorted(existing, key=lambda item: item['doc_id'])
         changed = normalized_new != normalized_existing
+        change_reason = 'document_hash_diff' if changed else 'unchanged'
+        if changed:
+            new_ids = {item['doc_id'] for item in normalized_new}
+            existing_ids = {item['doc_id'] for item in normalized_existing}
+            added = len(new_ids - existing_ids)
+            removed = len(existing_ids - new_ids)
+            common = new_ids & existing_ids
+            existing_by_id = {item['doc_id']: item for item in normalized_existing}
+            changed_content = sum(1 for item in normalized_new if item['doc_id'] in common and item != existing_by_id[item['doc_id']])
+            LOGGER.info(
+                'Search documents changed for %s: reason=%s new=%s existing=%s added=%s removed=%s changed_content=%s',
+                self.project_root,
+                change_reason,
+                len(normalized_new),
+                len(normalized_existing),
+                added,
+                removed,
+                changed_content,
+            )
         search_sync_ms = 0
         vector_sync_ms = 0
+        embedded_documents_count = 0
+        vector_sync_mode = 'skipped_no_search_document_changes'
         if changed:
             started = time.perf_counter()
             self.store.replace_search_documents(str(self.project_root), documents)
             search_sync_ms = int((time.perf_counter() - started) * 1000)
             started = time.perf_counter()
+            # Current vector backend replaces all project documents whenever the
+            # derived search document set changes. This is intentionally logged
+            # so slow rebuilds are visible and can be optimized later.
+            embedded_documents_count = len(documents)
+            vector_sync_mode = 'full_project_documents_when_changed'
+            LOGGER.info(
+                'Vector sync started for %s: mode=%s documents=%s',
+                self.project_root,
+                vector_sync_mode,
+                embedded_documents_count,
+            )
             self.vector_search_service.sync_documents(documents)
             vector_sync_ms = int((time.perf_counter() - started) * 1000)
+            LOGGER.info(
+                'Vector sync finished for %s: mode=%s embedded_documents=%s duration_ms=%s',
+                self.project_root,
+                vector_sync_mode,
+                embedded_documents_count,
+                vector_sync_ms,
+            )
             LOGGER.info('Search documents changed for %s: synced %s docs to graph/vector stores', self.project_root, len(documents))
         else:
             LOGGER.info('Search documents unchanged for %s: skip sync to graph/vector stores', self.project_root)
@@ -275,4 +345,7 @@ class ProjectServices:
             'vector_index_sync_ms': vector_sync_ms,
             'search_documents_count': len(documents),
             'search_documents_changed': changed,
+            'embedded_documents_count': embedded_documents_count,
+            'vector_sync_mode': vector_sync_mode,
+            'search_documents_change_reason': change_reason,
         }

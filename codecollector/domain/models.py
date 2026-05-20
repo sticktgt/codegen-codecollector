@@ -34,6 +34,7 @@ class ChangeRequest:
     project: str
     constraints: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    context_hints: dict[str, Any] = field(default_factory=dict)
 
     def search_text(self) -> str:
         parts = [self.title.strip(), self.description.strip()]
@@ -287,6 +288,8 @@ class PipelineExecutionSummary:
     code_generation_usage: dict[str, Any] | None = None
     test_generation_usage: dict[str, Any] | None = None
     repair_generation_usage: dict[str, Any] | None = None
+    generated_test_review_usage: dict[str, Any] | None = None
+    generated_test_review: dict[str, Any] | None = None
     embedding_usage: dict[str, Any] | None = None
 
 @dataclass(slots=True)
@@ -360,5 +363,6 @@ class PipelineRunResult:
     generated_test_apply: dict[str, Any] | None = None
     verification_report: VerificationReport | None = None
     repair_generation: ExternalGenerationCall | None = None
+    generated_test_review: dict[str, Any] | None = None
     warnings: list[str] = field(default_factory=list)
     execution_summary: PipelineExecutionSummary | None = None

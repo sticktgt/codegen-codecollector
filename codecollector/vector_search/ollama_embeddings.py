@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+import time
 
 import requests
 
@@ -89,7 +90,26 @@ class OllamaEmbeddings(Embeddings):
             return []
         payload: dict[str, Any] = {'model': self.model, 'input': texts}
         chars_total = sum(len(text) for text in texts)
+        started = time.perf_counter()
+        LOGGER.info(
+            'embedding batch started endpoint=%s model=%s texts_count=%s chars_total=%s timeout_sec=%s',
+            '/api/embed',
+            self.model,
+            len(texts),
+            chars_total,
+            self.timeout_sec,
+        )
         response = self.session.post(f'{self.base_url}/api/embed', json=payload, timeout=self.timeout_sec)
+        wall_duration_sec = time.perf_counter() - started
+        LOGGER.info(
+            'embedding batch finished endpoint=%s model=%s texts_count=%s chars_total=%s http_status=%s wall_duration=%.2fs',
+            '/api/embed',
+            self.model,
+            len(texts),
+            chars_total,
+            response.status_code,
+            wall_duration_sec,
+        )
         if response.ok:
             data = response.json()
             self._log_usage(data, texts_count=len(texts), chars_total=chars_total, endpoint='/api/embed')
@@ -98,10 +118,27 @@ class OllamaEmbeddings(Embeddings):
                 return [list(map(float, item)) for item in embeddings]
         result: list[list[float]] = []
         for text in texts:
+            started = time.perf_counter()
+            LOGGER.info(
+                'embedding batch started endpoint=%s model=%s texts_count=1 chars_total=%s timeout_sec=%s',
+                '/api/embeddings',
+                self.model,
+                len(text),
+                self.timeout_sec,
+            )
             response = self.session.post(
                 f'{self.base_url}/api/embeddings',
                 json={'model': self.model, 'prompt': text},
                 timeout=self.timeout_sec,
+            )
+            wall_duration_sec = time.perf_counter() - started
+            LOGGER.info(
+                'embedding batch finished endpoint=%s model=%s texts_count=1 chars_total=%s http_status=%s wall_duration=%.2fs',
+                '/api/embeddings',
+                self.model,
+                len(text),
+                response.status_code,
+                wall_duration_sec,
             )
             response.raise_for_status()
             data = response.json()

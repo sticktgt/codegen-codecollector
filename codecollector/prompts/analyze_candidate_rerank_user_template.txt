@@ -21,6 +21,14 @@ JSON-формат ответа:
   "target_reason": "короткое объяснение",
   "manual_review_required": false,
   "warnings": [{"code": "string", "message": "string"}],
+  "reuse_existing_logic": {
+    "mode": "required | recommended | none",
+    "confidence": 0.0,
+    "reason": "короткое объяснение",
+    "contracts": [
+      {"qualname": "qualname", "role": "same_class_helper | project_contract | other", "reason": "коротко"}
+    ]
+  },
   "ranked_candidates": [
     {"candidate_id": "string", "rank": 1, "reason": "коротко"}
   ],
@@ -29,8 +37,9 @@ JSON-формат ответа:
 
 Правила выбора:
 - Для replace_symbol выбирай symbol, который непосредственно реализует изменяемое поведение.
+- Если CR просит «реализовать/дореализовать/заполнить» поведение и среди candidates есть существующий method/function stub с NotImplementedError/TODO, совпадающий с задачей по смыслу, выбирай replace_symbol этого stub. Не добавляй новый symbol рядом с существующей заглушкой.
 - Не выбирай wrapper/controller/use-case метод, если есть более конкретный callee с нужной логикой.
-- Для insert_after_symbol выбирай anchor-symbol: место, рядом с которым логично добавить новый symbol.
+- Для insert_after_symbol выбирай anchor-symbol: место, рядом с которым логично добавить новый symbol; не используй insert_after_symbol для реализации уже существующей заглушки.
 - Для insert_after_symbol + insert_scope=module_body target_role должен быть "anchor".
 - Для insert_after_symbol + insert_scope=class_body target_role должен быть "method_anchor" или "parent_class".
 - Если пользователь явно просит добавить метод в класс, используй insert_scope=class_body, expected_new_symbol_kind=method и заполни parent_qualname.
@@ -44,6 +53,11 @@ JSON-формат ответа:
 - ranked_candidates должен содержать до 5 лучших candidate_id из candidate_cards в порядке полезности для человека.
 - Первый элемент ranked_candidates должен совпадать с recommended_candidate_id, если recommended_candidate_id не null.
 - Не добавляй в ranked_candidates кандидатов, которых нет во входных candidate_cards.
+- Если CR описывает несколько операций/методов одного класса, а кандидаты относятся к одному parent class, поднимать recommended_target до parent class.
+- Если для выполнения CR полезно переиспользовать уже существующую логику из того же класса или видимого проектного контракта, заполни reuse_existing_logic.
+- Используй reuse_existing_logic.mode="recommended", если переиспользование похоже полезным, но запрос не требует этого явно. Используй mode="required" только если без этого получится дублирование уже существующего поведения или запрос явно требует переиспользования существующей логики.
+- В reuse_existing_logic.contracts указывай только реально видимые qualname из candidate_cards, class_members или siblings. Не придумывай новые методы.
+- Если подходящего существующего метода или контракта не видно, верни reuse_existing_logic.mode="none" и contracts=[].
 
 Входные данные:
 $payload_json

@@ -32,7 +32,7 @@ class ContextService:
             inbound = [relation for relation in self.store.list_inbound_relations_for_name(self.project_key, target.name) if relation.relation_kind != 'contains']
         related_tests = self._collect_related_tests(qualname, inbound)
         child_relation_sources = self._child_relation_sources(target, file_symbols)
-        related_symbols = self._collect_related_symbols(target, inbound, outbound, child_relation_sources)
+        related_symbols = self._collect_related_symbols(target, inbound, outbound, file_symbols, child_relation_sources)
         file_based_tests = self._collect_file_based_tests(target)
         for item in file_based_tests:
             if all(existing.qualname != item.qualname for existing in related_tests):
@@ -61,6 +61,7 @@ class ContextService:
         target: SymbolRecord,
         inbound_relations: list[RelationRecord],
         outbound_relations: list[RelationRecord],
+        file_symbols: list[SymbolRecord],
         child_relation_sources: list[tuple[SymbolRecord, list[RelationRecord], list[RelationRecord]]] | None = None,
     ) -> list[RelatedSymbolContext]:
         related: list[RelatedSymbolContext] = []
@@ -137,6 +138,25 @@ class ContextService:
                     continue
                 symbol = self.store.get_symbol(self.project_key, relation.source_qualname)
                 add_symbol(symbol, relation, 'inbound', child_symbol.qualname)
+
+        # For class/method targets, the imported model classes used by the
+        # containing module are often needed by generation and test generation.
+        # Example: NoteStorage methods accept NoteModel, but the class itself may
+        # not have direct outbound relations to NoteModel. Include non-test module
+        # imports from the same file as low-noise related context.
+        module_symbols = [symbol for symbol in file_symbols if symbol.kind == 'module']
+        for module_symbol in module_symbols:
+            for relation in self.store.list_outbound_relations(self.project_key, module_symbol.qualname):
+                if relation.relation_kind not in {'imports'}:
+                    continue
+                symbol = None
+                if relation.target_qualname:
+                    symbol = self.store.get_symbol(self.project_key, relation.target_qualname)
+                if symbol is None and relation.target_ref:
+                    matches = self.store.list_symbols_by_short_name(self.project_key, relation.target_ref)
+                    if len(matches) == 1:
+                        symbol = matches[0]
+                add_symbol(symbol, relation, 'outbound', module_symbol.qualname)
 
         confidence_rank = {'high': 0, 'medium': 1, 'low': 2}
         direction_rank = {'outbound': 0, 'inbound': 1}

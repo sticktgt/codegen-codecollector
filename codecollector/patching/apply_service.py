@@ -92,6 +92,7 @@ class ApplyService:
         if artifact.operation == 'replace_symbol':
             start = symbol.start_line - 1
             end = symbol.end_line
+            payload_lines = self._normalize_replace_symbol_lines(lines, symbol, payload_lines)
             lines[start:end] = payload_lines
         elif artifact.operation == 'insert_after_symbol':
             if artifact.insert_scope == 'class_body':
@@ -105,6 +106,7 @@ class ApplyService:
         if artifact.import_changes:
             updated_source = self._apply_import_changes(updated_source, artifact.import_changes)
         ast.parse(updated_source)
+        self._assert_target_structure_preserved(updated_source, symbol, artifact)
         target_path.write_text(updated_source, encoding='utf-8')
 
     def _apply_import_changes(self, source: str, import_changes: list[dict]) -> str:
@@ -215,6 +217,36 @@ class ApplyService:
         normalized_lines = self._normalize_method_snippet_indentation(dedented.splitlines())
         return [method_indent + line if line.strip() else '' for line in normalized_lines]
 
+    def _normalize_replace_symbol_lines(self, lines: list[str], symbol: SymbolRecord, payload_lines: list[str]) -> list[str]:
+        if symbol.kind != 'method':
+            return payload_lines
+
+        dedented = textwrap.dedent('\n'.join(payload_lines)).strip('\n')
+        if not dedented.strip():
+            raise ValueError('Generated method code is empty for replace_symbol')
+        stripped = dedented.lstrip()
+        if not (stripped.startswith('def ') or stripped.startswith('async def ')):
+            return payload_lines
+
+        method_indent = self._method_indent(lines, symbol)
+        normalized_lines = self._normalize_method_snippet_indentation(dedented.splitlines())
+        return [method_indent + line if line.strip() else '' for line in normalized_lines]
+
+    def _assert_target_structure_preserved(self, source: str, symbol: SymbolRecord, artifact: PatchArtifact) -> None:
+        if artifact.operation != 'replace_symbol':
+            return
+        tree = ast.parse(source)
+        qualnames = set(self._list_symbol_qualnames_from_tree(tree, symbol.module_name))
+        if symbol.qualname in qualnames:
+            return
+
+        if symbol.kind == 'method' and f'{symbol.module_name}.{symbol.name}' in qualnames:
+            raise ValueError(
+                f'Replaced method {symbol.qualname} was rendered as module-level function {symbol.module_name}.{symbol.name}'
+            )
+
+        raise ValueError(f'Replaced target symbol is missing after apply: {symbol.qualname}')
+
     def _method_indent(self, lines: list[str], symbol: SymbolRecord) -> str:
         if symbol.kind == 'method' and 0 <= symbol.start_line - 1 < len(lines):
             line = lines[symbol.start_line - 1]
@@ -249,10 +281,12 @@ class ApplyService:
     def _list_symbol_qualnames_from_source(self, file_path: Path, module_name: str) -> list[str]:
         source = file_path.read_text(encoding='utf-8')
         tree = ast.parse(source)
+        return self._list_symbol_qualnames_from_tree(tree, module_name)
 
+    def _list_symbol_qualnames_from_tree(self, tree: ast.AST, module_name: str) -> list[str]:
         qualnames: list[str] = []
 
-        for node in tree.body:
+        for node in getattr(tree, 'body', []):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 qualnames.append(f'{module_name}.{node.name}')
             elif isinstance(node, ast.ClassDef):
@@ -262,7 +296,7 @@ class ApplyService:
                     if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                         qualnames.append(f'{class_qualname}.{child.name}')
 
-        return qualnames    
+        return qualnames
 
     def _build_impact_summary(
         self,
