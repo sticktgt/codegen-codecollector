@@ -427,6 +427,29 @@ def _self_attribute_type_map(tree: ast.AST | None, class_name: str) -> dict[str,
     return result
 
 
+def _module_level_names(tree: ast.AST | None) -> set[str]:
+    """Return names defined at module level in the target file."""
+    if tree is None:
+        return set()
+    names: set[str] = set()
+    for node in getattr(tree, "body", []):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    names.add(target.id)
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name):
+                names.add(node.target.id)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                imported_name = alias.asname or alias.name.split(".", 1)[0]
+                if imported_name:
+                    names.add(imported_name)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+    return names
+
+
 def _self_attribute_names(tree: ast.AST | None, class_name: str) -> set[str]:
     """Return visible instance attributes for a class.
 
@@ -470,6 +493,70 @@ def _self_attribute_names(tree: ast.AST | None, class_name: str) -> set[str]:
     return names
 
 
+
+def _simple_return_annotation_name(annotation: ast.AST | None) -> str:
+    """Return a simple return annotation name if it is safe to use for local type inference."""
+    if annotation is None:
+        return ""
+    if isinstance(annotation, ast.Name):
+        return annotation.id
+    if isinstance(annotation, ast.Attribute):
+        return annotation.attr
+    if isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
+        value = annotation.value.strip().strip("'\"")
+        if value.isidentifier():
+            return value
+        if "." in value:
+            tail = value.rsplit(".", 1)[-1]
+            return tail if tail.isidentifier() else ""
+    # Keep the first step deliberately conservative: Optional[Note], list[Note]
+    # and other compound annotations are not inferred here.
+    return ""
+
+
+def _same_class_method_return_type_map(
+    tree: ast.AST | None,
+    class_name: str,
+    allowed_type_names: set[str] | None = None,
+) -> dict[str, str]:
+    """Infer direct ``self.method(...)`` return types from same-class method annotations.
+
+    The inference is intentionally narrow and safe: only methods declared in the
+    same visible class and only simple return annotations are used. If
+    ``allowed_type_names`` is provided, the returned type must be in that set.
+    """
+    class_node = _class_node(tree, class_name)
+    if class_node is None:
+        return {}
+
+    result: dict[str, str] = {}
+    allowed = set(allowed_type_names or set())
+    for child in class_node.body:
+        if not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        type_name = _simple_return_annotation_name(child.returns)
+        if not type_name:
+            continue
+        if allowed and type_name not in allowed:
+            continue
+        result[child.name] = type_name
+    return result
+
+
+def _direct_self_method_call_return_type(expr: ast.AST, same_class_method_return_types: dict[str, str]) -> str:
+    """Return type for simple ``self.method(...)`` calls if explicitly known."""
+    if not isinstance(expr, ast.Call):
+        return ""
+    func = expr.func
+    if not (
+        isinstance(func, ast.Attribute)
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "self"
+    ):
+        return ""
+    return same_class_method_return_types.get(str(func.attr or ""), "")
+
+
 def _check_unknown_self_attribute_usage(
     *,
     owner_tree: ast.AST | None,
@@ -487,6 +574,7 @@ def _check_unknown_self_attribute_usage(
 
     known_attributes = _self_attribute_names(owner_tree, parent_class_name)
     known_methods = _class_methods(owner_tree, parent_class_name)
+    module_level_names = _module_level_names(owner_tree)
     checked: list[dict[str, Any]] = []
     checked_methods: list[dict[str, Any]] = []
     unknown: dict[tuple[str, int | None], ast.Attribute] = {}
@@ -546,6 +634,8 @@ def _check_unknown_self_attribute_usage(
         # parent links are not available on the parsed tree, so detect calls with a second pass below.
         if attr.startswith("_") and attr.lstrip("_") in known_attributes:
             unknown[(attr, getattr(node, "lineno", None))] = node
+        elif attr in module_level_names:
+            unknown[(attr, getattr(node, "lineno", None))] = node
 
     for node in ast.walk(scan_tree):
         if not isinstance(node, ast.Call):
@@ -568,8 +658,21 @@ def _check_unknown_self_attribute_usage(
     issues: list[VerificationIssue] = []
     unknown_details: list[dict[str, Any]] = []
     for (attr, line), _node in sorted(unknown.items(), key=lambda item: (item[0][0], item[0][1] or 0)):
-        suggestions = suggested_replacements(attr)
-        suggestion_text = f" Возможная замена: self.{suggestions[0]}." if suggestions else ""
+        is_module_level_name = attr in module_level_names and attr not in known_attributes and attr not in known_methods
+        suggestions = [attr] if is_module_level_name else suggested_replacements(attr)
+        if is_module_level_name:
+            suggestion_text = f" Возможная замена: `{attr}` без `self`."
+            repair_hint = (
+                "For repair: remove `self.` before this name and use the visible module-level name directly, "
+                "or use another visible instance attribute or method from the class context."
+            )
+        else:
+            suggestion_text = f" Возможная замена: self.{suggestions[0]}." if suggestions else ""
+            repair_hint = (
+                "For repair: remove every usage of this unknown self-attribute and use only visible instance "
+                "attributes or methods from the class context. Do not create a new alias/underscore field unless "
+                "the target is the initializer and the user explicitly requested a state change."
+            )
         issues.append(
             VerificationIssue(
                 code="unknown_self_attribute",
@@ -578,17 +681,20 @@ def _check_unknown_self_attribute_usage(
                     f"as an existing attribute or method of {parent_class_name}."
                     f" Visible attributes: {', '.join(sorted(known_attributes)) or '<none>'}."
                     f" Visible methods: {', '.join(sorted(known_methods)) or '<none>'}."
+                    f" Module-level names: {', '.join(sorted(module_level_names)) or '<none>'}."
                     f"{suggestion_text} "
-                    "For repair: remove every usage of this unknown self-attribute and use only visible instance "
-                    "attributes or methods from the class context. Do not create a new alias/underscore field unless "
-                    "the target is the initializer and the user explicitly requested a state change."
+                    f"{repair_hint}"
                 ),
                 severity="error",
                 file_path=target_file,
                 symbol=target_qualname,
             )
         )
-        unknown_details.append({"attribute": attr, "line": line, "suggested_replacements": suggestions})
+        detail = {"attribute": attr, "line": line, "suggested_replacements": suggestions}
+        if is_module_level_name:
+            detail["replacement_kind"] = "module_level_name"
+            detail["suggested_expression"] = attr
+        unknown_details.append(detail)
 
     unknown_method_details: list[dict[str, Any]] = []
     for (method, line), _node in sorted(unknown_methods.items(), key=lambda item: (item[0][0], item[0][1] or 0)):
@@ -618,6 +724,7 @@ def _check_unknown_self_attribute_usage(
         "parent_class": parent_class_name,
         "known_attributes": sorted(known_attributes),
         "known_methods": sorted(known_methods),
+        "module_level_names": sorted(module_level_names),
         "checked_attributes": checked,
         "unknown_attributes": unknown_details,
         "checked_methods": checked_methods,
@@ -1552,6 +1659,11 @@ def _check_model_surface_usage(
     checked_attributes: list[dict[str, Any]] = []
     parent_class_name = _class_name_from_qualname(target_qualname.rsplit(".", 1)[0])
     self_attribute_types = _self_attribute_type_map(tree, parent_class_name)
+    same_class_method_return_types = _same_class_method_return_type_map(
+        tree,
+        parent_class_name,
+        set(surfaces.keys()),
+    )
     field_types_by_class = _related_class_field_type_map(related_symbols)
     parent_map: dict[ast.AST, ast.AST] = {
         child: parent
@@ -1573,6 +1685,9 @@ def _check_model_surface_usage(
                 local_types[arg.arg] = type_name
 
         def infer_model_expr_type(expr: ast.AST) -> str:
+            self_method_type = _direct_self_method_call_return_type(expr, same_class_method_return_types)
+            if self_method_type:
+                return self_method_type
             return _infer_expr_type_for_contract_call(
                 expr,
                 local_types=local_types,
@@ -1744,6 +1859,7 @@ def _check_model_surface_usage(
 
     return issues, {
         "model_surfaces": surfaces,
+        "same_class_method_return_types": dict(sorted(same_class_method_return_types.items())),
         "checked_constructor_calls": checked_constructor_calls,
         "checked_attributes": checked_attributes,
         "skipped": False,
@@ -2270,6 +2386,7 @@ def _infer_function_local_value_types(
     *,
     related_symbols: list[Any] | None,
     self_attribute_types: dict[str, str],
+    same_class_method_return_types: dict[str, str] | None = None,
 ) -> dict[str, str]:
     field_types_by_class = _related_class_field_type_map(related_symbols)
     local_types: dict[str, str] = {}
@@ -2281,6 +2398,9 @@ def _infer_function_local_value_types(
             local_types[arg.arg] = type_name
 
     def infer(expr: ast.AST) -> str:
+        self_method_type = _direct_self_method_call_return_type(expr, same_class_method_return_types or {})
+        if self_method_type:
+            return self_method_type
         return _infer_expr_type_for_contract_call(
             expr,
             local_types=local_types,
@@ -2321,6 +2441,7 @@ def _check_contract_call_signatures(
     request_text = _change_request_text(change_request)
     parent_class_name = _class_name_from_qualname(target_qualname.rsplit(".", 1)[0])
     self_attribute_types = _self_attribute_type_map(tree, parent_class_name)
+    same_class_method_return_types = _same_class_method_return_type_map(tree, parent_class_name)
 
     if not specs_by_name:
         return issues, {
@@ -2342,6 +2463,7 @@ def _check_contract_call_signatures(
                 function_node,
                 related_symbols=related_symbols,
                 self_attribute_types=self_attribute_types,
+                same_class_method_return_types=same_class_method_return_types,
             )
             if isinstance(function_node, (ast.FunctionDef, ast.AsyncFunctionDef))
             else {}

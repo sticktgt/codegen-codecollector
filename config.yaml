@@ -78,9 +78,9 @@ analysis:
     num_ctx: 16384
     num_predict: 4096 # 1200
     keep_alive: 0
-    max_prompt_chars: 12000
-    search_plan_max_prompt_chars: 15000
-    rerank_max_prompt_chars: 15000
+    max_prompt_chars: 18000
+    search_plan_max_prompt_chars: 20000
+    rerank_max_prompt_chars: 20000
     rerank_soft_overflow_ratio: 1.02
     rerank_json_indent: 0
     rerank_drop_operation_definitions_on_overflow: true

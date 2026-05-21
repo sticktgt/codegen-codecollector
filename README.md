@@ -1,607 +1,407 @@
 # codecollector
 
-`codecollector` — orchestration-слой для управляемого dry-run изменения кода в локальном проекте по пользовательскому запросу.
+`codecollector` — технический оркестратор для управляемой доработки локального Python-проекта через анализ запроса, выбор места изменения, сбор контекста, вызов внешнего генератора кода, применение результата в staging workspace, проверки, repair и подготовку dry-run merge plan.
 
-Проект индексирует целевой код, помогает выбрать точку изменения, собирает проектный контекст, вызывает внешний `codegenerator`, применяет результат во временный workspace, запускает проверки и сохраняет артефакты запуска. Основной проект не изменяется автоматически: результат остается в staging workspace и применяется только после решения человека.
+Проект работает как нижний слой общего решения. Он не занимается верхнеуровневой детализацией бизнес-требований и не является UI. Пользовательский workflow, CR и отображение результатов находятся во внешнем интерфейсе, например в `codeui`.
 
-Текущая реализация ориентирована на Python-проекты, CLI-контракт, JSON-артефакты, локальные или совместимые с Ollama LLM-сервисы и human-in-the-loop review.
+## Роль проекта
 
-## Назначение
+`codecollector` отвечает за:
 
-`codecollector` не генерирует код самостоятельно. Он подготавливает структурированный, проверяемый и воспроизводимый процесс изменения кода.
-
-Основные функции:
-
-- регистрация и удаление проектов;
-- onboarding проекта из рабочей папки с кодом;
-- построение и обновление индекса проекта;
-- генерация и обновление `.codecollector/knowledge.yaml`;
-- enrichment `knowledge.yaml` по архитектурному документу через LLM;
-- поиск релевантных symbols;
-- LLM-assisted analyze пользовательского запроса;
-- выбор target для `replace_symbol` или anchor для `insert_after_symbol`;
+- регистрацию локальных проектов;
+- onboarding проекта из входной папки;
+- построение graph/index по исходному коду;
+- построение search documents;
+- синхронизацию vector search;
+- построение и обогащение `knowledge.yaml`;
+- анализ пользовательского запроса;
+- подбор target/anchor и operation;
 - сбор context pack;
-- формирование `allowed_api_surface`, `contract_context`, `required_contracts`, `required_class_members` и `model_surfaces`;
-- подбор reference artifacts;
-- подготовка request для внешнего `codegenerator`;
-- вызов `codegenerator` в режимах `generate`, `generate-test`, `repair` и `review-generated-test-failure`;
-- применение production artifact во временный workspace;
-- применение generated test, если он создан и прошел статические проверки;
-- запуск verification;
-- выполнение repair для исправимых ошибок production-кода;
-- выполнение рекомендательной проверки при ошибке сгенерированного теста;
-- формирование diff, impact summary и dry-run merge plan;
-- применение workspace в основной проект по явной команде;
-- сохранение run artifacts для анализа.
+- формирование allowed API surface;
+- формирование model surfaces;
+- формирование contract context;
+- формирование required/recommended contract context;
+- вызов `codegenerator`;
+- применение production artifact в staging workspace;
+- статические и runtime-проверки;
+- repair orchestration;
+- generated-test generation и semantic validation;
+- advisory review для generated-test failure;
+- dry-run merge plan;
+- применение workspace в основной проект после решения человека.
 
-## Границы ответственности
+## Основные сущности
 
-`codecollector` отвечает за orchestration, проектный контекст, проверки и workspace lifecycle.
+### Project
 
-`codecollector` не отвечает за:
+Проект — локальный каталог с исходным кодом. Внутри onboarding input ожидается папка `src/`. Архитектурный документ может присутствовать рядом с `src/` и использоваться для enrichment `knowledge.yaml`.
 
-- непосредственную генерацию production-кода;
-- непосредственную генерацию тестового файла;
-- сборку LLM-промптов для generation, test generation, repair и review;
-- низкоуровневый вызов LLM в `codegenerator`;
-- web-интерфейс и CR lifecycle в `codeui`.
+Один `project_root` не должен быть зарегистрирован повторно. Повторная регистрация возвращает структурированную ошибку duplicate root.
 
-Эти задачи выполняются соответственно в `codegenerator` и `codeui`.
+### Session
 
-## Основной сценарий dry-run
+Session создается при `sessions analyze` и хранит:
 
-Типовой сценарий работы:
+- исходный CR;
+- выбранный проект;
+- requested operation;
+- результат анализа;
+- recommended target;
+- selected target;
+- связанные run ids;
+- связанные workspace ids;
+- последний run/workspace.
 
-1. Пользователь регистрирует проект или выполняет onboarding нового проекта.
-2. `codecollector` строит или обновляет индекс проекта.
-3. Пользователь запускает `sessions analyze`.
-4. Analyze оценивает запрос, определяет operation и находит кандидатов.
-5. Пользователь принимает рекомендацию или выбирает target вручную.
-6. Пользователь запускает `sessions generate`.
-7. Pipeline собирает context pack и reference artifacts.
-8. Pipeline формирует request для `codegenerator`.
-9. `codegenerator` возвращает production artifact.
-10. `codecollector` применяет artifact в staging workspace.
-11. `codecollector` запускает статические проверки production patch.
-12. Если production patch требует repair, вызывается `codegenerator repair`.
-13. После валидного production patch вызывается `generate-test`.
-14. Generated test применяется в workspace, если он прошел статические проверки.
-15. Runtime verification запускает `compileall` и рекомендованные pytest targets.
-16. Если падает только generated test, может быть выполнен advisory review.
-17. Формируется `merge_plan` в режиме `dry_run`.
-18. Итоговый run сохраняется в `.runs/`.
-19. Пользователь принимает решение, применять workspace в основной проект или нет.
+### Run
 
-## Проекты
+Run создается при `sessions generate` и хранится в `.runs`. Run содержит:
 
-### Регистрация проекта
+- входной change request;
+- выбранный target;
+- context pack;
+- generation request/result;
+- repair request/result, если repair был выполнен;
+- generated-test request/result;
+- generated-test review request/result, если review был выполнен;
+- verification report;
+- generated test apply status;
+- merge plan;
+- diff;
+- steps timeline.
 
-```bash
-python -m codecollector projects register \
-  --project-name sample_python_app \
-  --project-root /path/to/project
-```
+### Workspace
 
-Команда регистрирует проект с указанным `project_root`.
+Workspace — staging-копия исходного проекта, куда применяется generated artifact. Workspace не применяется в основной проект автоматически. Применение выполняется отдельной командой после ручного review.
 
-Повторная регистрация проекта с тем же `project_root` блокируется. Индексные и vector-данные разделяются по `project_root`, поэтому один и тот же путь не должен быть зарегистрирован несколько раз.
+## Project onboarding
 
-### Onboarding существующего проекта
+Команда:
 
 ```bash
 python -m codecollector projects onboard \
-  --project-id <project_id> \
+  --input-root /path/to/project \
+  --project-name example \
   --full
 ```
 
-Команда строит индекс проекта и пересобирает `.codecollector/knowledge.yaml` из фактических modules и symbols.
-
-### Onboarding нового проекта из папки
-
-```bash
-python -m codecollector projects onboard \
-  --input-root /path/to/onboarding-folder \
-  --project-name sample_python_app \
-  --full
-```
-
-Ожидаемая структура входной папки:
+Ожидаемая структура:
 
 ```text
-/path/to/onboarding-folder/
+<input-root>/
   src/
-  ARCHITECT.md или ARCHITECTURE.md
+  ARCHITECTURE.md или ARCHITECT.md
 ```
 
-`src/` используется как `project_root`.
+Во время onboarding:
 
-Архитектурный документ ищется в корне входной папки по именам из `onboarding.knowledge.architecture_doc_names`. По умолчанию поддерживаются `ARCHITECT.md` и `ARCHITECTURE.md`.
+1. Регистрируется проект.
+2. Строится graph/index по `src`.
+3. Формируются search documents.
+4. Выполняется vector sync.
+5. Создается базовый `knowledge.yaml`.
+6. Если найден архитектурный документ, выполняется LLM-enrichment `knowledge.yaml`.
+7. Если архитектурный документ не найден, onboarding продолжается без enrichment.
+8. Если enrichment найденного архитектурного документа завершился ошибкой, onboarding считается неуспешным, регистрация и индексы откатываются.
 
-Если архитектурный документ найден, `codecollector`:
+## Reindex
 
-1. регистрирует проект;
-2. строит индекс кода;
-3. создает базовый `knowledge.yaml` по коду;
-4. выполняет LLM-enrichment `knowledge.yaml` по архитектурному документу.
-
-Если архитектурный документ найден, но enrichment завершился ошибкой, onboarding считается неуспешным. Регистрация проекта и индексные данные откатываются.
-
-Если архитектурный документ не найден, onboarding продолжается без LLM-enrichment и пишет warning в лог.
-
-Чтобы отключить LLM-enrichment для конкретного запуска:
-
-```bash
-python -m codecollector projects onboard \
-  --input-root /path/to/onboarding-folder \
-  --project-name sample_python_app \
-  --skip-architecture-enrichment
-```
-
-### Диагностика architecture enrichment
-
-При подготовке prompt для enrichment `codecollector` сохраняет валидность контекста:
-
-- сначала старается передать полный список файлов и symbols;
-- при нехватке budget сжимает поля всего набора, а не выбирает произвольную часть проекта;
-- компактный режим symbols передает полный список `qualname/kind/module`;
-- архитектурный документ может быть урезан, но не ниже минимального полезного порога.
-
-Если полный компактный список symbols и минимально полезный фрагмент архитектурного документа не укладываются в лимит, onboarding нужно запустить с большим лимитом или с `--skip-architecture-enrichment`.
-
-Ответ LLM разбирается как JSON. При ошибке разбора или незавершенном ответе raw response сохраняется в `.runs/knowledge_enrichment_traces/` внутри проекта `codecollector`.
-
-После нормализации LLM-ответа выполняется диагностика ссылок в `architecture.flows.steps`. Если шаг похож на ссылку на symbol или module, но не находится в индексе проекта, он возвращается в `knowledge_enrichment_unmatched_mentions` и `knowledge_enrichment_warnings`.
-
-В `knowledge.yaml` отдельные `unresolved_steps` и `unmatched_mentions` не записываются. Эти данные остаются диагностикой onboarding.
-
-### Переиндексация проекта
-
-Для уже зарегистрированного проекта доступна отдельная переиндексация без повторного onboarding:
+Обычная переиндексация:
 
 ```bash
 python -m codecollector projects reindex --project-id <project_id>
 ```
 
-По умолчанию выполняется инкрементальная переиндексация.
-
-Для полного graph rebuild:
+Полная переиндексация graph/index:
 
 ```bash
 python -m codecollector projects reindex --project-id <project_id> --full
 ```
 
-`--full` выполняет полный graph rebuild, но не означает принудительный пересчет embeddings. Embeddings пересчитываются только если изменились search documents.
+Текущая семантика:
 
-Если инкрементальная переиндексация не обнаружила измененных или удаленных файлов, search document sync и vector sync пропускаются.
-
-Ответ содержит:
-
-- `indexed_files`;
-- `unchanged_files`;
-- `deleted_files`;
-- `search_documents_count`;
-- `search_documents_changed`;
-- `search_documents_change_reason`;
-- `graph_indexing_ms`;
-- `search_documents_sync_ms`;
-- `vector_index_sync_ms`;
-- `embedded_documents_count`;
-- `vector_sync_mode`;
-- reference sync metrics.
-
-Текущий vector sync режим при изменениях — полный vector resync всех search documents проекта:
-
-```text
-full_project_documents_when_changed
-```
-
-Если изменений нет, vector sync пропускается.
-
-### Удаление проекта
-
-```bash
-python -m codecollector projects delete --project-id <project_id>
-```
-
-Команда удаляет регистрацию проекта и очищает graph/vector index данные по `project_root`.
-
-Если соответствующие graph/vector записи уже отсутствуют, это не считается ошибкой. Если количество удаленных graph search documents и vector documents различается, команда возвращает warning о возможном рассинхроне индекса.
-
-Если в registry остались другие проекты с тем же `project_root`, очистка индекса пропускается, чтобы не удалить данные, которые еще используются другой регистрацией.
+- обычный reindex выполняет incremental build;
+- `--full` выполняет полный graph rebuild;
+- `--full` не означает обязательный force vector re-embedding;
+- embeddings пересчитываются только при изменении search documents;
+- если incremental reindex не нашел измененных или удаленных файлов, search document sync и vector sync пропускаются;
+- текущий режим vector sync при изменениях — full project vector resync.
 
 ## Analyze
 
-Команда `sessions analyze` создает session, оценивает пользовательский запрос, определяет operation, выполняет поиск и возвращает список кандидатов.
+Команда:
 
 ```bash
-python -m codecollector sessions analyze \
-  --project-id <project_id> \
-  --title "Изменить текст уведомления о назначении тикета" \
-  --description "Сделать уведомление на русском языке." \
-  --constraint "Не менять внешний контракт API"
+python -m codecollector sessions analyze --project-id <project_id> --request-file <request.json>
 ```
 
-Analyze может использовать два LLM-assisted этапа:
+Analyze выполняет:
 
-1. `search_plan` — оценивает качество запроса, operation, expected symbols и поисковый план.
-2. `candidate_rerank` — ранжирует candidate cards и выбирает target или anchor.
+- оценку качества запроса;
+- выбор operation;
+- выбор insert scope;
+- поиск кандидатов;
+- rerank кандидатов;
+- рекомендацию target или anchor;
+- формирование target role;
+- формирование context summary;
+- формирование подсказок по переиспользованию существующей проектной логики.
 
-Если пользователь явно передал operation, она имеет приоритет над LLM-рекомендацией.
+### Request quality
 
-### Качество запроса
+`request_quality.status` может быть:
 
-Analyze возвращает `request_quality`.
+- `processable` — запрос можно выполнять;
+- `uncertain` — запрос можно выполнять после решения пользователя;
+- `insufficient` — запрос недостаточен для генерации.
+
+### Target role
+
+`target_role` показывает роль выбранного symbol:
+
+- `target` — изменяемый symbol;
+- `anchor` — точка вставки;
+- `parent_class` — класс, в который добавляется новый метод.
+
+### Reuse existing logic
+
+Analyze может вернуть поле `reuse_existing_logic`.
+
+Назначение поля — подсказать generation/repair, какие существующие методы или проектные контракты стоит рассмотреть для переиспользования.
+
+Пример структуры:
 
 ```json
 {
-  "request_quality": {
-    "status": "processable",
-    "reason": "Запрос достаточно конкретен.",
-    "missing_information": []
-  }
-}
-```
-
-Возможные статусы:
-
-| Статус | Значение |
-|---|---|
-| `processable` | Запрос достаточно конкретен для выбора target или anchor. |
-| `uncertain` | Есть неопределенность, но система может сделать рабочую попытку. |
-| `insufficient` | Запрос недостаточен для generation. Нужно переписать запрос и заново запустить analyze. |
-
-Если `request_quality.status=insufficient`, generation блокируется.
-
-Если первичный search plan считал запрос недостаточным, но candidate rerank уверенно выбрал target и operation, итоговый `request_quality` может быть повышен до `processable` с указанием исходного статуса и причины разрешения.
-
-### Operation source
-
-Итоговая operation возвращается в `requested_operation`.
-
-```json
-{
-  "requested_operation": "insert_after_symbol",
-  "operation_source": "llm_rerank",
-  "operation_confidence": 0.9,
-  "operation_reason": "Запрос требует добавить новый method."
-}
-```
-
-Возможные источники:
-
-| Источник | Значение |
-|---|---|
-| `user` | Operation явно задана пользователем. |
-| `llm_search_plan` | Operation определена на этапе search plan. |
-| `llm_rerank` | Operation уточнена на этапе rerank кандидатов. |
-| `fallback` | Использовано техническое значение по умолчанию. |
-
-### Target recommendation
-
-Analyze возвращает `target_recommendation`.
-
-```json
-{
-  "target_recommendation": {
-    "recommended_operation": "insert_after_symbol",
-    "insert_scope": {
-      "value": "class_body",
-      "confidence": 0.9,
-      "reason": "API-логика реализована методами класса."
-    },
-    "expected_new_symbol_kind": "method",
-    "parent_qualname": "support_app.api.controllers.TicketController",
-    "recommended_target": "support_app.api.controllers.TicketController",
-    "target_role": "anchor",
-    "target_confidence": 0.95,
-    "manual_review_required": false
-  }
-}
-```
-
-Возможные роли:
-
-| Роль | Значение |
-|---|---|
-| `target` | Symbol заменяется. |
-| `anchor` | Symbol используется как точка вставки. |
-| `parent_class` | Target нормализован до класса для вставки method. |
-| `unknown` | Роль не определена. |
-
-Для `replace_symbol` выбранный target является объектом замены.
-
-Для `insert_after_symbol` выбранный target является anchor. Новый symbol создается `codegenerator`.
-
-Если LLM выбирает method-anchor для `insert_after_symbol`, analyze может нормализовать anchor до parent class и установить `insert_scope=class_body`.
-
-Если ожидаемый новый symbol является class, вставка нормализуется в `insert_scope=module_body`, даже если anchor — существующий class.
-
-### Candidates
-
-Analyze возвращает candidates для UI или CLI.
-
-```json
-{
-  "qualname": "support_app.api.controllers.TicketController.agent_summary_endpoint",
-  "name": "agent_summary_endpoint",
-  "kind": "method",
-  "file_path": "support_app/api/controllers.py",
-  "score": 23.31,
-  "confidence": 1.0,
-  "relevance_category": "высокая",
-  "reasons": [
-    "Существующий API-метод с похожей логикой"
-  ],
-  "ranked_by_llm": true,
-  "llm_recommended": false,
-  "llm_rank": 2,
-  "llm_reason": "Подходит как anchor для новой функции статистики."
-}
-```
-
-Основные поля:
-
-| Поле | Значение |
-|---|---|
-| `qualname` | Полное имя symbol. |
-| `kind` | `module`, `class`, `function`, `method`. |
-| `file_path` | Файл symbol. |
-| `score` | Поисковый score. |
-| `confidence` | Нормализованная уверенность. |
-| `relevance_category` | Категория релевантности. |
-| `reasons` | Причины попадания в candidates. |
-| `ranked_by_llm` | Кандидат участвовал в LLM rerank. |
-| `llm_recommended` | Кандидат рекомендован LLM. |
-| `llm_rank` | Ранг по LLM. |
-| `llm_reason` | Причина ранга. |
-
-## Выбор target
-
-Команда `sessions select-target` фиксирует ручной выбор target или anchor.
-
-```bash
-python -m codecollector sessions select-target \
-  --session-id <session_id> \
-  --selected-qualname support_app.services.notification_service.build_assignment_message \
-  --operation replace_symbol
-```
-
-`select-target` не исправляет недостаточный запрос. Если analyze вернул `insufficient`, нужно переписать запрос и снова выполнить analyze.
-
-## Generate pipeline
-
-Команда `sessions generate` запускает pipeline по session.
-
-```bash
-python -m codecollector sessions generate --session-id <session_id>
-```
-
-Если session не готова к generation, команда возвращает JSON с причиной блокировки.
-
-```json
-{
-  "result_summary": {
-    "status": "needs_user_decision",
-    "generation_blocked": true,
-    "block_reason": "insufficient_request",
-    "request_quality_status": "insufficient",
-    "missing_information": [
-      "конкретное ожидаемое поведение"
-    ],
-    "recommended_action": "rewrite_request_and_run_analyze_again"
-  }
-}
-```
-
-## Context pack
-
-Context pack содержит структурированный контекст выбранного target или anchor:
-
-- target symbol;
-- parent symbol;
-- class members;
-- module outline;
-- related tests;
-- recommended tests;
-- related production symbols;
-- inbound/outbound relations;
-- requirement ids;
-- reference summary;
-- reference artifacts.
-
-Для class-target при `insert_after_symbol/class_body` дополнительно учитываются relations child methods. Это помогает сохранить контракты, которые используются методами класса.
-
-## Contract context
-
-`contract_context` содержит связанные production symbols, выбранные `codecollector`.
-
-Обычно включает:
-
-- `qualname`;
-- `file_path`;
-- `module_name`;
-- `name`;
-- `kind`;
-- `signature`;
-- `source_excerpt`;
-- relation metadata;
-- `origin_qualname`.
-
-`contract_context` считается фактическим проектным контекстом. Его сигнатуры, import path и source excerpts используются как источник истины для вызовов соседних компонентов.
-
-## Allowed API Surface
-
-`allowed_api_surface` — компактный список разрешенных вызовов, передаваемый в `codegenerator`.
-
-Поверхность строится консервативно:
-
-- `self.<attr>` из `__init__`, если есть type annotation;
-- методы типа, видимые в related symbols, graph index или source excerpts;
-- вложенные зависимости, если они уже встречаются в видимых вызовах или source excerpts;
-- free functions из видимого контекста.
-
-Если тип или метод неясен, он не добавляется в allowed surface.
-
-Если generated code вызывает метод зависимости, которого нет в allowed surface, проверка может вернуть issue `unknown_injected_dependency_method`.
-
-## Required contracts
-
-Если пользователь явно просит использовать существующую сервисную функцию, production contract или не дублировать бизнес-логику, `codecollector` может сформировать блок `required_contracts`.
-
-Блок строится только по видимому project context и `allowed_api_surface`.
-
-`patch_static_semantics` проверяет, что новый generated symbol действительно вызывает обязательный contract. Если generated code заменяет обязательный contract ручной реализацией логики, проверка возвращает issue `required_contract_not_used`.
-
-## Required class members
-
-Для `replace_symbol`, когда target является классом, `codecollector` формирует `required_class_members`.
-
-Блок строится из фактического исходного класса и включает существующий публичный API класса:
-
-- `__init__`;
-- публичные методы без префикса `_`;
-- явно видимые public members.
-
-Назначение блока — не дать модели при замене класса случайно удалить существующие публичные методы.
-
-Если обязательный метод исчез, `patch_static_semantics` возвращает issue `class_replacement_missing_existing_member`.
-
-`codecollector` не считает фразу вида `убрать NotImplementedError из save_note` запросом на удаление метода. Такая формулировка трактуется как требование сохранить метод и реализовать его тело.
-
-## Model surfaces
-
-Для связанных классов-моделей из видимого project context `codecollector` формирует `model_surfaces`.
-
-Блок содержит:
-
-- имя модели;
-- qualname;
-- видимые поля;
-- constructor fields;
-- required constructor fields;
-- источник.
-
-`model_surfaces` используется для:
-
-- генерации production-кода без выдуманных полей;
-- генерации тестов без неверных constructor kwargs;
-- статической проверки generated tests;
-- статической проверки production-кода в пределах доступного контекста.
-
-## Verification
-
-После применения запускаются проверки.
-
-Используются:
-
-- `runtime_ast_parse`;
-- `runtime_py_compile`;
-- `runtime_pytest_recommended`;
-- `patch_static_semantics`;
-- `generated_test_static_semantics`;
-- `generated_test_relevance`.
-
-Статусы verification:
-
-| Статус | Значение |
-|---|---|
-| `ready_for_merge_review` | Production-код и проверки прошли. |
-| `verification_failed` | Ошибка в production-коде или основных проверках. |
-| `generated_test_verification_failed` | Production-код прошел основные проверки, но generated test не прошел verification. |
-| `repair_verification_failed` | Repair выполнен, но verification не прошел. |
-| `repair_no_effective_change` | Repair не дал полезного изменения. |
-
-Если падает только generated test, production-код не описывается автоматически как некорректный и не отправляется в repair.
-
-### patch_static_semantics
-
-`patch_static_semantics` проверяет только новый или заменяемый symbol.
-
-Проверяются:
-
-- дубликаты symbols;
-- вызовы production-contract symbols;
-- обязательные аргументы production contracts;
-- фиктивные literals в обязательных аргументах;
-- receiver для method-контрактов;
-- неизвестные поля результата production-контракта;
-- небезопасный возврат `__dict__`;
-- неизвестные dependency methods;
-- required contracts usage;
-- required class members;
-- неизвестные annotation names;
-- model surface usage.
-
-Проверка может возвращать advisory warnings. Пример:
-
-```json
-{
-  "possible_existing_method_contract_lost": {
-    "warnings": [
+  "reuse_existing_logic": {
+    "mode": "recommended",
+    "confidence": 0.82,
+    "reason": "...",
+    "contracts": [
       {
-        "code": "possible_existing_method_contract_lost",
-        "severity": "warning",
-        "method": "note.note_model.Note.is_modified",
-        "message": "...",
-        "missing_exception_contracts": ["TypeError"]
+        "qualname": "note.note_storage.NoteStorage.find_note_file_by_id",
+        "role": "same_class_helper",
+        "reason": "..."
       }
     ]
   }
 }
 ```
 
-Такие warnings не блокируют pipeline, но должны учитываться при ручном review.
+`reuse_existing_logic` является контекстной подсказкой. Само по себе это поле не превращается в hard `required_contracts`. Hard constraints передаются отдельно через required contracts.
 
-### generated_test_static_semantics
+## Context pack
 
-Generated test проверяется до runtime-запуска.
+Context pack содержит данные, которые нужны `codegenerator` для генерации и repair.
 
-Проверяются:
+Основные элементы:
+
+- target symbol;
+- parent symbol;
+- module outline;
+- class members;
+- same-class methods;
+- related tests;
+- recommended tests;
+- related production symbols;
+- inbound/outbound relations;
+- contract context;
+- allowed API surface;
+- model surfaces;
+- reference artifacts;
+- reuse hints.
+
+### Same-class methods
+
+Для method-target `codecollector` передает видимые методы того же класса.
+
+Цель — дать `codegenerator` доступ к уже существующим helper-методам класса, чтобы generated code не дублировал поведение и не придумывал новые методы.
+
+Same-class methods передаются как контекст:
+
+- имя метода;
+- qualname;
+- сигнатура;
+- краткое описание;
+- короткий source excerpt.
+
+Same-class methods используются в generation и repair. Они не являются обязательными контрактами, если не переданы как required contracts.
+
+## Allowed API Surface
+
+Allowed API Surface — компактный список разрешенных вызовов для generated code.
+
+Он строится консервативно:
+
+- self-атрибуты берутся из видимого кода и `__init__`;
+- методы зависимостей разрешаются только если они видимы в project context;
+- вложенные access path добавляются только при наличии видимых примеров;
+- free functions берутся из видимого project context;
+- неизвестные методы dependency/helper не считаются допустимыми.
+
+Allowed API Surface ограничивает проектные зависимости и внутренние проектные контракты. Он не запрещает стандартную библиотеку Python и обычные методы стандартных типов, если они нужны для задачи и не добавляют внешних зависимостей.
+
+## Model surfaces
+
+Model surfaces описывают видимые модели и их поля.
+
+Для каждой модели могут передаваться:
+
+- имя;
+- qualname;
+- поля;
+- constructor fields;
+- required constructor fields;
+- типы полей, если они видимы;
+- источник.
+
+Model surfaces используются для:
+
+- production generation;
+- generated-test generation;
+- проверки constructor keyword arguments;
+- проверки неизвестных model attributes;
+- проверки восстановления моделей из JSON/dict/файлов;
+- проверки default behavior при отсутствующих serialized fields.
+
+## Generation
+
+Команда:
+
+```bash
+python -m codecollector sessions generate --session-id <session_id>
+```
+
+Основной pipeline:
+
+1. Обновить индекс проекта.
+2. Собрать context pack.
+3. Подобрать reference artifacts.
+4. Подготовить generation request.
+5. Вызвать `codegenerator generate`.
+6. Проверить generated artifact статическими правилами.
+7. Применить artifact в staging workspace.
+8. Выполнить `patch_static_semantics`.
+9. При production failure вызвать repair.
+10. Повторно применить repair artifact.
+11. Повторно выполнить static semantics.
+12. Сгенерировать generated test.
+13. Проверить generated test semantic/relevance rules.
+14. Применить generated test, если он прошел semantic checks.
+15. Выполнить runtime verification.
+16. При generated-test failure выполнить advisory review.
+17. Подготовить merge plan.
+
+## Repair
+
+Repair вызывается, если production artifact не прошел применение, static semantics или runtime checks.
+
+Repair request содержит:
+
+- previous artifact;
+- исходный target;
+- error context;
+- failed verification blocks;
+- visible self attributes;
+- visible self methods;
+- same-class methods;
+- suggested replacements;
+- model surfaces;
+- contract context;
+- allowed API surface;
+- full file excerpt, если доступен.
+
+Repair должен исправлять previous artifact, а не генерировать новый сценарий с нуля.
+
+## Verification report
+
+`verification_report` содержит:
+
+- `verdict`;
+- `passed`;
+- `blocks`;
+- `summary`.
+
+Каждый block содержит:
+
+- `name`;
+- `ok`;
+- `severity`;
+- `issues`;
+- `details`.
+
+Основные production checks:
+
+- `patch_static_semantics`;
+- `runtime_ast_parse`;
+- `runtime_py_compile`;
+- `runtime_ruff`, если включен;
+- `runtime_pytest_recommended`;
+- `runtime_pytest_full`, если включен.
+
+Generated test checks:
+
+- `generated_test_static_semantics`;
+- `generated_test_relevance`;
+- `runtime_pytest_recommended`, если failure относится к generated test.
+
+## Semantic checks
+
+`patch_static_semantics` проверяет generated production code перед merge review.
+
+Текущие группы проверок:
+
+- дубликаты symbols;
+- обязательные project contract calls;
+- число обязательных аргументов project contract calls;
+- несовместимые типы аргументов project contract calls;
+- неизвестные methods dependency/helper objects;
+- неизвестные self-attributes;
+- неизвестные self-methods;
+- suggested replacements для похожих self-attributes/self-methods;
+- неизвестные runtime names;
+- неизвестные annotation names;
+- неизвестные model attributes;
+- неизвестные constructor keyword arguments;
+- несовместимые типы constructor fields при восстановлении модели из serialized source;
+- передача `None` в constructor field, если поле имеет visible default/default factory;
+- небезопасный `__dict__` для dict-return;
+- unknown contract result attributes;
+- required class members для class replace;
+- advisory warning о возможной потере поведения существующего public method.
+
+Generated test static semantics проверяет:
 
 - синтаксис;
 - наличие test functions;
 - наличие assert;
-- отсутствие `pytest-mock`/`mocker`;
-- отсутствие неразрешенных имен;
-- использование тестируемого symbol;
-- отсутствие неизвестных keyword-аргументов при создании видимых project classes/dataclass-like models.
+- отсутствие `mocker` и pytest-mock fixtures;
+- отсутствие unresolved names;
+- использование target symbol;
+- constructor keyword arguments;
+- использование project symbols только через видимый import или локальный fake/stub;
+- соответствие expected values видимым типам model fields.
 
-Если test artifact не проходит статические проверки, он не применяется к финальному workspace.
+## Generated tests
 
-Если generated test применен, но падает только он, результат получает статус `generated_test_verification_failed`.
+Generated tests создаются внешним `codegenerator`, но применяются только после semantic validation в `codecollector`.
 
-Rejected generated tests считаются excluded files. `workspaces apply` не должен копировать такие файлы в основной проект.
+Если generated test не прошел static semantics или relevance check:
 
-## Repair
+- он считается rejected;
+- он не должен попадать в final workspace/merge;
+- он не должен участвовать в runtime verification;
+- `generated_test_apply.skipped` должен быть `true`;
+- `generated_test_apply.verification_failed` должен быть `true`;
+- `generated_test_apply.merge_recommended` должен быть `false`;
+- `candidate_test_files`, `removed_files` и `excluded_files` используются для UI-диагностики.
 
-Repair используется, если ошибка production artifact считается исправимой.
+Если generated test прошел semantic checks, он применяется во workspace и участвует в recommended runtime tests.
 
-Repair получает:
+## Advisory review generated-test failure
 
-- исходный change request;
-- target;
-- previous artifact;
-- verification error context;
-- project context;
-- reference context.
+Advisory review запускается, если production checks прошли, но generated test failed.
 
-Repair должен:
-
-- сохранять исходную operation;
-- сохранять insert scope;
-- исправлять previous artifact, а не генерировать новый сценарий с нуля;
-- не придумывать новые методы зависимостей;
-- не подставлять фиктивные литералы вместо обязательных аргументов;
-- использовать видимый параметризованный контракт, если широкий сценарий недоступен;
-- возвращать результат в формате `GenerationResult`.
-
-## Advisory review при ошибке generated test
-
-Если production-код прошел основные проверки, но generated test завершился со статусом `generated_test_verification_failed`, pipeline может выполнить рекомендательную проверку через `codegenerator`.
-
-Review не изменяет код, не запускает repair и не принимает решение автоматически.
-
-Review получает компактный контекст:
+Review context содержит:
 
 - исходный CR;
 - target;
@@ -610,267 +410,127 @@ Review получает компактный контекст:
 - generated test artifact;
 - failed verification blocks;
 - issues;
-- stdout/stderr excerpt;
+- stderr/stdout/traceback excerpts;
 - advisory warnings.
 
-Review возвращает рекомендацию для человека:
+Review возвращает рекомендацию, но не принимает решение автоматически.
 
-- является ли тест вероятно ошибочным;
-- нашел ли тест возможную production-регрессию;
-- есть ли риск в production-коде;
-- стоит ли сохранять production-код, отклонить его или отправить на ручной review.
+Основные verdict значения:
 
-## Generated test apply
-
-`generated_test_apply` описывает применение сгенерированного теста.
-
-Пример принятого теста:
-
-```json
-{
-  "applied_tests": [
-    "tests/test_generated_generate_test_Note.py"
-  ],
-  "count": 1,
-  "skipped": false
-}
-```
-
-Пример отклоненного теста:
-
-```json
-{
-  "applied_tests": [],
-  "count": 0,
-  "skipped": true,
-  "reason": "generated_test_semantic_checks_failed",
-  "candidate_test_files": [
-    "tests/test_generated_generate_test_Note.py"
-  ],
-  "verification_failed": true,
-  "merge_recommended": false,
-  "excluded_files": []
-}
-```
-
-## Pytest target resolver
-
-`ValidationService` преобразует рекомендованные тестовые цели в pytest paths.
-
-Поддерживаются форматы:
-
-```text
-tests/test_generated_generate_test_TicketController.py
-```
-
-```text
-tests.test_generated_generate_test_TicketController.test_function
-```
-
-```text
-tests.test_generated_generate_test_TicketController.TestClass.test_method
-```
-
-Последний формат резолвится в pytest node id:
-
-```text
-tests/test_generated_generate_test_TicketController.py::TestClass::test_method
-```
-
-Если точный dotted target не резолвится, но найден fallback file path, это диагностируется как fallback.
-
-Если среди целей одновременно есть pytest node id и путь к тому же файлу, `ValidationService` оставляет более точный node id и не запускает весь файл повторно.
-
-## Применение workspace
-
-Основной проект изменяется только явной командой:
-
-```bash
-python -m codecollector workspaces apply --workspace-id <workspace_id>
-```
-
-Команда применяет production changes из workspace в основной проект и пропускает excluded files.
-
-Ответ содержит диагностику:
-
-- `applied_files`;
-- `copied_files`;
-- `deleted_files`;
-- `skipped_excluded_files`;
-- `counts`;
-- `timings`;
-- `index_refresh`.
-
-`index_refresh` содержит:
-
-- `graph_indexing_ms`;
-- `search_documents_sync_ms`;
-- `vector_index_sync_ms`;
-- `embedded_documents_count`;
-- `vector_sync_mode`;
-- `embedding_usage`.
-
-## Run artifacts
-
-Каждый pipeline run сохраняется в `.runs/`.
-
-Сохраняются:
-
-- request и result внешних вызовов;
-- stderr/stdout внешнего генератора;
-- итоговый `pipeline_run_*.json`;
-- шаги pipeline;
-- usage и timing внешних LLM-вызовов;
-- diff;
-- verification report;
-- generated test diagnostics;
-- generated test failure review;
-- merge plan;
-- warnings и причины пропущенных этапов.
-
-Run artifacts — основной материал для отладки качества генерации.
+- `production_likely_ok_test_likely_bad`;
+- `production_likely_bad_test_valid`;
+- `both_uncertain`;
+- `environment_or_import_issue`;
+- `insufficient_context`.
 
 ## Merge plan
 
-`merge_plan` формируется в режиме `dry_run`.
+Merge plan формируется в режиме dry-run.
 
 Он содержит:
 
+- mode;
+- ready_for_manual_merge_review;
 - workspace path;
-- список changed files;
+- changed files;
 - symbols in changed files;
 - linked requirements;
 - recommended tests;
 - recommended test commands;
 - excluded files;
-- summary lines;
-- признак `ready_for_manual_merge_review`.
+- summary lines.
 
-Автоматический merge в основной проект не выполняется.
+`ready_for_manual_merge_review=true` означает, что результат готов к ручной проверке. Это не означает автоматическое применение.
 
-## CLI
+## Apply workspace
 
-CLI возвращает JSON как для успешных команд, так и для ошибок.
-
-При известной бизнес-ошибке payload содержит:
-
-- `status=failed`;
-- `error_type`;
-- `message`;
-- `details`.
-
-`traceback` добавляется только для непредусмотренных ошибок, у которых нет структурированного `details`.
-
-### Analyze
+Workspace применяется отдельной командой:
 
 ```bash
-python -m codecollector sessions analyze \
-  --project-id <project_id> \
-  --title "Изменить текст уведомления о назначении тикета" \
-  --description "Сделать уведомление на русском языке." \
-  --constraint "Не менять внешний контракт API"
+python -m codecollector workspaces apply --workspace-id <workspace_id>
 ```
 
-### Select target
+Apply должен учитывать merge plan и исключать rejected generated tests.
 
-```bash
-python -m codecollector sessions select-target \
-  --session-id <session_id> \
-  --selected-qualname support_app.services.notification_service.build_assignment_message \
-  --operation replace_symbol
-```
+## Статусы run/session
 
-### Generate
+Основные статусы:
 
-```bash
-python -m codecollector sessions generate --session-id <session_id>
-```
+- `ready_for_merge_review` — production checks прошли, результат готов к ручному review;
+- `generated_test_verification_failed` — production checks прошли, generated test failed или был отклонен;
+- `verification_failed` — production checks или runtime production verification не прошли;
+- `repair_verification_failed` — repair выполнен, но результат не прошел verification;
+- `repair_no_effective_change` — repair не дал полезного изменения;
+- `failed` — pipeline упал технически;
+- `needs_user_decision` — требуется решение человека;
+- `applied` — workspace применен.
 
-### Pipeline generate
+`generated_test_verification_failed` не означает, что production-код корректен или некорректен автоматически. Это статус для ручного review.
 
-```bash
-python -m codecollector pipeline generate \
-  --project demo_projects/sample_python_app \
-  --title "Изменить текст уведомления о назначении тикета" \
-  --description "Сделать уведомление полностью русскоязычным." \
-  --selected-qualname support_app.services.notification_service.build_assignment_message \
-  --operation replace_symbol
-```
+## Trace и диагностика
+
+Run artifacts находятся в `.runs`.
+
+Основные файлы:
+
+- `pipeline_run_*.json`;
+- `generation_request.json`;
+- `generation_result.json`;
+- `repair_request.json`;
+- `repair_result.json`;
+- `generation_test_request.json`;
+- `generation_test_result.json`;
+- `generated_test_review_request.json`;
+- `generated_test_review_result.json`;
+- stdout/stderr внешних вызовов;
+- trace `codegenerator`.
+
+Для анализа ошибок важны:
+
+- steps timeline;
+- verification report;
+- diff;
+- generated_test_apply;
+- repair_generation;
+- codegenerator trace prompt/result;
+- stdout/stderr runtime checks.
 
 ## Конфигурация
 
-Основная конфигурация хранится в `config.yaml`.
+Основной файл настроек — `config.yaml`.
 
-Ключевые разделы:
+Через конфигурацию задаются:
 
+- пути хранения state/runs/workspaces;
 - параметры индексации;
-- semantic search;
-- graph storage;
-- vector storage;
-- внешний `codegenerator`;
-- verification;
-- trace и логирование;
-- context selection;
-- LLM-assisted analyze;
-- onboarding и knowledge enrichment.
+- параметры vector search;
+- параметры reference library;
+- команды и timeout внешнего `codegenerator`;
+- включение runtime checks;
+- настройки generated tests;
+- лимиты контекста;
+- параметры моделей и endpoints.
 
-Настройки LLM для analyze задаются в `codecollector/config.yaml` и не наследуются из `codegenerator`.
+## Текущие ограничения
 
-Числовые лимиты, prompt budget и thresholds должны задаваться через конфигурацию.
+- Основной поддерживаемый язык — Python.
+- Multi-file generation в рамках одного CR не является основной рабочей схемой.
+- Generated tests имеют нестабильное качество и часто отклоняются semantic checks.
+- Generated tests могут неверно создавать project classes через constructor kwargs.
+- Reuse hints являются soft context, а не hard requirement.
+- Частичный vector sync по измененным search documents не реализован.
+- Некоторые связи между соседними методами класса требуют дальнейшего улучшения context selection.
+- `ready_for_merge_review` требует ручного review.
+- Структурный trace секций prompt пока ограничен; полный prompt доступен через trace `codegenerator`.
 
-## Логирование и диагностика
+## Ближайшие доработки
 
-Логи и trace должны показывать:
-
-- выбранный target или anchor;
-- operation и источник operation;
-- related tests;
-- full file usage;
-- reference artifacts;
-- context metrics;
-- trim steps;
-- размеры request и prompt;
-- проверки и их результаты;
-- generated tests и причины их применения или отклонения;
-- repair input и repair output;
-- embedding batch start/end;
-- vector sync mode;
-- embedded documents count.
-
-## Структура проекта
-
-| Путь | Назначение |
-|---|---|
-| `config.yaml` | Основная конфигурация. |
-| `.runs/` | Артефакты запусков pipeline. |
-| `.workspaces/` | Staging workspace. |
-| `api/` | CLI и точки входа. |
-| `analysis/` | LLM-assisted analyze. |
-| `prompts/` | Prompt-тексты analyze. |
-| `orchestration/` | Pipeline orchestration. |
-| `indexing/` | Индексация проекта. |
-| `search/` | Поиск кандидатов. |
-| `context/` | Сбор context pack. |
-| `external_codegen/` | Подготовка request и вызов `codegenerator`. |
-| `patching/` | Применение artifact. |
-| `workspace/` | Workspace, diff, apply и impact summary. |
-| `reference_library/` | Reference artifacts. |
-| `vector_search/` | Embedding и semantic search. |
-| `validation/` | Проверки после применения. |
-| `sessions/` | Session-based flow. |
-| `projects/` | Registry, cleanup и сопровождение проектов. |
-| `onboarding/` | Onboarding и enrichment `knowledge.yaml`. |
-
-## Ограничения текущей реализации
-
-- основная поддержка ориентирована на Python;
-- HTTP API поверх CLI-контракта не является основным интерфейсом;
-- vector sync при изменении search documents пересинхронизирует весь набор search documents проекта;
-- multi-target orchestration не является основным режимом;
-- advisory review не принимает автоматическое решение за пользователя;
-- generated test может быть отклонен или исключен из apply/merge;
-- решение о применении workspace принимает человек.
-
-## Итог
-
-`codecollector` — orchestration-слой controlled dry-run изменения кода. Он обеспечивает анализ запроса, выбор target или anchor, структурный отбор контекста, вызов внешнего `codegenerator`, применение результата в staging workspace, verification, repair, advisory review и подготовку результата к ручному review. Основной проект изменяется только по явной команде пользователя.
+- Улучшить generated-test generation для создания project classes по видимой сигнатуре конструктора.
+- Добавить структурный trace prompt-секций: какие блоки вошли в prompt, какие были обрезаны, какие symbols реально попали в prompt.
+- Улучшить отображение rejected generated tests в UI: candidate files, excluded files, removed files, reason.
+- Улучшить выбор reuse contracts в analyze без превращения soft hints в hard required contracts без высокой уверенности.
+- Добавить более точное определение required contracts для случаев явного переиспользования существующей логики.
+- Снизить шум reference artifact retrieval по общим словам.
+- Поддержать частичный vector sync по измененным search documents.
+- Расширить поддержку языков и адаптеров вне Python.
+- Добавить HTTP API поверх текущих CLI/JSON контрактов.

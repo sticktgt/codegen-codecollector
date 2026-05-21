@@ -1811,3 +1811,46 @@ def test_patch_static_semantics_does_not_treat_model_method_call_as_unknown_mode
     model_details = block.details.get('model_surface_usage_check') or {}
     checked = model_details.get('checked_attributes') or []
     assert not any(item.get('attribute') == 'build_path' for item in checked)
+
+
+def test_patch_static_semantics_rejects_self_access_to_module_constant(tmp_path: Path) -> None:
+    original = (
+        'DEFAULT_ENCODING = "utf-8"\n\n'
+        'class NoteStorage:\n'
+        '    def __init__(self, base_dir):\n'
+        '        self.base_dir = base_dir\n'
+        '    def load_from_file(self, file_path):\n'
+        '        raise NotImplementedError()\n'
+    )
+    patched = (
+        'DEFAULT_ENCODING = "utf-8"\n\n'
+        'class NoteStorage:\n'
+        '    def __init__(self, base_dir):\n'
+        '        self.base_dir = base_dir\n'
+        '    def load_from_file(self, file_path):\n'
+        '        with file_path.open("r", encoding=self.DEFAULT_ENCODING) as f:\n'
+        '            return f.read()\n'
+    )
+
+    block = validate_patch_static_semantics(
+        original_file_text=original,
+        patched_file_text=patched,
+        target_file='note/note_storage.py',
+        target_qualname='note.note_storage.NoteStorage.load_from_file',
+        requested_operation='replace_symbol',
+        insert_scope='class_body',
+        parent_qualname='note.note_storage.NoteStorage',
+        changed_files=['note/note_storage.py'],
+        change_request=ChangeRequest(title='Загрузка', description='Реализовать загрузку', project='demo'),
+    )
+
+    assert not block.ok
+    assert any(issue.code == 'unknown_self_attribute' for issue in block.issues)
+    unknown = block.details['self_attribute_usage_check']['unknown_attributes']
+    assert any(
+        item['attribute'] == 'DEFAULT_ENCODING'
+        and item['suggested_replacements'] == ['DEFAULT_ENCODING']
+        and item.get('replacement_kind') == 'module_level_name'
+        and item.get('suggested_expression') == 'DEFAULT_ENCODING'
+        for item in unknown
+    )

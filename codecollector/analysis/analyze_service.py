@@ -135,6 +135,7 @@ class AnalyzeService:
         )
 
         recall_search_started_at = time.perf_counter()
+        explicit_symbol_names = self._explicit_symbol_name_hints(input_requirements)
         candidates = self._collect_recall_candidates(
             services=services,
             base_query=query,
@@ -142,6 +143,7 @@ class AnalyzeService:
             requested_operation=effective_operation,
             limit=limit,
             use_vector_search=use_vector_search,
+            explicit_symbol_names=explicit_symbol_names,
         )
         record_timing('recall_search_sec', recall_search_started_at)
 
@@ -195,6 +197,23 @@ class AnalyzeService:
 
         target_resolution_started_at = time.perf_counter()
         recommended_target = self._recommended_target(candidates, target_recommendation)
+        exact_target_override = self._exact_target_override_for_explicit_symbol_names(
+            candidates=candidates,
+            target_recommendation=target_recommendation,
+            recommended_target=recommended_target,
+            explicit_symbol_names=explicit_symbol_names,
+            requested_operation=effective_operation,
+        )
+        if exact_target_override is not None:
+            recommended_target, candidates, target_recommendation = exact_target_override
+            effective_operation = 'replace_symbol'
+            operation_source = 'explicit_symbol_exact_match'
+            operation_confidence = self._safe_float(target_recommendation.get('operation_confidence')) or 1.0
+            operation_reason = str(target_recommendation.get('operation_reason') or operation_reason or '').strip() or None
+            override_scope = self._insert_scope_from_payload(target_recommendation)
+            if override_scope:
+                effective_insert_scope = override_scope
+
         stub_override = self._prefer_existing_stub_target_for_implementation(
             services=services,
             base_query=query,
@@ -350,6 +369,125 @@ class AnalyzeService:
             ),
         )
 
+    def _explicit_symbol_name_hints(self, input_requirements: list[dict[str, Any]]) -> set[str]:
+        """Extract explicit code-like symbol names from user-facing CR text.
+
+        The extraction is deliberately conservative. It only treats identifiers
+        containing underscores or dotted names as explicit symbol hints. This
+        avoids interpreting ordinary words as target names while still covering
+        names such as ``search_by_content`` or ``NoteStorage.load``.
+        """
+        texts: list[str] = []
+        for item in input_requirements or []:
+            if not isinstance(item, dict):
+                continue
+            for field in ("title", "description", "note", "notes"):
+                value = item.get(field)
+                if isinstance(value, str):
+                    texts.append(value)
+                elif isinstance(value, list):
+                    texts.extend(str(part) for part in value if str(part))
+            constraints = item.get("constraints") or []
+            if isinstance(constraints, list):
+                texts.extend(str(part) for part in constraints if str(part))
+        full_text = "\n".join(texts)
+        hints: set[str] = set()
+        for match in re.finditer(r"\b[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\b", full_text):
+            token = match.group(0).strip()
+            if not token:
+                continue
+            if "_" not in token and "." not in token:
+                continue
+            if token.startswith(".") or token.endswith("."):
+                continue
+            hints.add(token)
+            hints.add(token.rsplit(".", 1)[-1])
+        return hints
+
+    def _add_exact_symbol_name_candidates(
+        self,
+        by_qualname: dict[str, SearchCandidate],
+        services: ProjectServices,
+        explicit_symbol_names: set[str],
+    ) -> None:
+        if not explicit_symbol_names:
+            return
+        project_key = str(services.project_root)
+        explicit_names = {name for name in explicit_symbol_names if name}
+        for symbol in services.store.list_symbols(project_key):
+            if symbol.kind == "module" or symbol.qualname in by_qualname:
+                continue
+            if symbol.name in explicit_names or symbol.qualname in explicit_names:
+                by_qualname[symbol.qualname] = self._candidate_from_symbol(
+                    symbol,
+                    score=100.0,
+                    reason="точное совпадение имени symbol из текста CR",
+                )
+
+    def _exact_target_override_for_explicit_symbol_names(
+        self,
+        *,
+        candidates: list[SearchCandidate],
+        target_recommendation: dict[str, Any],
+        recommended_target: str | None,
+        explicit_symbol_names: set[str],
+        requested_operation: str,
+    ) -> tuple[str, list[SearchCandidate], dict[str, Any]] | None:
+        if requested_operation != "replace_symbol" or not explicit_symbol_names:
+            return None
+        exact_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate.name in explicit_symbol_names or candidate.qualname in explicit_symbol_names
+        ]
+        if len(exact_candidates) != 1:
+            return None
+        exact = exact_candidates[0]
+        if recommended_target == exact.qualname:
+            return None
+
+        updated = dict(target_recommendation or {})
+        parent_qualname = exact.qualname.rsplit(".", 1)[0] if exact.kind == "method" and "." in exact.qualname else None
+        insert_scope = "class_body" if exact.kind == "method" else "module_body"
+        updated.update(
+            {
+                "recommended_operation": "replace_symbol",
+                "operation_confidence": 1.0,
+                "operation_reason": (
+                    f"В CR явно указан symbol `{exact.name}`, и в индексе найдено точное совпадение "
+                    f"{exact.qualname}. Для replace_symbol точное совпадение имеет приоритет над похожими методами."
+                ),
+                "insert_scope": {
+                    "value": insert_scope,
+                    "confidence": 1.0,
+                    "reason": "Scope определен по типу найденного точного symbol.",
+                },
+                "expected_new_symbol_kind": exact.kind,
+                "parent_qualname": parent_qualname,
+                "recommended_candidate_id": None,
+                "recommended_target": exact.qualname,
+                "target_role": "target",
+                "target_confidence": 1.0,
+                "target_reason": (
+                    f"Точное совпадение с явно указанным symbol `{exact.name}` из CR. "
+                    "Похожие методы с другим именем не выбираются как target для replace_symbol."
+                ),
+                "manual_review_required": False,
+                "post_processing": {
+                    **(updated.get("post_processing") or {}),
+                    "explicit_symbol_exact_match": {
+                        "symbol_name": exact.name,
+                        "qualname": exact.qualname,
+                    },
+                },
+            }
+        )
+        reordered = sorted(
+            candidates,
+            key=lambda item: (0 if item.qualname == exact.qualname else 1, -item.score, item.qualname),
+        )
+        return exact.qualname, reordered, updated
+
     def _collect_recall_candidates(
         self,
         *,
@@ -359,6 +497,7 @@ class AnalyzeService:
         requested_operation: str,
         limit: int | None,
         use_vector_search: bool | None,
+        explicit_symbol_names: set[str] | None = None,
     ) -> list[SearchCandidate]:
         query_limit = max(limit or self.config.search_default_limit, self.config.analysis_base_search_limit)
         queries = [base_query]
@@ -388,6 +527,7 @@ class AnalyzeService:
                     by_qualname[candidate.qualname] = candidate
 
         self._add_hint_candidates(by_qualname, services, search_plan)
+        self._add_exact_symbol_name_candidates(by_qualname, services, explicit_symbol_names or set())
         candidates = list(by_qualname.values())
         LOGGER.info('Analyze recall collected candidates_count=%s before_limit=%s', len(candidates), max(limit or self.config.search_default_limit, self.config.analysis_max_recall_candidates))
         candidates.sort(key=lambda item: (-item.score, -item.confidence, item.file_path, item.qualname))
