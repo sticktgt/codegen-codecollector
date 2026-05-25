@@ -346,6 +346,84 @@ def test_generated_test_static_semantics_rejects_unknown_project_constructor_key
     assert details['checked_calls'][0]['unknown_keywords'] == ['agent_name']
 
 
+def test_generated_test_static_semantics_rejects_missing_project_import_module_and_name(tmp_path: Path) -> None:
+    note_search = tmp_path / 'note' / 'note_search.py'
+    note_search.parent.mkdir(parents=True)
+    note_search.write_text(
+        'class SearchResult:\n'
+        '    def __init__(self, note, preview, match_positions):\n'
+        '        self.note = note\n'
+        '        self.preview = preview\n'
+        '        self.match_positions = match_positions\n',
+        encoding='utf-8',
+    )
+    test_file = tmp_path / 'tests' / 'test_generated.py'
+    test_file.parent.mkdir(parents=True)
+    test_file.write_text(
+        'from note.search_result import SearchResult\n'
+        'from note import search_utils\n'
+        'from note.note_search import MissingResult\n\n'
+        'def test_imports():\n'
+        '    assert SearchResult\n'
+        '    assert search_utils\n'
+        '    assert MissingResult\n',
+        encoding='utf-8',
+    )
+
+    block = validate_generated_test_static_semantics(
+        project_root=tmp_path,
+        test_file_path=test_file,
+        target_qualname='note.note_storage.NoteStorage.search_results_by_content',
+        requested_operation='insert_after_symbol',
+        generated_symbol_names=['note.note_storage.NoteStorage.search_results_by_content'],
+    )
+
+    assert not block.ok
+    assert any(issue.code == 'generated_test_import_points_to_missing_module' for issue in block.issues)
+    assert any(issue.code == 'generated_test_imports_missing_project_name' for issue in block.issues)
+    checked = block.details['project_import_check']['checked_imports']
+    assert any(item['module'] == 'note.search_result' and not item['module_exists'] for item in checked)
+    assert any(item['module'] == 'note.note_search' and item['missing_names'] == ['MissingResult'] for item in checked)
+
+
+def test_generated_test_static_semantics_rejects_unknown_project_method_and_new_usage(tmp_path: Path) -> None:
+    storage_file = tmp_path / 'note' / 'note_storage.py'
+    storage_file.parent.mkdir(parents=True)
+    storage_file.write_text(
+        'class NoteStorage:\n'
+        '    def __init__(self, base_dir):\n'
+        '        self.base_dir = base_dir\n'
+        '    def search_results_by_content(self, query):\n'
+        '        return []\n'
+        '    def search_by_content(self, query):\n'
+        '        return []\n',
+        encoding='utf-8',
+    )
+    test_file = tmp_path / 'tests' / 'test_generated.py'
+    test_file.parent.mkdir(parents=True)
+    test_file.write_text(
+        'from note.note_storage import NoteStorage\n\n'
+        'def test_storage(tmp_path):\n'
+        '    storage = NoteStorage.__new__(NoteStorage)\n'
+        '    storage.save_note(object())\n'
+        '    assert storage.search_results_by_content("x") == []\n',
+        encoding='utf-8',
+    )
+
+    block = validate_generated_test_static_semantics(
+        project_root=tmp_path,
+        test_file_path=test_file,
+        target_qualname='note.note_storage.NoteStorage.search_results_by_content',
+        requested_operation='insert_after_symbol',
+        generated_symbol_names=['note.note_storage.NoteStorage.search_results_by_content'],
+    )
+
+    assert not block.ok
+    assert any(issue.code == 'generated_test_uses_project_class_new' for issue in block.issues)
+    assert any(issue.code == 'generated_test_calls_unknown_project_method' for issue in block.issues)
+    assert block.details['project_method_call_check']['variable_types']['storage'] == 'NoteStorage'
+
+
 def test_patch_static_semantics_rejects_missing_required_contract_call() -> None:
     original = (
         'from support_app.services.report_service import build_agent_summary\n\n'
@@ -877,6 +955,118 @@ def test_patch_static_semantics_rejects_unknown_model_fields_in_production_code(
     assert 'unknown_model_constructor_keyword' in codes
 
 
+
+def test_patch_static_semantics_does_not_infer_result_model_from_free_text() -> None:
+    original = (
+        'class SearchResult:\n'
+        '    def __init__(self, note, preview, match_positions):\n'
+        '        self.note = note\n'
+        '        self.preview = preview\n'
+        '        self.match_positions = match_positions\n\n'
+        'class NoteStorage:\n'
+        '    def search_by_content(self, query):\n'
+        '        return []\n'
+    )
+    patched = original + (
+        '    def search_results_by_content(self, query: str) -> list[dict]:\n'
+        '        results = []\n'
+        '        for note in self.search_by_content(query):\n'
+        '            results.append({"note_id": note.id, "preview": note.content})\n'
+        '        return results\n'
+    )
+    model_surfaces = [
+        {
+            'name': 'SearchResult',
+            'qualname': 'note.note_search.SearchResult',
+            'fields': ['note', 'preview', 'match_positions'],
+            'constructor_fields': ['note', 'preview', 'match_positions'],
+        }
+    ]
+
+    block = validate_patch_static_semantics(
+        requested_operation='insert_after_symbol',
+        change_request=ChangeRequest(
+            title='Поиск с результатами для отображения',
+            description='Метод должен возвращать список SearchResult.',
+            project='demo',
+            constraints=[
+                'Создавать SearchResult только с видимыми аргументами note, preview и match_positions.',
+                'Не использовать словари вместо SearchResult.',
+            ],
+        ),
+        target_qualname='note.note_storage.NoteStorage.search_by_content',
+        original_file_text=original,
+        patched_file_text=patched,
+        changed_files=['note/note_storage.py'],
+        target_file='note/note_storage.py',
+        insert_scope='class_body',
+        parent_qualname='note.note_storage.NoteStorage',
+        related_symbols=[],
+        model_surfaces=model_surfaces,
+    )
+
+    codes = {issue.code for issue in block.issues}
+    assert 'requested_result_model_not_constructed' not in codes
+    assert 'request_forbids_dict_result' not in codes
+    details = block.details['requested_result_model_usage_check']
+    assert details['skipped'] is True
+    assert details['skip_reason'] == 'structured_verification_contract_not_available'
+
+
+def test_patch_static_semantics_accepts_requested_result_model_constructor() -> None:
+    original = (
+        'class SearchResult:\n'
+        '    def __init__(self, note, preview, match_positions):\n'
+        '        self.note = note\n'
+        '        self.preview = preview\n'
+        '        self.match_positions = match_positions\n\n'
+        'class NoteStorage:\n'
+        '    def search_by_content(self, query):\n'
+        '        return []\n'
+    )
+    patched = original + (
+        '    def search_results_by_content(self, query: str) -> list[SearchResult]:\n'
+        '        results = []\n'
+        '        for note in self.search_by_content(query):\n'
+        '            results.append(SearchResult(note=note, preview=note.content, match_positions=[]))\n'
+        '        return results\n'
+    )
+    model_surfaces = [
+        {
+            'name': 'SearchResult',
+            'qualname': 'note.note_search.SearchResult',
+            'fields': ['note', 'preview', 'match_positions'],
+            'constructor_fields': ['note', 'preview', 'match_positions'],
+        }
+    ]
+
+    block = validate_patch_static_semantics(
+        requested_operation='insert_after_symbol',
+        change_request=ChangeRequest(
+            title='Поиск с результатами для отображения',
+            description='Метод должен возвращать список SearchResult.',
+            project='demo',
+            constraints=[
+                'Создавать SearchResult только с видимыми аргументами note, preview и match_positions.',
+                'Не использовать словари вместо SearchResult.',
+            ],
+        ),
+        target_qualname='note.note_storage.NoteStorage.search_by_content',
+        original_file_text=original,
+        patched_file_text=patched,
+        changed_files=['note/note_storage.py'],
+        target_file='note/note_storage.py',
+        insert_scope='class_body',
+        parent_qualname='note.note_storage.NoteStorage',
+        related_symbols=[],
+        model_surfaces=model_surfaces,
+    )
+
+    codes = {issue.code for issue in block.issues}
+    assert 'requested_result_model_not_constructed' not in codes
+    assert 'request_forbids_dict_result' not in codes
+
+
 def test_patch_static_semantics_rejects_unknown_annotation_names() -> None:
     original = (
         'from dataclasses import dataclass, field\n'
@@ -1074,6 +1264,43 @@ def test_generated_test_static_semantics_rejects_missing_required_constructor_ar
     details = block.details['constructor_keyword_check']
     assert details['required_constructor_fields']['NoteStorage'] == ['base_dir']
     assert details['checked_calls'][0]['missing_required_arguments'] == ['base_dir']
+
+
+def test_generated_test_static_semantics_rejects_string_for_path_constructor_arg(tmp_path: Path) -> None:
+    module_file = tmp_path / 'note' / 'note_storage.py'
+    module_file.parent.mkdir(parents=True)
+    module_file.write_text(
+        'from pathlib import Path\n\n'
+        'class NoteStorage:\n'
+        '    def __init__(self, base_dir: Path):\n'
+        '        self.base_dir = base_dir\n'
+        '    def generate_filename(self, note):\n'
+        '        return "name.note"\n',
+        encoding='utf-8',
+    )
+    test_file = tmp_path / 'tests' / 'test_generated.py'
+    test_file.parent.mkdir(parents=True)
+    test_file.write_text(
+        'from note.note_storage import NoteStorage\n\n'
+        'def test_storage():\n'
+        '    storage = NoteStorage(base_dir=".")\n'
+        '    assert storage.generate_filename(object()) == "name.note"\n',
+        encoding='utf-8',
+    )
+
+    block = validate_generated_test_static_semantics(
+        project_root=tmp_path,
+        test_file_path=test_file,
+        target_qualname='note.note_storage.NoteStorage.generate_filename',
+        requested_operation='replace_symbol',
+        generated_symbol_names=['note.note_storage.NoteStorage.generate_filename'],
+    )
+
+    assert not block.ok
+    assert any(issue.code == 'generated_test_constructor_argument_type_mismatch' for issue in block.issues)
+    details = block.details['constructor_keyword_check']
+    assert details['checked_calls'][0]['field_annotations']['base_dir'] == 'Path'
+    assert details['checked_calls'][0]['type_issue_count'] == 1
 
 
 def test_generated_test_static_semantics_accepts_required_constructor_keyword(tmp_path: Path) -> None:
@@ -1854,3 +2081,77 @@ def test_patch_static_semantics_rejects_self_access_to_module_constant(tmp_path:
         and item.get('suggested_expression') == 'DEFAULT_ENCODING'
         for item in unknown
     )
+
+
+def test_generated_test_static_semantics_rejects_unknown_project_attribute_assignment(tmp_path: Path) -> None:
+    module_file = tmp_path / 'note' / 'note_storage.py'
+    module_file.parent.mkdir(parents=True)
+    module_file.write_text(
+        'class NoteStorage:\n'
+        '    def __init__(self, base_dir):\n'
+        '        self.base_dir = base_dir\n'
+        '    def search_by_content(self, query):\n'
+        '        return []\n'
+        '    def search_results_by_content(self, query):\n'
+        '        return self.search_by_content(query)\n',
+        encoding='utf-8',
+    )
+    test_file = tmp_path / 'tests' / 'test_generated.py'
+    test_file.parent.mkdir(parents=True)
+    test_file.write_text(
+        'from note.note_storage import NoteStorage\n\n'
+        'def test_storage(tmp_path):\n'
+        '    storage = NoteStorage(tmp_path)\n'
+        '    storage._notes = []\n'
+        '    assert storage.search_results_by_content("x") == []\n',
+        encoding='utf-8',
+    )
+
+    block = validate_generated_test_static_semantics(
+        project_root=tmp_path,
+        test_file_path=test_file,
+        target_qualname='note.note_storage.NoteStorage.search_results_by_content',
+        requested_operation='insert_after_symbol',
+        generated_symbol_names=['note.note_storage.NoteStorage.search_results_by_content'],
+    )
+
+    assert not block.ok
+    assert any(issue.code == 'generated_test_assigns_unknown_project_attribute' for issue in block.issues)
+    details = block.details['project_attribute_assignment_check']
+    assert details['checked_assignments'][0]['attribute'] == '_notes'
+
+
+def test_generated_test_static_semantics_allows_overriding_visible_helper_method(tmp_path: Path) -> None:
+    module_file = tmp_path / 'note' / 'note_storage.py'
+    module_file.parent.mkdir(parents=True)
+    module_file.write_text(
+        'class NoteStorage:\n'
+        '    def __init__(self, base_dir):\n'
+        '        self.base_dir = base_dir\n'
+        '    def search_by_content(self, query):\n'
+        '        return []\n'
+        '    def search_results_by_content(self, query):\n'
+        '        return self.search_by_content(query)\n',
+        encoding='utf-8',
+    )
+    test_file = tmp_path / 'tests' / 'test_generated.py'
+    test_file.parent.mkdir(parents=True)
+    test_file.write_text(
+        'from note.note_storage import NoteStorage\n\n'
+        'def test_storage(tmp_path):\n'
+        '    storage = NoteStorage(tmp_path)\n'
+        '    storage.search_by_content = lambda query: ["ok"]\n'
+        '    assert storage.search_results_by_content("x") == ["ok"]\n',
+        encoding='utf-8',
+    )
+
+    block = validate_generated_test_static_semantics(
+        project_root=tmp_path,
+        test_file_path=test_file,
+        target_qualname='note.note_storage.NoteStorage.search_results_by_content',
+        requested_operation='insert_after_symbol',
+        generated_symbol_names=['note.note_storage.NoteStorage.search_results_by_content'],
+    )
+
+    assert block.ok
+    assert block.details['project_attribute_assignment_check']['checked_assignments'][0]['attribute'] == 'search_by_content'

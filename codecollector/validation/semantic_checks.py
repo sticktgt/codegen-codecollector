@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 from dataclasses import asdict
 from pathlib import Path
+import re
 from typing import Any
 
 from codecollector.domain.models import (
@@ -733,6 +734,201 @@ def _check_unknown_self_attribute_usage(
     }
 
 
+
+def _same_class_method_call_specs(owner_tree: ast.AST | None, class_name: str) -> dict[str, dict[str, Any]]:
+    """Return conservative call specs for methods declared in the same class."""
+    class_node = _class_node(owner_tree, class_name)
+    if class_node is None:
+        return {}
+
+    specs: dict[str, dict[str, Any]] = {}
+    for child in class_node.body:
+        if not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+
+        args = child.args
+        if args.vararg is not None or args.kwarg is not None:
+            # Dynamic signatures are intentionally skipped to avoid false positives.
+            continue
+
+        positional_args = list(args.posonlyargs) + list(args.args)
+        if positional_args and positional_args[0].arg in {"self", "cls"}:
+            positional_args = positional_args[1:]
+
+        defaults_count = len(args.defaults or [])
+        required_positional_count = max(0, len(positional_args) - defaults_count)
+        required_positional_names = [arg.arg for arg in positional_args[:required_positional_count]]
+        positional_names = [arg.arg for arg in positional_args]
+        keyword_only_names = [arg.arg for arg in args.kwonlyargs]
+        required_keyword_only = [
+            arg.arg
+            for arg, default in zip(args.kwonlyargs, args.kw_defaults, strict=False)
+            if default is None
+        ]
+        allowed_keyword_names = set(positional_names) | set(keyword_only_names)
+
+        specs[child.name] = {
+            "name": child.name,
+            "required_positional_names": required_positional_names,
+            "positional_names": positional_names,
+            "required_keyword_only": required_keyword_only,
+            "allowed_keyword_names": sorted(allowed_keyword_names),
+            "signature": _function_signature_for_diagnostic(child),
+        }
+    return specs
+
+
+def _function_signature_for_diagnostic(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
+    """Build a compact readable signature from a function node."""
+    try:
+        args_text = ast.unparse(node.args)
+    except Exception:
+        args_text = "..."
+    prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
+    returns = ""
+    if node.returns is not None:
+        try:
+            returns = f" -> {ast.unparse(node.returns)}"
+        except Exception:
+            returns = ""
+    return f"{prefix} {node.name}({args_text}){returns}:"
+
+
+def _check_same_class_method_call_signatures(
+    *,
+    owner_tree: ast.AST | None,
+    scan_tree: ast.AST | None,
+    target_file: str,
+    target_qualname: str,
+    parent_qualname: str | None,
+) -> tuple[list[VerificationIssue], dict[str, Any]]:
+    """Validate simple ``self.method(...)`` calls against visible same-class signatures.
+
+    This check is deliberately narrow: it verifies only argument count and keyword
+    names for methods declared in the same visible class. It does not perform
+    type checking and skips methods with *args/**kwargs.
+    """
+    if owner_tree is None or scan_tree is None:
+        return [], {"known_methods": {}, "checked_calls": [], "skipped_calls": [], "skipped": True}
+
+    parent_class_name = _class_name_from_qualname(parent_qualname or target_qualname.rsplit(".", 1)[0])
+    if not parent_class_name:
+        return [], {"known_methods": {}, "checked_calls": [], "skipped_calls": [], "skipped": True, "reason": "no_parent_class"}
+
+    specs = _same_class_method_call_specs(owner_tree, parent_class_name)
+    if not specs:
+        return [], {"known_methods": {}, "checked_calls": [], "skipped_calls": [], "skipped": True, "reason": "no_visible_same_class_methods"}
+
+    issues: list[VerificationIssue] = []
+    checked_calls: list[dict[str, Any]] = []
+    skipped_calls: list[dict[str, Any]] = []
+
+    for node in ast.walk(scan_tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (
+            isinstance(func, ast.Attribute)
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "self"
+        ):
+            continue
+
+        method_name = str(func.attr or "")
+        spec = specs.get(method_name)
+        if spec is None:
+            continue
+
+        call_name = _call_display_name(func)
+        if any(isinstance(arg, ast.Starred) for arg in node.args):
+            skipped_calls.append({"call": call_name, "reason": "star_args", "line": getattr(node, "lineno", None)})
+            continue
+        if any(keyword.arg is None for keyword in node.keywords):
+            skipped_calls.append({"call": call_name, "reason": "kwargs_unpack", "line": getattr(node, "lineno", None)})
+            continue
+
+        positional_names = list(spec.get("positional_names") or [])
+        required_positional_names = list(spec.get("required_positional_names") or [])
+        required_keyword_only = list(spec.get("required_keyword_only") or [])
+        allowed_keyword_names = set(spec.get("allowed_keyword_names") or [])
+        keyword_names = {str(keyword.arg) for keyword in node.keywords if keyword.arg}
+        supplied_positional_count = len(node.args)
+        satisfied_by_position = set(positional_names[:supplied_positional_count])
+        missing_required_positional = [
+            name for name in required_positional_names
+            if name not in satisfied_by_position and name not in keyword_names
+        ]
+        unknown_keywords = sorted(name for name in keyword_names if name not in allowed_keyword_names)
+        missing_required_keyword_only = [name for name in required_keyword_only if name not in keyword_names]
+
+        checked_calls.append(
+            {
+                "call": call_name,
+                "method": method_name,
+                "line": getattr(node, "lineno", None),
+                "signature": spec.get("signature"),
+                "supplied_positional": supplied_positional_count,
+                "keyword_names": sorted(keyword_names),
+                "required_positional_names": required_positional_names,
+                "missing_required_positional": missing_required_positional,
+                "unknown_keywords": unknown_keywords,
+                "required_keyword_only": required_keyword_only,
+                "missing_required_keyword_only": missing_required_keyword_only,
+            }
+        )
+
+        if missing_required_positional:
+            issues.append(
+                VerificationIssue(
+                    code="self_method_call_missing_required_args",
+                    message=(
+                        f"В production-коде вызов {call_name} не передает обязательные аргументы метода "
+                        f"{parent_class_name}.{method_name}: {', '.join(missing_required_positional)}. "
+                        f"Сигнатура: {spec.get('signature')}. Для repair: исправь вызов по видимой сигнатуре метода того же класса."
+                    ),
+                    severity="error",
+                    file_path=target_file,
+                    symbol=target_qualname,
+                )
+            )
+        if unknown_keywords:
+            issues.append(
+                VerificationIssue(
+                    code="self_method_call_unknown_keyword_arg",
+                    message=(
+                        f"В production-коде вызов {call_name} передает неизвестные keyword-аргументы метода "
+                        f"{parent_class_name}.{method_name}: {', '.join(unknown_keywords)}. "
+                        f"Сигнатура: {spec.get('signature')}. Для repair: используй только параметры из видимой сигнатуры метода того же класса."
+                    ),
+                    severity="error",
+                    file_path=target_file,
+                    symbol=target_qualname,
+                )
+            )
+        if missing_required_keyword_only:
+            issues.append(
+                VerificationIssue(
+                    code="self_method_call_missing_required_keyword_only_args",
+                    message=(
+                        f"В production-коде вызов {call_name} не передает обязательные keyword-only аргументы метода "
+                        f"{parent_class_name}.{method_name}: {', '.join(missing_required_keyword_only)}. "
+                        f"Сигнатура: {spec.get('signature')}. Для repair: исправь вызов по видимой сигнатуре метода того же класса."
+                    ),
+                    severity="error",
+                    file_path=target_file,
+                    symbol=target_qualname,
+                )
+            )
+
+    return issues, {
+        "parent_class": parent_class_name,
+        "known_methods": specs,
+        "checked_calls": checked_calls,
+        "skipped_calls": skipped_calls,
+        "skipped": False,
+    }
+
+
 def _related_method_names_by_parent_type(related_symbols: list[Any] | None) -> dict[str, set[str]]:
     result: dict[str, set[str]] = {}
     for item in related_symbols or []:
@@ -1230,6 +1426,79 @@ def _constraint_contains(change_request: ChangeRequest, needle: str) -> bool:
     return any(needle_norm in str(item).lower() for item in (change_request.constraints or []))
 
 
+def _change_request_full_text(change_request: ChangeRequest) -> str:
+    parts = [
+        str(change_request.title or ""),
+        str(change_request.description or ""),
+        *[str(item or "") for item in (change_request.constraints or [])],
+        *[str(item or "") for item in (change_request.notes or [])],
+    ]
+    return "\n".join(part for part in parts if part).lower()
+
+
+def _requested_result_model_names(change_request: ChangeRequest, model_surfaces: list[dict[str, Any]] | None) -> list[str]:
+    """Deprecated: do not infer required result objects from free-form CR text.
+
+    Free-form wording is too ambiguous for deterministic validation.
+    Required result objects must come from a future structured verification
+    contract produced by analyze/planner and confirmed against project index.
+    """
+    return []
+
+
+def _annotation_mentions_dict(annotation: ast.AST | None) -> bool:
+    if annotation is None:
+        return False
+    if isinstance(annotation, ast.Name):
+        return annotation.id == "dict"
+    if isinstance(annotation, ast.Subscript):
+        return _annotation_mentions_dict(annotation.value) or _annotation_mentions_dict(annotation.slice)
+    if isinstance(annotation, ast.Tuple):
+        return any(_annotation_mentions_dict(elt) for elt in annotation.elts)
+    if isinstance(annotation, ast.BinOp) and isinstance(annotation.op, ast.BitOr):
+        return _annotation_mentions_dict(annotation.left) or _annotation_mentions_dict(annotation.right)
+    if isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
+        return "dict" in annotation.value
+    if isinstance(annotation, ast.Attribute):
+        return annotation.attr == "dict"
+    return False
+
+
+def _call_name(node: ast.AST) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return ""
+
+
+def _check_requested_result_model_usage(
+    *,
+    scan_tree: ast.AST | None,
+    change_request: ChangeRequest,
+    model_surfaces: list[dict[str, Any]] | None,
+    target_file: str,
+    target_qualname: str,
+) -> tuple[list[VerificationIssue], dict[str, Any]]:
+    """Skip request-text-driven result model validation.
+
+    This hook is intentionally inert until codecollector has a structured
+    verification contract from analyze/planner. The semantic checker should not
+    reinterpret natural-language CR text because phrases that preserve existing
+    contracts (for example "existing method continues returning List[Note]")
+    can be confused with requirements to construct that model.
+    """
+    return [], {
+        "requested_models": [],
+        "forbids_dict": False,
+        "constructed_models": [],
+        "dict_literals": 0,
+        "dict_return_annotations": 0,
+        "skipped": True,
+        "skip_reason": "structured_verification_contract_not_available",
+    }
+
+
 def _extract_new_top_level_symbols(original_text: str, patched_text: str) -> dict[str, str]:
     before = _top_level_defs(_safe_parse(original_text))
     after = _top_level_defs(_safe_parse(patched_text))
@@ -1302,7 +1571,151 @@ def _project_module_exists(project_root: Path, module_name: str) -> bool:
     module_path = module_name.replace(".", "/")
     py_path = project_root / f"{module_path}.py"
     pkg_init = project_root / module_path / "__init__.py"
-    return py_path.exists() or pkg_init.exists()
+    namespace_dir = project_root / module_path
+    return py_path.exists() or pkg_init.exists() or (namespace_dir.is_dir() and any(namespace_dir.glob("*.py")))
+
+
+def _project_root_packages(project_root: Path) -> set[str]:
+    """Return import roots that belong to the checked project.
+
+    Generated-test validation should not be tied to one demo package name.  We
+    treat every top-level Python module/package under ``project_root`` as a
+    project import root and use it to validate imports such as
+    ``from note.search_result import SearchResult``.
+    """
+    roots: set[str] = set()
+    try:
+        children = list(project_root.iterdir())
+    except OSError:
+        return roots
+
+    for child in children:
+        name = child.name
+        if not name or name.startswith(".") or name in {"tests", "__pycache__"}:
+            continue
+        if child.is_file() and child.suffix == ".py" and child.stem.isidentifier():
+            roots.add(child.stem)
+        elif child.is_dir() and name.isidentifier():
+            if (child / "__init__.py").exists() or any(child.glob("*.py")):
+                roots.add(name)
+    return roots
+
+
+def _looks_like_project_module(project_root: Path, module_name: str) -> bool:
+    root = str(module_name or "").split(".", 1)[0]
+    return bool(root and root in _project_root_packages(project_root))
+
+
+def _module_defined_names(project_root: Path, module_name: str) -> set[str]:
+    module_file = _module_file_for_import(project_root, module_name)
+    if module_file is None:
+        return set()
+    try:
+        source = module_file.read_text(encoding="utf-8")
+    except OSError:
+        return set()
+    tree = _safe_parse(source)
+    if tree is None:
+        return set()
+    return _module_available_names(tree)
+
+
+def _project_imported_name_exists(project_root: Path, module_name: str, imported_name: str) -> bool:
+    """Check whether ``from module_name import imported_name`` is project-visible."""
+    if not imported_name or imported_name == "*":
+        return True
+
+    # ``from package import submodule`` is valid if package/submodule.py or
+    # package/submodule/__init__.py exists even when package/__init__.py does
+    # not explicitly re-export it.
+    if _project_module_exists(project_root, f"{module_name}.{imported_name}"):
+        return True
+
+    module_file = _module_file_for_import(project_root, module_name)
+    if module_file is None:
+        return False
+
+    return imported_name in _module_defined_names(project_root, module_name)
+
+
+def _check_generated_test_project_imports(
+    *,
+    tree: ast.AST,
+    project_root: Path,
+    test_file_path: Path,
+) -> tuple[list[VerificationIssue], dict[str, Any]]:
+    issues: list[VerificationIssue] = []
+    checked: list[dict[str, Any]] = []
+    roots = sorted(_project_root_packages(project_root))
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            module_name = node.module
+            if not _looks_like_project_module(project_root, module_name):
+                continue
+            module_exists = _project_module_exists(project_root, module_name)
+            missing_names: list[str] = []
+            if module_exists:
+                for alias in node.names:
+                    if not _project_imported_name_exists(project_root, module_name, alias.name):
+                        missing_names.append(alias.name)
+            checked.append(
+                {
+                    "kind": "from_import",
+                    "module": module_name,
+                    "line": getattr(node, "lineno", None),
+                    "module_exists": module_exists,
+                    "names": [alias.name for alias in node.names],
+                    "missing_names": missing_names,
+                }
+            )
+            if not module_exists:
+                issues.append(
+                    VerificationIssue(
+                        code="generated_test_import_points_to_missing_module",
+                        message=f"Generated test импортирует отсутствующий project module: {module_name}.",
+                        file_path=str(test_file_path),
+                        symbol=module_name,
+                    )
+                )
+            for name in missing_names:
+                issues.append(
+                    VerificationIssue(
+                        code="generated_test_imports_missing_project_name",
+                        message=(
+                            f"Generated test импортирует `{name}` из project module `{module_name}`, "
+                            "но это имя или submodule не видны в проекте."
+                        ),
+                        file_path=str(test_file_path),
+                        symbol=f"{module_name}.{name}",
+                    )
+                )
+
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                module_name = alias.name
+                if not _looks_like_project_module(project_root, module_name):
+                    continue
+                module_exists = _project_module_exists(project_root, module_name)
+                checked.append(
+                    {
+                        "kind": "import",
+                        "module": module_name,
+                        "line": getattr(node, "lineno", None),
+                        "module_exists": module_exists,
+                    }
+                )
+                if not module_exists:
+                    issues.append(
+                        VerificationIssue(
+                            code="generated_test_import_points_to_missing_module",
+                            message=f"Generated test импортирует отсутствующий project module: {module_name}.",
+                            file_path=str(test_file_path),
+                            symbol=module_name,
+                        )
+                    )
+
+    return issues, {"project_roots": roots, "checked_imports": checked}
 
 
 def _collect_called_names(tree: ast.AST) -> set[str]:
@@ -1665,6 +2078,7 @@ def _check_model_surface_usage(
         set(surfaces.keys()),
     )
     field_types_by_class = _related_class_field_type_map(related_symbols)
+    related_function_return_types = _related_function_return_types(related_symbols)
     parent_map: dict[ast.AST, ast.AST] = {
         child: parent
         for parent in ast.walk(scan_tree)
@@ -1688,6 +2102,10 @@ def _check_model_surface_usage(
             self_method_type = _direct_self_method_call_return_type(expr, same_class_method_return_types)
             if self_method_type:
                 return self_method_type
+            if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name):
+                return_type = related_function_return_types.get(expr.func.id, "")
+                if return_type:
+                    return return_type
             return _infer_expr_type_for_contract_call(
                 expr,
                 local_types=local_types,
@@ -2115,6 +2533,269 @@ def _known_imported_names(tree: ast.AST, import_changes: list[dict[str, Any]] | 
     return names
 
 
+
+
+def _import_change_added_names(import_changes: list[dict[str, Any]] | None) -> dict[str, dict[str, Any]]:
+    """Return names added by import_changes mapped to their source change."""
+    result: dict[str, dict[str, Any]] = {}
+    for change in import_changes or []:
+        if not isinstance(change, dict):
+            continue
+        action = str(change.get("action") or "").strip()
+        if action == "add_import":
+            module = str(change.get("module") or "").strip()
+            if module:
+                asname = str(change.get("asname") or change.get("alias") or "").strip()
+                imported_name = asname or module.rsplit(".", 1)[-1]
+                result[imported_name] = change
+        elif action == "add_from_import":
+            for raw_name in change.get("names") or []:
+                if not isinstance(raw_name, str) or not raw_name.strip():
+                    continue
+                # Support both plain names and the common textual form "name as alias".
+                imported_name = raw_name.strip().split(" as ")[-1].strip()
+                if imported_name:
+                    result[imported_name] = change
+    return result
+
+
+def _local_imported_names(tree: ast.AST | None) -> set[str]:
+    """Return import names declared inside the generated symbol scan tree."""
+    if tree is None:
+        return set()
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                imported_name = alias.asname or alias.name.split(".", 1)[0]
+                if imported_name:
+                    names.add(imported_name)
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                imported_name = alias.asname or alias.name
+                if imported_name:
+                    names.add(imported_name)
+    return names
+
+
+def _check_import_changes_usage(
+    *,
+    scan_tree: ast.AST | None,
+    import_changes: list[dict[str, Any]] | None,
+    target_file: str,
+    target_qualname: str,
+) -> tuple[list[VerificationIssue], dict[str, Any]]:
+    """Check that imports requested by import_changes are actually used.
+
+    import_changes are part of the generated artifact contract. If the model asks
+    codecollector to add a file-level import, the generated symbol should use the
+    imported name. Otherwise the artifact is internally inconsistent and should
+    be repaired instead of leaving dead imports in the target file.
+    """
+    added_names = _import_change_added_names(import_changes)
+    if scan_tree is None or not added_names:
+        return [], {
+            "added_names": sorted(added_names),
+            "used_names": [],
+            "local_imported_names": [],
+            "unused_imports": [],
+            "duplicated_local_imports": [],
+            "skipped": scan_tree is None,
+        }
+
+    used_names = _collect_loaded_names(scan_tree)
+    local_imports = _local_imported_names(scan_tree)
+    issues: list[VerificationIssue] = []
+    unused: list[str] = []
+    duplicated: list[str] = []
+
+    for name in sorted(added_names):
+        if name not in used_names:
+            unused.append(name)
+            issues.append(
+                VerificationIssue(
+                    code="unused_import_change",
+                    message=(
+                        f"import_changes добавляет импорт `{name}`, но generated symbol не использует это имя. "
+                        "Для repair: удали лишний import_changes или измени code так, чтобы использовалось импортированное имя."
+                    ),
+                    severity="error",
+                    file_path=target_file,
+                    symbol=target_qualname,
+                )
+            )
+        if name in local_imports:
+            duplicated.append(name)
+            issues.append(
+                VerificationIssue(
+                    code="duplicated_import_change_with_local_import",
+                    message=(
+                        f"Имя `{name}` добавлено через import_changes и одновременно импортируется внутри generated symbol. "
+                        "Для repair: оставь один способ импорта; обычно импорт должен быть возвращен через import_changes, "
+                        "а import-строки внутри поля code нужно убрать."
+                    ),
+                    severity="error",
+                    file_path=target_file,
+                    symbol=target_qualname,
+                )
+            )
+
+    return issues, {
+        "added_names": sorted(added_names),
+        "used_names": sorted(used_names),
+        "local_imported_names": sorted(local_imports),
+        "unused_imports": unused,
+        "duplicated_local_imports": duplicated,
+        "skipped": False,
+    }
+
+
+def _top_level_exported_names_from_source(source: str) -> set[str]:
+    tree = _safe_parse(source)
+    if tree is None:
+        return set()
+    names: set[str] = set()
+    for node in getattr(tree, 'body', []):
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    names.add(target.id)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names.add(node.target.id)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                names.add(alias.asname or alias.name.split('.', 1)[0])
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name != '*':
+                    names.add(alias.asname or alias.name)
+    return names
+
+
+def _module_file_for_import_change(project_root: Path, module_name: str) -> Path | None:
+    module_path = str(module_name or '').replace('.', '/')
+    if not module_path:
+        return None
+    module_file = project_root / f'{module_path}.py'
+    if module_file.exists():
+        return module_file
+    package_file = project_root / module_path / '__init__.py'
+    if package_file.exists():
+        return package_file
+    return None
+
+
+def _check_import_changes_resolvable(
+    *,
+    project_root: Path | None,
+    import_changes: list[dict[str, Any]] | None,
+    target_file: str,
+    target_qualname: str,
+) -> tuple[list[VerificationIssue], dict[str, Any]]:
+    if project_root is None:
+        return [], {'checked': [], 'unresolved': [], 'skipped': True, 'reason': 'project_root_not_provided'}
+
+    issues: list[VerificationIssue] = []
+    checked: list[dict[str, Any]] = []
+    unresolved: list[dict[str, Any]] = []
+
+    for change in import_changes or []:
+        if not isinstance(change, dict):
+            continue
+        action = str(change.get('action') or '').strip()
+        module_name = str(change.get('module') or '').strip()
+        if action not in {'add_import', 'add_from_import'} or not module_name:
+            continue
+        module_file = _module_file_for_import_change(project_root, module_name)
+        record = {'action': action, 'module': module_name, 'module_file': str(module_file) if module_file else ''}
+        if module_file is None:
+            record['reason'] = 'module_not_found'
+            unresolved.append(record)
+            issues.append(
+                VerificationIssue(
+                    code='unresolved_import_change_module',
+                    message=(
+                        f"import_changes добавляет импорт из модуля `{module_name}`, но такой проектный модуль "
+                        "не найден относительно project root. Для repair: используй только подтвержденный путь импорта "
+                        "из contract context, related symbols, full file source или стандартной библиотеки."
+                    ),
+                    severity='error',
+                    file_path=target_file,
+                    symbol=target_qualname,
+                )
+            )
+            checked.append(record)
+            continue
+        if action == 'add_from_import':
+            try:
+                exported = _top_level_exported_names_from_source(module_file.read_text(encoding='utf-8'))
+            except OSError:
+                exported = set()
+            requested_names = [str(name).split(' as ')[0].strip() for name in (change.get('names') or []) if str(name).strip()]
+            missing_names = sorted(name for name in requested_names if name and name not in exported)
+            record['requested_names'] = requested_names
+            record['exported_names'] = sorted(exported)
+            record['missing_names'] = missing_names
+            if missing_names:
+                unresolved.append(record)
+                issues.append(
+                    VerificationIssue(
+                        code='unresolved_import_change_name',
+                        message=(
+                            f"import_changes добавляет from-import из `{module_name}`, но имена не найдены "
+                            f"в этом модуле: {', '.join(missing_names)}. Для repair: возьми точный module path "
+                            "и имена symbol из видимого проектного контекста, не нормализуй путь по аналогии."
+                        ),
+                        severity='error',
+                        file_path=target_file,
+                        symbol=target_qualname,
+                    )
+                )
+        checked.append(record)
+
+    return issues, {'checked': checked, 'unresolved': unresolved, 'skipped': False}
+
+
+def _contract_call_spec_matches_call(func: ast.expr, spec: dict[str, Any]) -> bool:
+    """Return whether an AST call expression can refer to the visible contract spec.
+
+    This avoids matching unrelated calls that happen to share the same short name,
+    for example ``json.load(...)`` and ``NoteStorage.load(...)``.
+    """
+    kind = str(spec.get("kind") or "").strip()
+    parent_qualname = str(spec.get("parent_qualname") or "").strip()
+    parent_name = parent_qualname.rsplit(".", 1)[-1] if parent_qualname else ""
+
+    if isinstance(func, ast.Name):
+        # Direct name calls are safe only for visible free functions. Methods
+        # should be called through self/instance/class and must not match by
+        # short name alone.
+        return kind == "function"
+
+    if isinstance(func, ast.Attribute):
+        receiver = _call_display_name(func.value)
+        if kind == "function":
+            # Module-qualified free function calls are allowed when the module
+            # path is visible through the receiver name.
+            qualname = str(spec.get("qualname") or "")
+            module_name = qualname.rsplit(".", 1)[0]
+            return bool(receiver and (module_name.endswith(receiver) or receiver.endswith(module_name.rsplit(".", 1)[-1])))
+        if kind == "method":
+            if receiver in {"self", "cls"}:
+                return True
+            if parent_name and receiver.rsplit(".", 1)[-1] == parent_name:
+                return True
+            # Instance variables are intentionally not matched by short method
+            # name here. Dependency method calls are checked by dedicated
+            # dependency/contract signature checks.
+            return False
+
+    return False
+
 def _literal_value_for_diagnostic(node: ast.AST) -> str | None:
     if isinstance(node, ast.Constant) and (isinstance(node.value, str) or node.value is None):
         return repr(node.value)
@@ -2156,6 +2837,36 @@ def _function_signature_from_source(source: str, node: ast.FunctionDef | ast.Asy
             break
     header = " ".join(header_lines).strip()
     return header[:-1].strip() if header.endswith(":") else header
+
+
+def _signature_from_symbol_item(item: dict[str, Any], *, name: str) -> str:
+    """Prefer visible source signature so default values are preserved."""
+    source = str(item.get("source_code") or item.get("source") or item.get("source_excerpt") or "")
+    tree = _safe_parse(source) if source else None
+    for node in getattr(tree, "body", []) if tree is not None else []:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            signature = _function_signature_from_source(source, node)
+            if signature:
+                return signature
+    return str(item.get("signature") or "").strip()
+
+
+def _related_function_return_types(related_symbols: list[Any] | None) -> dict[str, str]:
+    """Map visible free function names to their annotated return type."""
+    result: dict[str, str] = {}
+    for raw in related_symbols or []:
+        item = raw if isinstance(raw, dict) else asdict(raw)
+        if str(item.get("kind") or "").strip() != "function":
+            continue
+        name = str(item.get("name") or item.get("qualname", "").rsplit(".", 1)[-1]).strip()
+        if not name:
+            continue
+        signature = _signature_from_symbol_item(item, name=name)
+        parsed = _parse_required_call_args(signature, kind="function") if signature else None
+        return_annotation = str((parsed or {}).get("return_annotation") or "")
+        if return_annotation:
+            result[name] = return_annotation
+    return result
 
 
 def _related_class_method_call_specs(source: str, *, qualname: str, class_name: str) -> list[dict[str, Any]]:
@@ -2221,7 +2932,7 @@ def _contract_call_specs(
         if kind not in {"function", "method"}:
             continue
 
-        signature = str(item.get("signature") or "").strip()
+        signature = _signature_from_symbol_item(item, name=name)
         parsed_signature = _parse_required_call_args(signature, kind=kind)
         if parsed_signature is None:
             continue
@@ -2256,10 +2967,19 @@ def _normalized_type_name(value: str) -> str:
     value = str(value or "").strip().strip('"\'')
     if not value:
         return ""
+    value = value.replace("typing.", "")
+    if "[" in value:
+        value = value.split("[", 1)[0]
     value = value.rsplit(".", 1)[-1]
     aliases = {
         "DateTime": "datetime",
         "Datetime": "datetime",
+        "List": "list",
+        "Dict": "dict",
+        "Set": "set",
+        "Tuple": "tuple",
+        "Sequence": "list",
+        "MutableSequence": "list",
         "PathLike": "Path",
         "PurePath": "Path",
         "PurePosixPath": "Path",
@@ -2668,6 +3388,117 @@ def _check_contract_call_signatures(
     }
 
 
+
+def _code_artifact_boundary_issues(
+    *,
+    tree: ast.AST | None,
+    operation: str | None,
+    target_qualname: str | None,
+    target_file: str | None,
+) -> tuple[list[VerificationIssue], dict[str, Any]]:
+    """Validate that a replace_symbol artifact contains only the target symbol.
+
+    This check is intentionally limited to code_artifact-level validation. It
+    prevents a replacement artifact for one method/function/class from smuggling
+    additional sibling symbols or local helper functions that belong to a wider
+    change.
+    """
+    details: dict[str, Any] = {
+        "operation": operation,
+        "target_qualname": target_qualname,
+        "target_name": (target_qualname or "").rsplit(".", 1)[-1],
+        "top_level_symbols": [],
+        "nested_symbols": [],
+        "skipped": True,
+    }
+    if operation != "replace_symbol" or tree is None or not target_qualname:
+        return [], details
+
+    target_name = str(target_qualname).rsplit(".", 1)[-1]
+    top_level_defs: list[ast.AST] = [
+        node
+        for node in getattr(tree, "body", [])
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    ]
+    top_level_symbols = [
+        {
+            "name": getattr(node, "name", ""),
+            "kind": "class" if isinstance(node, ast.ClassDef) else "function",
+            "line": getattr(node, "lineno", None),
+        }
+        for node in top_level_defs
+    ]
+    details["top_level_symbols"] = top_level_symbols
+    details["skipped"] = False
+
+    issues: list[VerificationIssue] = []
+    if len(top_level_defs) != 1:
+        issues.append(
+            VerificationIssue(
+                code="replace_symbol_artifact_must_contain_single_symbol",
+                message=(
+                    "Для replace_symbol code_artifact должен содержать ровно один top-level symbol — "
+                    f"целевой `{target_name}`. Найдено symbols: "
+                    f"{', '.join(item['name'] for item in top_level_symbols) or '<none>'}. "
+                    "Для repair: верни только полный код целевого symbol и не добавляй соседние методы, "
+                    "функции или классы."
+                ),
+                severity="error",
+                file_path=str(target_file or ""),
+                symbol=str(target_qualname or ""),
+            )
+        )
+        return issues, details
+
+    root = top_level_defs[0]
+    root_name = str(getattr(root, "name", ""))
+    if root_name != target_name:
+        issues.append(
+            VerificationIssue(
+                code="replace_symbol_artifact_target_name_mismatch",
+                message=(
+                    f"Для replace_symbol ожидался symbol `{target_name}`, но code_artifact содержит `{root_name}`. "
+                    "Для repair: верни полный код именно целевого symbol с тем же именем."
+                ),
+                severity="error",
+                file_path=str(target_file or ""),
+                symbol=str(target_qualname or ""),
+            )
+        )
+
+    if isinstance(root, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        nested: list[dict[str, Any]] = []
+        for node in ast.walk(root):
+            if node is root:
+                continue
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                nested.append(
+                    {
+                        "name": getattr(node, "name", ""),
+                        "kind": "class" if isinstance(node, ast.ClassDef) else "function",
+                        "line": getattr(node, "lineno", None),
+                    }
+                )
+        details["nested_symbols"] = nested
+        if nested:
+            issues.append(
+                VerificationIssue(
+                    code="replace_symbol_artifact_contains_nested_symbol",
+                    message=(
+                        f"Для replace_symbol target `{target_name}` code_artifact не должен содержать "
+                        "локальные helper-функции, классы или дополнительные symbols внутри целевого метода. "
+                        f"Найдены nested symbols: {', '.join(item['name'] for item in nested)}. "
+                        "Для repair: реализуй вспомогательную логику внутри тела целевого метода без объявления "
+                        "новых def/class, либо используй уже видимый проектный контракт."
+                    ),
+                    severity="error",
+                    file_path=str(target_file or ""),
+                    symbol=str(target_qualname or ""),
+                )
+            )
+
+    return issues, details
+
 def validate_code_artifact_static_semantics(
     *,
     result_payload: dict[str, Any],
@@ -2751,6 +3582,14 @@ def validate_code_artifact_static_semantics(
             )
         )
 
+    boundary_issues, boundary_details = _code_artifact_boundary_issues(
+        tree=tree,
+        operation=operation,
+        target_qualname=target_qualname or expected_target_qualname,
+        target_file=target_file,
+    )
+    issues.extend(boundary_issues)
+
     return VerificationBlock(
         name=f"{step_name}_static_semantics",
         ok=not issues,
@@ -2765,6 +3604,7 @@ def validate_code_artifact_static_semantics(
             "parseable": tree is not None,
             "expected_operation": expected_operation,
             "expected_target_qualname": expected_target_qualname,
+            "artifact_boundary_check": boundary_details,
             "syntax_error": (
                 {
                     "error_type": type(syntax_error).__name__,
@@ -2926,7 +3766,7 @@ def _check_dict_return_shape(
             if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
                 called_name = _called_symbol_name(node.value.func)
                 spec = specs_by_name.get(called_name or "")
-                if spec is None:
+                if spec is None or not _contract_call_spec_matches_call(node.value.func, spec):
                     continue
                 for target in node.targets:
                     if isinstance(target, ast.Name):
@@ -2947,7 +3787,7 @@ def _check_dict_return_shape(
             if isinstance(value, ast.Call):
                 called_name = _called_symbol_name(value.func)
                 spec = specs_by_name.get(called_name or "")
-                if spec is not None:
+                if spec is not None and _contract_call_spec_matches_call(value.func, spec):
                     checked["source"] = "direct_contract_call"
                     checked["contract_qualname"] = spec.get("qualname")
                     checked["contract_return_annotation"] = spec.get("return_annotation", "")
@@ -3036,7 +3876,7 @@ def _check_contract_result_field_usage(
                 continue
             called_name = _called_symbol_name(node.value.func)
             spec = specs_by_name.get(called_name or "")
-            if spec is None:
+            if spec is None or not _contract_call_spec_matches_call(node.value.func, spec):
                 continue
             for target in node.targets:
                 if isinstance(target, ast.Name):
@@ -3045,9 +3885,19 @@ def _check_contract_result_field_usage(
         if not assigned_contract_calls:
             continue
 
+        parent_map: dict[ast.AST, ast.AST] = {
+            child: parent
+            for parent in ast.walk(function_node)
+            for child in ast.iter_child_nodes(parent)
+        }
+
         for node in ast.walk(function_node):
             attr = _result_attribute_name(node)
             if attr is None:
+                continue
+            parent = parent_map.get(node)
+            if isinstance(parent, ast.Call) and parent.func is node:
+                # ``data.get(...)`` is a method call, not a read of a model field named ``get``.
                 continue
 
             variable_name, field_name = attr
@@ -3247,6 +4097,7 @@ def validate_patch_static_semantics(
     required_contracts: list[dict[str, Any]] | None = None,
     required_class_members: list[dict[str, Any]] | None = None,
     model_surfaces: list[dict[str, Any]] | None = None,
+    project_root: Path | None = None,
 ) -> VerificationBlock:
     issues: list[VerificationIssue] = []
 
@@ -3295,6 +4146,14 @@ def validate_patch_static_semantics(
         "model_surfaces": {},
         "checked_constructor_calls": [],
         "checked_attributes": [],
+        "skipped": True,
+    }
+    requested_result_model_details: dict[str, Any] = {
+        "requested_models": [],
+        "forbids_dict": False,
+        "constructed_models": [],
+        "dict_literals": 0,
+        "dict_return_annotations": 0,
         "skipped": True,
     }
     annotation_name_details: dict[str, Any] = {
@@ -3487,6 +4346,22 @@ def validate_patch_static_semantics(
     )
     issues.extend(runtime_name_issues)
 
+    import_change_issues, import_change_details = _check_import_changes_usage(
+        scan_tree=contract_scan_tree,
+        import_changes=import_changes,
+        target_file=target_file,
+        target_qualname=target_qualname,
+    )
+    issues.extend(import_change_issues)
+
+    import_change_resolve_issues, import_change_resolve_details = _check_import_changes_resolvable(
+        project_root=project_root,
+        import_changes=import_changes,
+        target_file=target_file,
+        target_qualname=target_qualname,
+    )
+    issues.extend(import_change_resolve_issues)
+
     model_surface_issues, model_surface_details = _check_model_surface_usage(
         tree=after_tree,
         scan_tree=contract_scan_tree,
@@ -3496,6 +4371,15 @@ def validate_patch_static_semantics(
         related_symbols=related_symbols,
     )
     issues.extend(model_surface_issues)
+
+    requested_result_model_issues, requested_result_model_details = _check_requested_result_model_usage(
+        scan_tree=contract_scan_tree,
+        change_request=change_request,
+        model_surfaces=model_surfaces,
+        target_file=target_file,
+        target_qualname=target_qualname,
+    )
+    issues.extend(requested_result_model_issues)
 
     contract_issues, contract_details = _check_contract_call_signatures(
         tree=after_tree,
@@ -3526,6 +4410,15 @@ def validate_patch_static_semantics(
         parent_qualname=parent_qualname,
     )
     issues.extend(self_attribute_issues)
+
+    self_method_signature_issues, self_method_signature_details = _check_same_class_method_call_signatures(
+        owner_tree=after_tree,
+        scan_tree=contract_scan_tree,
+        target_file=target_file,
+        target_qualname=target_qualname,
+        parent_qualname=parent_qualname,
+    )
+    issues.extend(self_method_signature_issues)
 
     incompatible_operator_issues, incompatible_operator_details = _check_incompatible_visible_type_operator_usage(
         owner_tree=after_tree,
@@ -3603,6 +4496,7 @@ def validate_patch_static_semantics(
             "contract_call_signature_check": contract_details,
             "injected_dependency_method_check": injected_method_details,
             "self_attribute_usage_check": self_attribute_details,
+            "self_method_call_signature_check": self_method_signature_details,
             "visible_type_operator_check": incompatible_operator_details,
             "dict_return_shape_check": return_shape_details,
             "contract_result_field_check": result_field_details,
@@ -3611,7 +4505,10 @@ def validate_patch_static_semantics(
             "possible_existing_method_contract_lost": possible_method_contract_details,
             "annotation_name_check": annotation_name_details,
             "runtime_name_check": runtime_name_details,
+            "import_changes_usage_check": import_change_details,
+            "import_changes_resolvable_check": import_change_resolve_details,
             "model_surface_usage_check": model_surface_details,
+            "requested_result_model_usage_check": requested_result_model_details,
             "duplicate_symbols": duplicate_symbols,
         },
     )
@@ -3659,6 +4556,7 @@ def _class_constructor_signature_from_source(source: str, class_name: str) -> di
             'constructor_fields': [],
             'required_fields': [],
             'positional_fields': [],
+            'field_annotations': {},
             'accepts_varargs': False,
             'accepts_kwargs': False,
             'has_explicit_init': False,
@@ -3677,6 +4575,7 @@ def _class_constructor_signature_from_source(source: str, class_name: str) -> di
             'constructor_fields': [],
             'required_fields': [],
             'positional_fields': [],
+            'field_annotations': {},
             'accepts_varargs': False,
             'accepts_kwargs': False,
             'has_explicit_init': False,
@@ -3688,6 +4587,11 @@ def _class_constructor_signature_from_source(source: str, class_name: str) -> di
     positional_fields = [arg.arg for arg in positional_args]
     kwonly_fields = [arg.arg for arg in init_node.args.kwonlyargs]
     constructor_fields = [*positional_fields, *kwonly_fields]
+    field_annotations = {
+        arg.arg: _annotation_name(arg.annotation)
+        for arg in [*positional_args, *init_node.args.kwonlyargs]
+        if _annotation_name(arg.annotation)
+    }
 
     positional_defaults = list(init_node.args.defaults or [])
     required_positional_count = max(0, len(positional_fields) - len(positional_defaults))
@@ -3700,6 +4604,7 @@ def _class_constructor_signature_from_source(source: str, class_name: str) -> di
         'constructor_fields': constructor_fields,
         'required_fields': required_fields,
         'positional_fields': positional_fields,
+        'field_annotations': field_annotations,
         'accepts_varargs': init_node.args.vararg is not None,
         'accepts_kwargs': init_node.args.kwarg is not None,
         'has_explicit_init': True,
@@ -3727,6 +4632,11 @@ def _project_constructor_signatures(
         signature['constructor_fields'] = sorted({str(item) for item in fields if str(item)})
         signature['required_fields'] = [str(item) for item in signature.get('required_fields') or [] if str(item)]
         signature['positional_fields'] = [str(item) for item in signature.get('positional_fields') or [] if str(item)]
+        signature['field_annotations'] = {
+            str(name): str(annotation)
+            for name, annotation in (signature.get('field_annotations') or {}).items()
+            if str(name) and str(annotation)
+        }
         result[imported_name] = signature
     return result
 
@@ -3740,6 +4650,290 @@ def _project_constructor_keyword_fields(
         for class_name, signature in _project_constructor_signatures(project_root, imported_names).items()
         if signature.get('constructor_fields')
     }
+
+
+def _project_class_methods_from_source(source: str, class_name: str) -> set[str]:
+    tree = _safe_parse(source)
+    class_node = _class_node(tree, class_name)
+    if class_node is None:
+        return set()
+    return {
+        child.name
+        for child in class_node.body
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+
+def _project_class_instance_attributes_from_source(source: str, class_name: str) -> set[str]:
+    tree = _safe_parse(source)
+    class_node = _class_node(tree, class_name)
+    if class_node is None:
+        return set()
+    attrs: set[str] = set()
+    for node in ast.walk(class_node):
+        target_nodes: list[ast.AST] = []
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            if isinstance(node, ast.Assign):
+                target_nodes.extend(node.targets)
+            else:
+                target_nodes.append(node.target)
+        for target in target_nodes:
+            if (
+                isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "self"
+            ):
+                attrs.add(target.attr)
+    return attrs
+
+
+def _project_class_methods(
+    project_root: Path,
+    imported_names: dict[str, str],
+) -> dict[str, set[str]]:
+    result: dict[str, set[str]] = {}
+    for imported_name, module_name in sorted(imported_names.items()):
+        module_file = _module_file_for_import(project_root, module_name)
+        if module_file is None:
+            continue
+        try:
+            source = module_file.read_text(encoding='utf-8')
+        except OSError:
+            continue
+        methods = _project_class_methods_from_source(source, imported_name)
+        if methods:
+            result[imported_name] = methods
+    return result
+
+
+def _project_class_instance_attributes(
+    project_root: Path,
+    imported_names: dict[str, str],
+) -> dict[str, set[str]]:
+    result: dict[str, set[str]] = {}
+    for imported_name, module_name in sorted(imported_names.items()):
+        module_file = _module_file_for_import(project_root, module_name)
+        if module_file is None:
+            continue
+        try:
+            source = module_file.read_text(encoding='utf-8')
+        except OSError:
+            continue
+        attrs = _project_class_instance_attributes_from_source(source, imported_name)
+        if attrs:
+            result[imported_name] = attrs
+    return result
+
+
+def _infer_generated_test_variable_types(
+    tree: ast.AST,
+    imported_class_names: set[str],
+) -> dict[str, str]:
+    """Infer simple local variables that hold imported project class instances."""
+    variable_types: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        targets = [target for target in node.targets if isinstance(target, ast.Name)]
+        if not targets:
+            continue
+
+        inferred_type = ""
+        value = node.value
+        if isinstance(value, ast.Call):
+            func = value.func
+            if isinstance(func, ast.Name) and func.id in imported_class_names:
+                inferred_type = func.id
+            elif (
+                isinstance(func, ast.Attribute)
+                and func.attr == "__new__"
+                and isinstance(func.value, ast.Name)
+                and func.value.id in imported_class_names
+            ):
+                inferred_type = func.value.id
+
+        if not inferred_type:
+            continue
+        for target in targets:
+            variable_types[target.id] = inferred_type
+    return variable_types
+
+
+def _check_generated_test_project_method_calls(
+    *,
+    tree: ast.AST,
+    project_root: Path,
+    imported_names: dict[str, str],
+    test_file_path: Path,
+    allowed_new_method_names: set[str] | None = None,
+) -> tuple[list[VerificationIssue], dict[str, Any]]:
+    class_methods = _project_class_methods(project_root, imported_names)
+    imported_class_names = set(class_methods)
+    variable_types = _infer_generated_test_variable_types(tree, imported_class_names)
+    issues: list[VerificationIssue] = []
+    checked_calls: list[dict[str, Any]] = []
+    allowed_new_methods = set(allowed_new_method_names or set())
+
+    if not class_methods:
+        return issues, {"class_methods": {}, "variable_types": {}, "checked_calls": []}
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+
+        func = node.func
+        owner_type = ""
+        owner_name = ""
+        if isinstance(func.value, ast.Name):
+            owner_name = func.value.id
+            owner_type = variable_types.get(owner_name, "")
+        elif (
+            isinstance(func.value, ast.Attribute)
+            and func.value.attr == "__new__"
+            and isinstance(func.value.value, ast.Name)
+        ):
+            owner_type = func.value.value.id
+
+        if not owner_type or owner_type not in class_methods:
+            continue
+
+        method_name = func.attr
+        visible_methods = class_methods.get(owner_type) or set()
+        checked_calls.append(
+            {
+                "owner_name": owner_name,
+                "owner_type": owner_type,
+                "method": method_name,
+                "line": getattr(func, "lineno", None),
+                "visible_methods": sorted(visible_methods),
+            }
+        )
+
+        if method_name in visible_methods or method_name in allowed_new_methods:
+            continue
+        issues.append(
+            VerificationIssue(
+                code="generated_test_calls_unknown_project_method",
+                message=(
+                    f"Generated test вызывает `{method_name}` у объекта {owner_type}, но такой метод "
+                    f"не виден в проектном классе. Видимые методы: {', '.join(sorted(visible_methods))}."
+                ),
+                file_path=str(test_file_path),
+                symbol=f"{owner_type}.{method_name}",
+            )
+        )
+
+    return issues, {
+        "class_methods": {name: sorted(methods) for name, methods in class_methods.items()},
+        "variable_types": variable_types,
+        "allowed_new_method_names": sorted(allowed_new_methods),
+        "checked_calls": checked_calls,
+    }
+
+
+def _check_generated_test_unknown_project_attribute_assignments(
+    *,
+    tree: ast.AST,
+    project_root: Path,
+    imported_names: dict[str, str],
+    test_file_path: Path,
+    allowed_new_method_names: set[str] | None = None,
+) -> tuple[list[VerificationIssue], dict[str, Any]]:
+    class_methods = _project_class_methods(project_root, imported_names)
+    class_attrs = _project_class_instance_attributes(project_root, imported_names)
+    imported_class_names = set(class_methods) | set(class_attrs)
+    variable_types = _infer_generated_test_variable_types(tree, imported_class_names)
+    allowed_new_methods = set(allowed_new_method_names or set())
+    issues: list[VerificationIssue] = []
+    checked_assignments: list[dict[str, Any]] = []
+
+    def iter_assignment_targets() -> list[ast.AST]:
+        targets: list[ast.AST] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                targets.extend(node.targets)
+            elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+                targets.append(node.target)
+        return targets
+
+    for target in iter_assignment_targets():
+        if not (
+            isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Name)
+        ):
+            continue
+        owner_name = target.value.id
+        owner_type = variable_types.get(owner_name, "")
+        if not owner_type:
+            continue
+        visible_methods = class_methods.get(owner_type) or set()
+        visible_attrs = class_attrs.get(owner_type) or set()
+        attr_name = target.attr
+        checked_assignments.append({
+            "owner_name": owner_name,
+            "owner_type": owner_type,
+            "attribute": attr_name,
+            "line": getattr(target, "lineno", None),
+            "visible_attributes": sorted(visible_attrs),
+            "visible_methods": sorted(visible_methods),
+        })
+        if attr_name in visible_attrs or attr_name in visible_methods or attr_name in allowed_new_methods:
+            continue
+        issues.append(
+            VerificationIssue(
+                code="generated_test_assigns_unknown_project_attribute",
+                message=(
+                    f"Generated test присваивает `{attr_name}` объекту {owner_type}, но такой атрибут/метод "
+                    "не виден в проектном классе. Для контроля поведения используй видимый method/helper, "
+                    "обычный конструктор или локальный fake/stub."
+                ),
+                file_path=str(test_file_path),
+                symbol=f"{owner_type}.{attr_name}",
+            )
+        )
+
+    return issues, {
+        "class_methods": {name: sorted(methods) for name, methods in class_methods.items()},
+        "class_attributes": {name: sorted(attrs) for name, attrs in class_attrs.items()},
+        "variable_types": variable_types,
+        "allowed_new_method_names": sorted(allowed_new_methods),
+        "checked_assignments": checked_assignments,
+    }
+
+
+def _check_generated_test_unsafe_new_usage(
+    *,
+    tree: ast.AST,
+    imported_names: dict[str, str],
+    test_file_path: Path,
+) -> tuple[list[VerificationIssue], dict[str, Any]]:
+    project_names = set(imported_names)
+    issues: list[VerificationIssue] = []
+    usages: list[dict[str, Any]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (
+            isinstance(func, ast.Attribute)
+            and func.attr == "__new__"
+            and isinstance(func.value, ast.Name)
+            and func.value.id in project_names
+        ):
+            continue
+        usages.append({"class_name": func.value.id, "line": getattr(func, "lineno", None)})
+        issues.append(
+            VerificationIssue(
+                code="generated_test_uses_project_class_new",
+                message=(
+                    f"Generated test создает {func.value.id} через __new__, обходя видимый __init__. "
+                    "Для теста нужно использовать обычный конструктор с видимыми аргументами или локальный fake/stub."
+                ),
+                file_path=str(test_file_path),
+                symbol=func.value.id,
+            )
+        )
+    return issues, {"usages": usages}
 
 
 def _missing_required_constructor_arguments(
@@ -3761,6 +4955,65 @@ def _missing_required_constructor_arguments(
     supplied_by_position = set(positional_fields[: len(call.args)])
     supplied_by_keyword = {str(keyword.arg) for keyword in call.keywords if keyword.arg}
     return [name for name in required if name not in supplied_by_position and name not in supplied_by_keyword]
+
+
+
+def _literal_type_name(node: ast.AST) -> str:
+    if isinstance(node, ast.Constant):
+        value = node.value
+        if isinstance(value, str):
+            return "str"
+        if isinstance(value, bool):
+            return "bool"
+        if isinstance(value, int):
+            return "int"
+        if isinstance(value, float):
+            return "float"
+        if value is None:
+            return "None"
+    return ""
+
+
+def _constructor_argument_type_issues(
+    *,
+    call: ast.Call,
+    class_name: str,
+    signature: dict[str, Any],
+    test_file_path: Path,
+) -> list[VerificationIssue]:
+    annotations = {
+        str(name): str(annotation).rsplit(".", 1)[-1]
+        for name, annotation in (signature.get('field_annotations') or {}).items()
+        if str(name) and str(annotation)
+    }
+    if not annotations:
+        return []
+
+    positional_fields = [str(item) for item in signature.get('positional_fields') or [] if str(item)]
+    supplied: list[tuple[str, ast.AST]] = []
+    for field_name, arg_node in zip(positional_fields, call.args):
+        supplied.append((field_name, arg_node))
+    for keyword in call.keywords:
+        if keyword.arg:
+            supplied.append((str(keyword.arg), keyword.value))
+
+    issues: list[VerificationIssue] = []
+    for field_name, value_node in supplied:
+        expected = annotations.get(field_name, "")
+        actual = _literal_type_name(value_node)
+        if expected in {"Path", "PurePath"} and actual == "str":
+            issues.append(
+                VerificationIssue(
+                    code='generated_test_constructor_argument_type_mismatch',
+                    message=(
+                        f'Generated test передает строковый literal в аргумент `{field_name}` конструктора {class_name}, '
+                        'но видимая аннотация конструктора требует Path/PurePath. Используй pathlib.Path(...) или pytest tmp_path.'
+                    ),
+                    file_path=str(test_file_path),
+                    symbol=f'{class_name}.{field_name}',
+                )
+            )
+    return issues
 
 
 def _check_generated_test_constructor_keywords(
@@ -3797,6 +5050,12 @@ def _check_generated_test_constructor_keywords(
         supplied_keywords = [kw.arg for kw in node.keywords if kw.arg]
         unknown = sorted({name for name in supplied_keywords if name not in allowed_fields}) if allowed_fields else []
         missing_required = _missing_required_constructor_arguments(call=node, signature=signature)
+        type_issues = _constructor_argument_type_issues(
+            call=node,
+            class_name=class_name,
+            signature=signature,
+            test_file_path=test_file_path,
+        )
         checked_calls.append({
             'class_name': class_name,
             'module_name': imported_names.get(class_name, ''),
@@ -3807,7 +5066,10 @@ def _check_generated_test_constructor_keywords(
             'supplied_keywords': supplied_keywords,
             'unknown_keywords': unknown,
             'missing_required_arguments': missing_required,
+            'field_annotations': dict(signature.get('field_annotations') or {}),
+            'type_issue_count': len(type_issues),
         })
+        issues.extend(type_issues)
         for keyword in unknown:
             issues.append(
                 VerificationIssue(
@@ -3967,7 +5229,21 @@ def validate_generated_test_static_semantics(
                             )
                         )
 
+    project_import_issues, project_import_details = _check_generated_test_project_imports(
+        tree=tree,
+        project_root=project_root,
+        test_file_path=test_file_path,
+    )
+    issues.extend(project_import_issues)
+
     imported_names = _collect_project_imported_names(tree, project_root)
+    unsafe_new_issues, unsafe_new_details = _check_generated_test_unsafe_new_usage(
+        tree=tree,
+        imported_names=imported_names,
+        test_file_path=test_file_path,
+    )
+    issues.extend(unsafe_new_issues)
+
     constructor_keyword_issues, constructor_keyword_details = _check_generated_test_constructor_keywords(
         tree=tree,
         project_root=project_root,
@@ -3975,6 +5251,31 @@ def validate_generated_test_static_semantics(
         test_file_path=test_file_path,
     )
     issues.extend(constructor_keyword_issues)
+
+    allowed_generated_method_names = {
+        name.rsplit('.', 1)[-1]
+        for name in (generated_symbol_names or [])
+        if str(name or '').strip()
+    }
+
+    project_method_issues, project_method_details = _check_generated_test_project_method_calls(
+        tree=tree,
+        project_root=project_root,
+        imported_names=imported_names,
+        test_file_path=test_file_path,
+        allowed_new_method_names=allowed_generated_method_names,
+    )
+    issues.extend(project_method_issues)
+
+    attribute_assignment_issues, attribute_assignment_details = _check_generated_test_unknown_project_attribute_assignments(
+        tree=tree,
+        project_root=project_root,
+        imported_names=imported_names,
+        test_file_path=test_file_path,
+        allowed_new_method_names=allowed_generated_method_names,
+    )
+    issues.extend(attribute_assignment_issues)
+
     called_names = _collect_called_names(tree)
     asserted_names = _collect_assert_names(tree)
     unresolved_names = _find_unresolved_names(tree)
@@ -4081,7 +5382,11 @@ def validate_generated_test_static_semantics(
             "referenced_names": sorted(referenced_names),
             "used_names": sorted(used_names),
             "target_reference_names": sorted(target_reference_names),
+            "project_import_check": project_import_details,
+            "unsafe_project_new_usage_check": unsafe_new_details,
             "constructor_keyword_check": constructor_keyword_details,
+            "project_method_call_check": project_method_details,
+            "project_attribute_assignment_check": attribute_assignment_details,
         },
     )
 

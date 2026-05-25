@@ -87,6 +87,315 @@ def _select_related_symbols(
     return selected, total_chars
 
 
+def _as_related_symbol_payload(item: Any, *, source_chars: int | None = None) -> dict[str, Any]:
+    """Normalize a related symbol dataclass/dict into request payload shape."""
+    if isinstance(item, dict):
+        raw = dict(item)
+    else:
+        raw = {
+            'qualname': getattr(item, 'qualname', ''),
+            'file_path': getattr(item, 'file_path', ''),
+            'module_name': getattr(item, 'module_name', ''),
+            'name': getattr(item, 'name', ''),
+            'kind': getattr(item, 'kind', ''),
+            'parent_qualname': getattr(item, 'parent_qualname', None),
+            'role': getattr(item, 'role', ''),
+            'origin_qualname': getattr(item, 'origin_qualname', ''),
+            'relation_kind': getattr(item, 'relation_kind', ''),
+            'relation_direction': getattr(item, 'relation_direction', ''),
+            'relation_source': getattr(item, 'relation_source', ''),
+            'relation_confidence': getattr(item, 'relation_confidence', ''),
+            'signature': getattr(item, 'signature', ''),
+            'docstring': getattr(item, 'docstring', ''),
+            'source_excerpt': getattr(item, 'source_code', '') or getattr(item, 'source_excerpt', ''),
+        }
+    source = str(raw.get('source_excerpt') or raw.get('source_code') or raw.get('source') or '')
+    truncated = bool(raw.get('truncated', False))
+    if source_chars is not None:
+        source, truncated = _truncate_source(source, max(0, int(source_chars or 0)))
+    return {
+        'qualname': str(raw.get('qualname') or ''),
+        'file_path': str(raw.get('file_path') or ''),
+        'module_name': str(raw.get('module_name') or ''),
+        'name': str(raw.get('name') or ''),
+        'kind': str(raw.get('kind') or ''),
+        'parent_qualname': raw.get('parent_qualname'),
+        'role': str(raw.get('role') or ''),
+        'origin_qualname': str(raw.get('origin_qualname') or ''),
+        'relation_kind': str(raw.get('relation_kind') or ''),
+        'relation_direction': str(raw.get('relation_direction') or ''),
+        'relation_source': str(raw.get('relation_source') or ''),
+        'relation_confidence': str(raw.get('relation_confidence') or ''),
+        'signature': str(raw.get('signature') or ''),
+        'docstring': str(raw.get('docstring') or ''),
+        'source_excerpt': source,
+        'truncated': truncated,
+    }
+
+
+def _dedupe_related_symbol_payloads(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in items:
+        key = str(item.get('qualname') or item.get('name') or '').strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+    return result
+
+
+def _module_file_for_module_name(project_root: Path, module_name: str) -> Path | None:
+    module_path = str(module_name or '').replace('.', '/')
+    if not module_path:
+        return None
+    py_path = project_root / f'{module_path}.py'
+    if py_path.exists():
+        return py_path
+    init_path = project_root / module_path / '__init__.py'
+    if init_path.exists():
+        return init_path
+    return None
+
+
+def _split_qualname_to_module(project_root: Path, qualname: str) -> tuple[str, str, Path] | None:
+    parts = [part for part in str(qualname or '').split('.') if part]
+    for index in range(len(parts) - 1, 0, -1):
+        module_name = '.'.join(parts[:index])
+        module_file = _module_file_for_module_name(project_root, module_name)
+        if module_file is None:
+            continue
+        symbol_path = '.'.join(parts[index:])
+        if symbol_path:
+            return module_name, symbol_path, module_file
+    return None
+
+
+def _ast_signature_for_payload(node: Any) -> str:
+    import ast
+
+    if isinstance(node, ast.ClassDef):
+        return f'class {node.name}:'
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return _method_signature_from_ast(node)
+    return str(getattr(node, 'name', '') or '')
+
+
+def _iter_module_symbol_nodes(tree: Any, module_name: str, parent_qualname: str | None = None):
+    import ast
+
+    for node in getattr(tree, 'body', []):
+        if isinstance(node, ast.ClassDef):
+            qualname = f'{module_name}.{node.name}' if not parent_qualname else f'{parent_qualname}.{node.name}'
+            yield qualname, node, 'class', parent_qualname
+            for child in getattr(node, 'body', []):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    yield f'{qualname}.{child.name}', child, 'method', qualname
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            qualname = f'{module_name}.{node.name}' if not parent_qualname else f'{parent_qualname}.{node.name}'
+            yield qualname, node, 'function', parent_qualname
+
+
+def _compact_class_source_for_surface(source_text: str, class_node: Any) -> str:
+    """Return compact class source that keeps constructor signature visible."""
+    import ast
+
+    if not isinstance(class_node, ast.ClassDef):
+        return ''
+    init_node = next(
+        (
+            child
+            for child in getattr(class_node, 'body', [])
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child.name == '__init__'
+        ),
+        None,
+    )
+    if init_node is None:
+        return ''
+    init_source = ast.get_source_segment(source_text, init_node) or ''
+    if not init_source:
+        return ''
+    init_source = '\n'.join(
+        line if line.startswith((' ', '\t')) else f'    {line}'
+        for line in init_source.splitlines()
+    )
+    bases = ''
+    if getattr(class_node, 'bases', None):
+        try:
+            bases = '(' + ', '.join(ast.unparse(base) for base in class_node.bases) + ')'
+        except Exception:
+            bases = ''
+    return f'class {class_node.name}{bases}:\n{init_source}'
+
+
+def _symbol_payload_from_ast(
+    *,
+    module_name: str,
+    module_file: Path,
+    project_root: Path,
+    source_text: str,
+    qualname: str,
+    node: Any,
+    kind: str,
+    parent_qualname: str | None,
+    source_chars: int,
+    role: str,
+    reason: str,
+) -> dict[str, Any]:
+    import ast
+
+    segment = ast.get_source_segment(source_text, node) or ''
+    if isinstance(node, ast.ClassDef):
+        compact_segment = _compact_class_source_for_surface(source_text, node)
+        if compact_segment:
+            segment = compact_segment
+    segment, truncated = _truncate_source(segment, max(0, int(source_chars or 0)))
+    try:
+        file_path = str(module_file.resolve().relative_to(project_root.resolve()))
+    except ValueError:
+        file_path = str(module_file)
+    return {
+        'qualname': qualname,
+        'file_path': file_path,
+        'module_name': module_name,
+        'name': str(getattr(node, 'name', '') or qualname.rsplit('.', 1)[-1]),
+        'kind': kind,
+        'parent_qualname': parent_qualname,
+        'role': role,
+        'origin_qualname': '',
+        'relation_kind': 'imports',
+        'relation_direction': 'outbound',
+        'relation_source': 'index',
+        'relation_confidence': 'high',
+        'signature': _ast_signature_for_payload(node),
+        'docstring': ast.get_docstring(node) or '',
+        'source_excerpt': segment,
+        'truncated': truncated,
+        'selection_reason': reason,
+    }
+
+
+def _request_visible_symbol_names(change_request: ChangeRequest) -> set[str]:
+    text = ' '.join([
+        str(change_request.title or ''),
+        str(change_request.description or ''),
+        ' '.join(str(item) for item in (change_request.constraints or [])),
+        ' '.join(str(item) for item in (change_request.notes or [])),
+    ])
+    names = set(re.findall(r'\b[A-Za-z_][A-Za-z0-9_]*\b', text))
+    return {
+        name
+        for name in names
+        if name[:1].isupper() or '_' in name
+    }
+
+
+def _collect_explicit_project_symbol_contexts(
+    *,
+    project_root: Path,
+    change_request: ChangeRequest,
+    reuse_existing_logic: dict[str, Any],
+    source_chars: int,
+) -> list[dict[str, Any]]:
+    """Load exact project symbols named by analyze hints and explicit request text.
+
+    Analyze may mark helper functions/classes as required reuse contracts. Those
+    symbols must be visible to codegenerator with their true module paths;
+    otherwise the model tends to invent nearby modules such as ``models`` or
+    ``utils``. The collection is conservative: exact qualnames are loaded first,
+    and short names from the user request are resolved only inside modules that
+    were already confirmed by exact reuse contracts.
+    """
+    exact_qualnames = [
+        str(item.get('qualname') or '').strip()
+        for item in (reuse_existing_logic.get('contracts') or [])
+        if isinstance(item, dict) and str(item.get('qualname') or '').strip()
+    ]
+    request_names = _request_visible_symbol_names(change_request)
+    payloads: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    confirmed_modules: dict[str, tuple[Path, str]] = {}
+
+    def load_module(module_name: str, module_file: Path) -> tuple[Any, str] | None:
+        try:
+            source_text = module_file.read_text(encoding='utf-8')
+        except OSError:
+            return None
+        try:
+            import ast
+            tree = ast.parse(source_text)
+        except SyntaxError:
+            return None
+        return tree, source_text
+
+    for qualname in exact_qualnames:
+        split = _split_qualname_to_module(project_root, qualname)
+        if split is None:
+            LOGGER.info('Explicit project symbol not resolved: qualname=%s reason=module_not_found', qualname)
+            continue
+        module_name, _symbol_path, module_file = split
+        loaded = load_module(module_name, module_file)
+        if loaded is None:
+            LOGGER.info('Explicit project symbol not resolved: qualname=%s reason=parse_or_read_failed', qualname)
+            continue
+        tree, source_text = loaded
+        confirmed_modules[module_name] = (module_file, source_text)
+        for node_qualname, node, kind, parent_qualname in _iter_module_symbol_nodes(tree, module_name):
+            if node_qualname != qualname:
+                continue
+            payload = _symbol_payload_from_ast(
+                module_name=module_name,
+                module_file=module_file,
+                project_root=project_root,
+                source_text=source_text,
+                qualname=node_qualname,
+                node=node,
+                kind=kind,
+                parent_qualname=parent_qualname,
+                source_chars=source_chars,
+                role='required_reuse_contract',
+                reason='analyze_reuse_existing_logic',
+            )
+            payloads.append(payload)
+            seen.add(node_qualname)
+            break
+
+    for module_name, (module_file, source_text) in confirmed_modules.items():
+        try:
+            import ast
+            tree = ast.parse(source_text)
+        except SyntaxError:
+            continue
+        for node_qualname, node, kind, parent_qualname in _iter_module_symbol_nodes(tree, module_name):
+            name = str(getattr(node, 'name', '') or '')
+            if name not in request_names or node_qualname in seen:
+                continue
+            payloads.append(
+                _symbol_payload_from_ast(
+                    module_name=module_name,
+                    module_file=module_file,
+                    project_root=project_root,
+                    source_text=source_text,
+                    qualname=node_qualname,
+                    node=node,
+                    kind=kind,
+                    parent_qualname=parent_qualname,
+                    source_chars=source_chars,
+                    role='explicit_request_symbol',
+                    reason='explicit_name_in_request_same_module_as_reuse_contract',
+                )
+            )
+            seen.add(node_qualname)
+
+    if payloads:
+        LOGGER.info(
+            'Explicit project symbol contexts added: count=%s symbols=%s',
+            len(payloads),
+            [item.get('qualname') for item in payloads],
+        )
+    return _dedupe_related_symbol_payloads(payloads)
+
+
 def _select_related_tests(context_pack: ContextPack, limit: int = 1) -> tuple[list[dict[str, Any]], int]:
     selected: list[dict[str, Any]] = []
     total_chars = 0
@@ -1175,10 +1484,11 @@ def build_generation_request(
         'generate_test': config.codegenerator_generate_test_related_symbol_chars,
         'repair': config.codegenerator_repair_related_symbol_chars,
     }
+    reference_enabled = bool(getattr(config, 'codegenerator_include_reference_artifacts', False))
     reference_limits = {
-        'generate': config.codegenerator_generate_reference_max_items,
-        'generate_test': config.codegenerator_generate_test_reference_max_items,
-        'repair': config.codegenerator_repair_reference_max_items,
+        'generate': config.codegenerator_generate_reference_max_items if reference_enabled else 0,
+        'generate_test': config.codegenerator_generate_test_reference_max_items if reference_enabled else 0,
+        'repair': config.codegenerator_repair_reference_max_items if reference_enabled else 0,
     }
 
     related_test_limit = max(0, int(related_test_limits.get(mode, 0) or 0))
@@ -1202,6 +1512,25 @@ def build_generation_request(
         limit=len(context_pack.related_symbols or []),
         source_chars=related_symbol_char_limit or 700,
     )
+
+    reuse_existing_logic = _normalize_reuse_existing_logic_hint(change_request)
+    explicit_related_symbols = _collect_explicit_project_symbol_contexts(
+        project_root=project_root,
+        change_request=change_request,
+        reuse_existing_logic=reuse_existing_logic,
+        source_chars=related_symbol_char_limit or 700,
+    )
+    if explicit_related_symbols:
+        related_symbols = _dedupe_related_symbol_payloads([*explicit_related_symbols, *related_symbols])
+        all_related_symbols = _dedupe_related_symbol_payloads([*explicit_related_symbols, *all_related_symbols])
+        explicit_related_chars = sum(len(str(item.get('source_excerpt') or '')) for item in explicit_related_symbols)
+        related_symbol_chars += explicit_related_chars
+        LOGGER.info(
+            'Explicit project symbols included in generation context: mode=%s count=%s chars=%s',
+            mode,
+            len(explicit_related_symbols),
+            explicit_related_chars,
+        )
 
     selected_reference_items = list(context_pack.reference_artifacts[:max(0, int(reference_limits.get(mode, 0) or 0))])
     LOGGER.info(
@@ -1308,7 +1637,7 @@ def build_generation_request(
         neighbor_sources=[str(item.source_code or '') for item in context_pack.neighbors],
         related_symbols=all_related_symbols,
     )
-    raw_related_symbols = _raw_related_symbol_payloads(context_pack)
+    raw_related_symbols = _dedupe_related_symbol_payloads([*_raw_related_symbol_payloads(context_pack), *explicit_related_symbols])
     model_surfaces = _build_model_surfaces(raw_related_symbols)
     if model_surfaces:
         LOGGER.info(
@@ -1351,7 +1680,6 @@ def build_generation_request(
             [item.get('qualname') or item.get('name') for item in required_contracts],
         )
 
-    reuse_existing_logic = _normalize_reuse_existing_logic_hint(change_request)
     same_class_methods = _same_class_methods_from_source(project_root=project_root, target=target)
     if same_class_methods:
         LOGGER.info(
@@ -1616,6 +1944,7 @@ def build_repair_request(
     requested_operation: str = 'replace_symbol',
     insert_scope: str | None = None,
     previous_generation_request: dict[str, Any] | None = None,
+    project_root: Path | None = None,
 ) -> dict[str, Any]:
     target = context_pack.target
     failure_summary = verification_summary.get('failure_summary', {}) if isinstance(verification_summary, dict) else {}
@@ -1637,7 +1966,11 @@ def build_repair_request(
     )
     repair_reference_limit = max(
         0,
-        int((config.codegenerator_repair_reference_max_items if config is not None else 1) or 0),
+        int((
+            config.codegenerator_repair_reference_max_items
+            if config is not None and bool(getattr(config, 'codegenerator_include_reference_artifacts', False))
+            else 0
+        ) or 0),
     )
     related_symbol_limit = max(
         0,
@@ -1678,6 +2011,24 @@ def build_repair_request(
         limit=len(context_pack.related_symbols or []),
         source_chars=related_symbol_char_limit or 700,
     )
+    explicit_related_symbols: list[dict[str, Any]] = []
+    if project_root is not None:
+        reuse_existing_logic_from_request = _normalize_reuse_existing_logic_hint(change_request)
+        explicit_related_symbols = _collect_explicit_project_symbol_contexts(
+            project_root=project_root,
+            change_request=change_request,
+            reuse_existing_logic=reuse_existing_logic_from_request,
+            source_chars=related_symbol_char_limit or 700,
+        )
+        if explicit_related_symbols:
+            related_symbols = _dedupe_related_symbol_payloads([*explicit_related_symbols, *related_symbols])
+            all_related_symbols = _dedupe_related_symbol_payloads([*explicit_related_symbols, *all_related_symbols])
+            LOGGER.info(
+                'Explicit project symbols included in repair context: count=%s symbols=%s',
+                len(explicit_related_symbols),
+                [item.get('qualname') for item in explicit_related_symbols],
+            )
+
     allowed_api_surface = _allowed_api_surface_from_previous_request(previous_generation_request)
     allowed_api_surface_source = 'previous_generation_request' if allowed_api_surface else 'rebuilt_from_context_pack'
     if allowed_api_surface is None:
@@ -1687,7 +2038,7 @@ def build_repair_request(
             neighbor_sources=[str(item.source_code or '') for item in context_pack.neighbors],
             related_symbols=all_related_symbols,
         )
-    raw_related_symbols = _raw_related_symbol_payloads(context_pack)
+    raw_related_symbols = _dedupe_related_symbol_payloads([*_raw_related_symbol_payloads(context_pack), *explicit_related_symbols])
     model_surfaces = []
     previous_project_context = (previous_generation_request or {}).get('project_context') if isinstance(previous_generation_request, dict) else {}
     if isinstance(previous_project_context, dict):

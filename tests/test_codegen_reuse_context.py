@@ -238,3 +238,90 @@ def test_repair_request_preserves_same_class_methods_from_generation_request(tmp
     assert project_context['same_class_methods'][0]['qualname'] == 'note.note_storage.NoteStorage.find_note_file_by_id'
     assert project_context['reuse_existing_logic']['mode'] == 'recommended'
     assert project_context['reuse_existing_logic']['contracts'][0]['qualname'] == 'note.note_storage.NoteStorage.find_note_file_by_id'
+
+
+def test_generation_request_adds_explicit_project_contracts_and_result_surface(tmp_path: Path) -> None:
+    note_dir = tmp_path / 'note'
+    note_dir.mkdir()
+    (note_dir / 'note_search.py').write_text('''
+class SearchResult:
+    def __init__(self, note, preview: str, match_positions: list[int]) -> None:
+        self.note = note
+        self.preview = preview
+        self.match_positions = match_positions
+
+
+def build_context_fragment(text: str, query: str) -> str:
+    return text[:10]
+
+
+def find_match_positions(text: str, query: str) -> list[int]:
+    return []
+''', encoding='utf-8')
+    storage_source = '''
+class NoteStorage:
+    def search_by_content(self, query: str):
+        return []
+'''
+    (note_dir / 'note_storage.py').write_text(storage_source, encoding='utf-8')
+
+    target = SymbolRecord(
+        file_path='note/note_storage.py',
+        module_name='note.note_storage',
+        name='NoteStorage',
+        qualname='note.note_storage.NoteStorage',
+        kind='class',
+        parent_qualname=None,
+        start_line=2,
+        end_line=4,
+        docstring='',
+        source_code=storage_source,
+    )
+    context_pack = ContextPack(
+        target=target,
+        neighbors=[],
+        inbound_relations=[],
+        outbound_relations=[],
+        related_tests=[],
+        related_symbols=[],
+    )
+    change_request = ChangeRequest(
+        title='Добавить результаты поиска',
+        description='Добавить метод, который использует build_context_fragment и find_match_positions и возвращает SearchResult.',
+        constraints=[
+            'Для контекстного фрагмента использовать build_context_fragment.',
+            'Для позиций совпадений использовать find_match_positions.',
+            'Создавать SearchResult только с видимыми аргументами note, preview и match_positions.',
+        ],
+        project='demo',
+        context_hints={
+            'reuse_existing_logic': {
+                'mode': 'required',
+                'confidence': 0.95,
+                'reason': 'Нужно переиспользовать существующие helper-функции.',
+                'contracts': [
+                    {'qualname': 'note.note_search.build_context_fragment', 'role': 'project_contract'},
+                    {'qualname': 'note.note_search.find_match_positions', 'role': 'project_contract'},
+                ],
+            }
+        },
+    )
+
+    request = build_generation_request(
+        tmp_path,
+        change_request,
+        target.qualname,
+        context_pack,
+        load_config(),
+        mode='generate',
+        operation='insert_after_symbol',
+        insert_scope='class_body',
+    )
+
+    related_qualnames = {item['qualname'] for item in request['project_context']['related_symbols']}
+    assert 'note.note_search.build_context_fragment' in related_qualnames
+    assert 'note.note_search.find_match_positions' in related_qualnames
+    assert 'note.note_search.SearchResult' in related_qualnames
+
+    surfaces = {item['qualname']: item for item in request['project_context']['model_surfaces']}
+    assert surfaces['note.note_search.SearchResult']['constructor_fields'] == ['note', 'preview', 'match_positions']

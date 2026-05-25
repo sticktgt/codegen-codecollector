@@ -580,6 +580,7 @@ class PipelineService:
                     required_contracts=required_contracts,
                     required_class_members=required_class_members,
                     model_surfaces=model_surfaces,
+                    project_root=self.project_services.project_root,
                 ),
             )
 
@@ -661,6 +662,7 @@ class PipelineService:
                             required_contracts=required_contracts,
                             required_class_members=required_class_members,
                             model_surfaces=model_surfaces,
+                            project_root=self.project_services.project_root,
                         ),
                     )
 
@@ -1638,6 +1640,7 @@ class PipelineService:
             requested_operation=requested_operation,
             insert_scope=insert_scope,
             previous_generation_request=previous_generation_request,
+            project_root=self.project_services.project_root,
         )
         call_result = invoke_repair(run_dir, self.project_services.config, request_payload)
         external_call = ExternalGenerationCall(

@@ -46,6 +46,7 @@ class AppConfig:
     codegenerator_config_path: str
     codegenerator_python: str
     codegenerator_request_format: str
+    codegenerator_include_reference_artifacts: bool
     codegenerator_include_full_file_for_non_symbol_targets: bool
     codegenerator_include_full_file_for_generate_test: bool
     codegenerator_include_full_file_for_repair: bool
@@ -269,6 +270,7 @@ def load_config(config_path: Path | None = None) -> AppConfig:
         codegenerator_config_path=str(codegen.get('config_path', 'config.yaml')),
         codegenerator_python=str(codegen.get('python', 'python')),
         codegenerator_request_format=str(codegen.get('request_format', 'json')),
+        codegenerator_include_reference_artifacts=bool(codegen.get('include_reference_artifacts', False)),
         codegenerator_include_full_file_for_non_symbol_targets=bool(codegen.get('include_full_file_for_non_symbol_targets', True)),
         codegenerator_include_full_file_for_generate_test=bool(codegen.get('include_full_file_for_generate_test', True)),
         codegenerator_include_full_file_for_repair=bool(codegen.get('include_full_file_for_repair', True)),

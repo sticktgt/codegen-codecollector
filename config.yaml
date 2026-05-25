@@ -43,6 +43,7 @@ codegenerator:
   config_path: config.yaml
   python: python
   request_format: json
+  include_reference_artifacts: false
   include_full_file_for_non_symbol_targets: true
   include_full_file_for_generate_test: true
   include_full_file_for_repair: true
@@ -56,9 +57,9 @@ codegenerator:
   generate_test_related_symbol_chars: 700
   repair_related_symbols_max_items: 4
   repair_related_symbol_chars: 700
-  generate_reference_max_items: 1
-  generate_test_reference_max_items: 1
-  repair_reference_max_items: 1
+  generate_reference_max_items: 0
+  generate_test_reference_max_items: 0
+  repair_reference_max_items: 0
   test_generation_mode: always
   repair_enabled: true
   max_repair_attempts: 1
