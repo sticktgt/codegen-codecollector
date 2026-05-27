@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ast
+import importlib
+import sys
 from dataclasses import asdict
 from pathlib import Path
 import re
@@ -2676,6 +2678,24 @@ def _top_level_exported_names_from_source(source: str) -> set[str]:
     return names
 
 
+def _is_stdlib_module(module_name: str) -> bool:
+    root = str(module_name or '').split('.', 1)[0]
+    if not root:
+        return False
+    stdlib_names = getattr(sys, 'stdlib_module_names', set())
+    return root in stdlib_names
+
+
+def _stdlib_missing_from_import_names(module_name: str, names: list[str]) -> list[str]:
+    if not names:
+        return []
+    try:
+        module = importlib.import_module(module_name)
+    except Exception:
+        return []
+    return [name for name in names if name and not hasattr(module, name)]
+
+
 def _module_file_for_import_change(project_root: Path, module_name: str) -> Path | None:
     module_path = str(module_name or '').replace('.', '/')
     if not module_path:
@@ -2711,8 +2731,14 @@ def _check_import_changes_resolvable(
         if action not in {'add_import', 'add_from_import'} or not module_name:
             continue
         module_file = _module_file_for_import_change(project_root, module_name)
-        record = {'action': action, 'module': module_name, 'module_file': str(module_file) if module_file else ''}
-        if module_file is None:
+        is_stdlib = _is_stdlib_module(module_name)
+        record = {
+            'action': action,
+            'module': module_name,
+            'module_file': str(module_file) if module_file else '',
+            'is_stdlib': is_stdlib,
+        }
+        if module_file is None and not is_stdlib:
             record['reason'] = 'module_not_found'
             unresolved.append(record)
             issues.append(
@@ -2720,8 +2746,9 @@ def _check_import_changes_resolvable(
                     code='unresolved_import_change_module',
                     message=(
                         f"import_changes добавляет импорт из модуля `{module_name}`, но такой проектный модуль "
-                        "не найден относительно project root. Для repair: используй только подтвержденный путь импорта "
-                        "из contract context, related symbols, full file source или стандартной библиотеки."
+                        "не найден относительно project root и это не модуль стандартной библиотеки. Для repair: "
+                        "используй подтвержденный путь импорта из contract context, related symbols, full file source "
+                        "или модуль стандартной библиотеки."
                     ),
                     severity='error',
                     file_path=target_file,
@@ -2731,12 +2758,16 @@ def _check_import_changes_resolvable(
             checked.append(record)
             continue
         if action == 'add_from_import':
-            try:
-                exported = _top_level_exported_names_from_source(module_file.read_text(encoding='utf-8'))
-            except OSError:
-                exported = set()
             requested_names = [str(name).split(' as ')[0].strip() for name in (change.get('names') or []) if str(name).strip()]
-            missing_names = sorted(name for name in requested_names if name and name not in exported)
+            if is_stdlib and module_file is None:
+                missing_names = _stdlib_missing_from_import_names(module_name, requested_names)
+                exported = []
+            else:
+                try:
+                    exported = _top_level_exported_names_from_source(module_file.read_text(encoding='utf-8')) if module_file else set()
+                except OSError:
+                    exported = set()
+                missing_names = sorted(name for name in requested_names if name and name not in exported)
             record['requested_names'] = requested_names
             record['exported_names'] = sorted(exported)
             record['missing_names'] = missing_names
@@ -4081,6 +4112,340 @@ def _collect_possible_lost_method_contract_warnings(
 
     return details
 
+
+
+_PRESERVE_EXISTING_MARKERS = (
+    "сохран", "не менять", "без изменения", "остав", "текущ", "существующ",
+    "структур", "формат", "публичн", "контракт", "кроме",
+)
+
+
+def _request_asks_to_preserve_existing_behavior_for_validation(change_request: ChangeRequest) -> bool:
+    text = _change_request_full_text(change_request)
+    return any(marker in text for marker in _PRESERVE_EXISTING_MARKERS)
+
+
+def _target_function_node(
+    tree: ast.AST | None,
+    *,
+    target_file: str,
+    target_qualname: str,
+) -> ast.AST | None:
+    if tree is None:
+        return None
+    parts = _target_relative_parts(target_file, target_qualname)
+    if len(parts) == 1:
+        nodes = _top_level_def_nodes(tree, {parts[0]})
+        return nodes[0] if nodes else None
+    if len(parts) == 2:
+        nodes = _class_method_nodes(tree, parts[0], {parts[1]})
+        return nodes[0] if nodes else None
+    return None
+
+
+def _assignment_targets_in_node(node: ast.AST) -> list[str]:
+    targets: list[str] = []
+    if isinstance(node, ast.Assign):
+        candidates = list(node.targets)
+    elif isinstance(node, ast.AnnAssign):
+        candidates = [node.target]
+    elif isinstance(node, ast.AugAssign):
+        candidates = [node.target]
+    else:
+        return targets
+    for candidate in candidates:
+        try:
+            target = ast.unparse(candidate).strip()
+        except Exception:
+            continue
+        if target:
+            targets.append(target)
+    return targets
+
+
+def _node_uses_expr(node: ast.AST | None, expr_text: str) -> bool:
+    if node is None or not expr_text:
+        return False
+    for child in ast.walk(node):
+        if isinstance(child, (ast.Load, ast.Store, ast.Del)):
+            continue
+        try:
+            text = ast.unparse(child).strip()
+        except Exception:
+            continue
+        if text == expr_text:
+            return True
+    return False
+
+
+def _output_use_lines_for_expr(function_node: ast.AST, expr_text: str) -> list[int]:
+    """Return lines where an expression is used in persisted/returned/called data.
+
+    This is intentionally narrow: it does not attempt full data-flow analysis. It
+    only catches high-risk reordering in generated replacements, such as writing
+    a value into a dict/return/call before the value is assigned as in the
+    original method.
+    """
+    lines: list[int] = []
+    for node in ast.walk(function_node):
+        if isinstance(node, ast.Dict):
+            for value in node.values:
+                if _node_uses_expr(value, expr_text):
+                    lines.append(getattr(node, "lineno", 0) or 0)
+                    break
+        elif isinstance(node, ast.Return):
+            if _node_uses_expr(node.value, expr_text):
+                lines.append(getattr(node, "lineno", 0) or 0)
+        elif isinstance(node, ast.Call):
+            # A call site can persist or expose data (e.g. dump/write/emit/return helper).
+            # Do not inspect the function object itself; inspect only arguments.
+            call_parts: list[ast.AST] = [*node.args, *[kw.value for kw in node.keywords if kw.value is not None]]
+            if any(_node_uses_expr(part, expr_text) for part in call_parts):
+                lines.append(getattr(node, "lineno", 0) or 0)
+    return sorted(line for line in lines if line > 0)
+
+
+def _assignment_first_lines(function_node: ast.AST) -> dict[str, int]:
+    first: dict[str, int] = {}
+    for node in ast.walk(function_node):
+        for target in _assignment_targets_in_node(node):
+            line = getattr(node, "lineno", 0) or 0
+            if line and target not in first:
+                first[target] = line
+    return first
+
+
+def _check_preserved_assignment_use_order(
+    *,
+    before_tree: ast.AST | None,
+    after_tree: ast.AST | None,
+    requested_operation: str,
+    change_request: ChangeRequest,
+    target_file: str,
+    target_qualname: str,
+) -> tuple[list[VerificationIssue], dict[str, Any]]:
+    details: dict[str, Any] = {
+        "skipped": True,
+        "reason": "not_applicable",
+        "checked_targets": [],
+        "issues": [],
+    }
+    if requested_operation != "replace_symbol":
+        details["reason"] = "not_replace_symbol"
+        return [], details
+    if not _request_asks_to_preserve_existing_behavior_for_validation(change_request):
+        details["reason"] = "no_preserve_request"
+        return [], details
+
+    before_func = _target_function_node(before_tree, target_file=target_file, target_qualname=target_qualname)
+    after_func = _target_function_node(after_tree, target_file=target_file, target_qualname=target_qualname)
+    if not isinstance(before_func, (ast.FunctionDef, ast.AsyncFunctionDef)) or not isinstance(after_func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        details["reason"] = "target_function_unavailable"
+        return [], details
+
+    before_assignments = _assignment_first_lines(before_func)
+    after_assignments = _assignment_first_lines(after_func)
+    issues: list[VerificationIssue] = []
+    checked: list[dict[str, Any]] = []
+
+    for target, before_assign_line in sorted(before_assignments.items(), key=lambda item: item[1]):
+        # Focus on meaningful state/value assignments. Local temporaries often move
+        # safely, while attributes and subscript/nested values are more likely to be
+        # persisted or observed.
+        if "." not in target and "[" not in target:
+            continue
+        before_uses_after_assignment = [
+            line for line in _output_use_lines_for_expr(before_func, target) if line > before_assign_line
+        ]
+        if not before_uses_after_assignment:
+            continue
+        after_assign_line = after_assignments.get(target)
+        if not after_assign_line:
+            continue
+        after_uses = _output_use_lines_for_expr(after_func, target)
+        after_uses_before_assignment = [line for line in after_uses if line < after_assign_line]
+        item = {
+            "target": target,
+            "before_assignment_line": before_assign_line,
+            "before_first_use_after_assignment_line": min(before_uses_after_assignment),
+            "after_assignment_line": after_assign_line,
+            "after_uses_before_assignment": after_uses_before_assignment,
+        }
+        checked.append(item)
+        if after_uses_before_assignment:
+            issues.append(
+                VerificationIssue(
+                    code="preserved_assignment_used_before_assignment",
+                    message=(
+                        f"В replace_symbol изменен порядок использования `{target}`: в исходном коде значение "
+                        "присваивалось до использования в сохраняемых/возвращаемых данных, а в новом коде "
+                        "используется до присваивания. Для repair: сохрани порядок текущей реализации или "
+                        "перенеси присваивание до первого использования значения."
+                    ),
+                    severity="error",
+                    file_path=target_file,
+                    symbol=target_qualname,
+                )
+            )
+
+    details["skipped"] = False
+    details["reason"] = ""
+    details["checked_targets"] = checked
+    details["issues"] = [issue.code for issue in issues]
+    return issues, details
+
+
+def _contains_ast_node(root: ast.AST | None, target: ast.AST) -> bool:
+    if root is None:
+        return False
+    return any(node is target for node in ast.walk(root))
+
+
+def _dict_literal_key_texts(dict_node: ast.Dict) -> set[str]:
+    keys: set[str] = set()
+    for key in dict_node.keys:
+        if isinstance(key, ast.Constant) and isinstance(key.value, str):
+            keys.add(key.value)
+    return keys
+
+
+def _dict_literal_context(function_node: ast.AST, dict_node: ast.Dict, parents: dict[ast.AST, ast.AST]) -> str:
+    current: ast.AST = dict_node
+    while current in parents:
+        parent = parents[current]
+        if isinstance(parent, ast.Assign) and _contains_ast_node(parent.value, dict_node):
+            targets: list[str] = []
+            for target in parent.targets:
+                try:
+                    targets.append(ast.unparse(target).strip())
+                except Exception:
+                    continue
+            if targets:
+                return "assign:" + ",".join(sorted(targets))
+        if isinstance(parent, ast.AnnAssign) and _contains_ast_node(parent.value, dict_node):
+            try:
+                return "assign:" + ast.unparse(parent.target).strip()
+            except Exception:
+                return "assign:<unknown>"
+        if isinstance(parent, ast.Return):
+            return "return"
+        if isinstance(parent, ast.Call):
+            try:
+                return "call:" + ast.unparse(parent.func).strip()
+            except Exception:
+                return "call:<unknown>"
+        current = parent
+    return "dict:<unknown>"
+
+
+def _dict_literals_by_context(function_node: ast.AST) -> dict[str, dict[str, Any]]:
+    parents: dict[ast.AST, ast.AST] = {
+        child: parent
+        for parent in ast.walk(function_node)
+        for child in ast.iter_child_nodes(parent)
+    }
+    result: dict[str, dict[str, Any]] = {}
+    for node in ast.walk(function_node):
+        if not isinstance(node, ast.Dict):
+            continue
+        keys = _dict_literal_key_texts(node)
+        if len(keys) < 2:
+            continue
+        context = _dict_literal_context(function_node, node, parents)
+        existing = result.setdefault(
+            context,
+            {"keys": set(), "line": getattr(node, "lineno", None), "dict_count": 0},
+        )
+        existing["keys"].update(keys)
+        existing["dict_count"] = int(existing.get("dict_count") or 0) + 1
+    return result
+
+
+def _request_explicitly_allows_dict_key_removal(change_request: ChangeRequest, key: str) -> bool:
+    text = _change_request_full_text(change_request)
+    if key and key.lower() in text:
+        removal_markers = ("удал", "убрать", "исключ", "не сохраня", "не включ")
+        return any(marker in text for marker in removal_markers)
+    return False
+
+
+def _check_preserved_dict_keys(
+    *,
+    before_tree: ast.AST | None,
+    after_tree: ast.AST | None,
+    requested_operation: str,
+    change_request: ChangeRequest,
+    target_file: str,
+    target_qualname: str,
+) -> tuple[list[VerificationIssue], dict[str, Any]]:
+    details: dict[str, Any] = {
+        "skipped": True,
+        "reason": "not_applicable",
+        "checked_dicts": [],
+        "issues": [],
+    }
+    if requested_operation != "replace_symbol":
+        details["reason"] = "not_replace_symbol"
+        return [], details
+    if not _request_asks_to_preserve_existing_behavior_for_validation(change_request):
+        details["reason"] = "no_preserve_request"
+        return [], details
+
+    before_func = _target_function_node(before_tree, target_file=target_file, target_qualname=target_qualname)
+    after_func = _target_function_node(after_tree, target_file=target_file, target_qualname=target_qualname)
+    if not isinstance(before_func, (ast.FunctionDef, ast.AsyncFunctionDef)) or not isinstance(after_func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        details["reason"] = "target_function_unavailable"
+        return [], details
+
+    before_dicts = _dict_literals_by_context(before_func)
+    after_dicts = _dict_literals_by_context(after_func)
+    issues: list[VerificationIssue] = []
+    checked: list[dict[str, Any]] = []
+
+    for context, before_info in sorted(before_dicts.items()):
+        before_keys = set(before_info.get("keys") or set())
+        if not before_keys:
+            continue
+        after_info = after_dicts.get(context)
+        if not after_info:
+            continue
+        after_keys = set(after_info.get("keys") or set())
+        removed = sorted(
+            key for key in (before_keys - after_keys)
+            if not _request_explicitly_allows_dict_key_removal(change_request, key)
+        )
+        item = {
+            "context": context,
+            "before_keys": sorted(before_keys),
+            "after_keys": sorted(after_keys),
+            "removed_keys": removed,
+            "before_line": before_info.get("line"),
+            "after_line": after_info.get("line"),
+        }
+        checked.append(item)
+        if removed:
+            issues.append(
+                VerificationIssue(
+                    code="preserved_dict_key_removed",
+                    message=(
+                        "В replace_symbol удалены ключи из сохраняемого словаря/JSON-структуры "
+                        f"({', '.join(removed)}) в контексте `{context}`. Пользовательский запрос просит "
+                        "сохранить формат/структуру данных; для repair верни эти ключи или явно обоснуй "
+                        "изменение только если оно прямо требуется запросом."
+                    ),
+                    severity="error",
+                    file_path=target_file,
+                    symbol=target_qualname,
+                )
+            )
+
+    details["skipped"] = False
+    details["reason"] = ""
+    details["checked_dicts"] = checked
+    details["issues"] = [issue.code for issue in issues]
+    return issues, details
+
+
 def validate_patch_static_semantics(
     *,
     requested_operation: str,
@@ -4167,6 +4532,12 @@ def validate_patch_static_semantics(
         "checked_members": [],
         "skipped": True,
         "reason": "not_class_replace",
+    }
+    assignment_order_details: dict[str, Any] = {
+        "skipped": True,
+        "reason": "not_checked",
+        "checked_targets": [],
+        "issues": [],
     }
 
     target_is_class_method = _target_is_class_method(target_file, target_qualname)
@@ -4458,6 +4829,26 @@ def validate_patch_static_semantics(
     )
     issues.extend(required_contract_issues)
 
+    assignment_order_issues, assignment_order_details = _check_preserved_assignment_use_order(
+        before_tree=before_tree,
+        after_tree=after_tree,
+        requested_operation=requested_operation,
+        change_request=change_request,
+        target_file=target_file,
+        target_qualname=target_qualname,
+    )
+    issues.extend(assignment_order_issues)
+
+    dict_key_issues, dict_key_details = _check_preserved_dict_keys(
+        before_tree=before_tree,
+        after_tree=after_tree,
+        requested_operation=requested_operation,
+        change_request=change_request,
+        target_file=target_file,
+        target_qualname=target_qualname,
+    )
+    issues.extend(dict_key_issues)
+
     duplicate_symbols = find_duplicate_symbol_definitions(
         patched_file_text,
         _module_name_from_target_file(target_file),
@@ -4503,6 +4894,8 @@ def validate_patch_static_semantics(
             "required_contract_usage_check": required_contract_details,
             "required_class_members_check": required_class_member_details,
             "possible_existing_method_contract_lost": possible_method_contract_details,
+            "preserved_assignment_order_check": assignment_order_details,
+            "preserved_dict_key_check": dict_key_details,
             "annotation_name_check": annotation_name_details,
             "runtime_name_check": runtime_name_details,
             "import_changes_usage_check": import_change_details,
@@ -4841,7 +5234,8 @@ def _check_generated_test_unknown_project_attribute_assignments(
 ) -> tuple[list[VerificationIssue], dict[str, Any]]:
     class_methods = _project_class_methods(project_root, imported_names)
     class_attrs = _project_class_instance_attributes(project_root, imported_names)
-    imported_class_names = set(class_methods) | set(class_attrs)
+    constructor_fields = _project_constructor_keyword_fields(project_root, imported_names)
+    imported_class_names = set(class_methods) | set(class_attrs) | set(constructor_fields)
     variable_types = _infer_generated_test_variable_types(tree, imported_class_names)
     allowed_new_methods = set(allowed_new_method_names or set())
     issues: list[VerificationIssue] = []
@@ -4868,6 +5262,7 @@ def _check_generated_test_unknown_project_attribute_assignments(
             continue
         visible_methods = class_methods.get(owner_type) or set()
         visible_attrs = class_attrs.get(owner_type) or set()
+        visible_constructor_fields = set(constructor_fields.get(owner_type) or [])
         attr_name = target.attr
         checked_assignments.append({
             "owner_name": owner_name,
@@ -4876,8 +5271,23 @@ def _check_generated_test_unknown_project_attribute_assignments(
             "line": getattr(target, "lineno", None),
             "visible_attributes": sorted(visible_attrs),
             "visible_methods": sorted(visible_methods),
+            "visible_constructor_fields": sorted(visible_constructor_fields),
         })
         if attr_name in visible_attrs or attr_name in visible_methods or attr_name in allowed_new_methods:
+            continue
+        if attr_name in visible_constructor_fields:
+            issues.append(
+                VerificationIssue(
+                    code="generated_test_assigns_project_model_field_after_construction",
+                    message=(
+                        f"Generated test присваивает `{attr_name}` объекту {owner_type} после создания. "
+                        "Это поле видно как аргумент конструктора; для тестовых данных передай его "
+                        "через keyword-аргумент конструктора вместо post-init assignment."
+                    ),
+                    file_path=str(test_file_path),
+                    symbol=f"{owner_type}.{attr_name}",
+                )
+            )
             continue
         issues.append(
             VerificationIssue(
@@ -4895,6 +5305,7 @@ def _check_generated_test_unknown_project_attribute_assignments(
     return issues, {
         "class_methods": {name: sorted(methods) for name, methods in class_methods.items()},
         "class_attributes": {name: sorted(attrs) for name, attrs in class_attrs.items()},
+        "constructor_fields": {name: list(fields) for name, fields in constructor_fields.items()},
         "variable_types": variable_types,
         "allowed_new_method_names": sorted(allowed_new_methods),
         "checked_assignments": checked_assignments,

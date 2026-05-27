@@ -132,3 +132,29 @@ def test_import_changes_unresolved_project_name_is_reported(tmp_path) -> None:
 
     assert any(issue.code == 'unresolved_import_change_name' for issue in block.issues)
     assert block.details['import_changes_resolvable_check']['unresolved'][0]['missing_names'] == ['SearchResult']
+
+
+def test_import_changes_standard_library_module_is_resolvable(tmp_path) -> None:
+    original = 'class Storage:\n    pass\n'
+    patched = original + (
+        '\n'
+        'def build(value):\n'
+        '    return datetime.now()\n'
+    )
+
+    block = validate_patch_static_semantics(
+        requested_operation='insert_after_symbol',
+        change_request=ChangeRequest(title='Добавить дату', description='Использовать стандартную библиотеку.', project='demo'),
+        target_qualname='demo.Storage',
+        original_file_text=original,
+        patched_file_text=patched,
+        changed_files=['demo.py'],
+        target_file='demo.py',
+        insert_scope='module_body',
+        import_changes=[{'action': 'add_from_import', 'module': 'datetime', 'names': ['datetime']}],
+        project_root=tmp_path,
+    )
+
+    assert not any(issue.code == 'unresolved_import_change_module' for issue in block.issues)
+    assert not any(issue.code == 'unresolved_import_change_name' for issue in block.issues)
+    assert block.details['import_changes_resolvable_check']['checked'][0]['is_stdlib'] is True

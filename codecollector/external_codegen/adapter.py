@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import re
 import subprocess
@@ -1438,6 +1439,91 @@ def _build_allowed_api_surface(
 
 
 
+_CODEGEN_PRESERVE_MARKERS = (
+    "сохранить", "сохранять", "не менять", "без изменения", "оставить",
+    "текущую структуру", "текущий формат", "текущего поведения",
+    "существующую структуру", "существующий формат", "структуру", "формат",
+    "публичный контракт", "публичное поведение", "кроме",
+)
+
+
+def _change_request_text_for_codegen(change_request: ChangeRequest) -> str:
+    return "\n".join([
+        str(change_request.title or ""),
+        str(change_request.description or ""),
+        "\n".join(str(item) for item in (change_request.constraints or [])),
+        "\n".join(str(item) for item in (change_request.notes or [])),
+    ]).casefold()
+
+
+def _request_asks_to_preserve_existing_behavior_for_codegen(change_request: ChangeRequest) -> bool:
+    text = _change_request_text_for_codegen(change_request)
+    return any(marker in text for marker in _CODEGEN_PRESERVE_MARKERS)
+
+
+def _extract_available_imports_from_source(source: str) -> list[dict[str, Any]]:
+    """Return compact module-level import surface for code generation prompts."""
+    text = str(source or "")
+    if not text.strip():
+        return []
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return []
+
+    lines = text.splitlines()
+    imports: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            source_line = lines[node.lineno - 1].strip() if 0 < node.lineno <= len(lines) else ""
+            for alias in node.names:
+                module = str(alias.name or "").strip()
+                if not module:
+                    continue
+                public_name = str(alias.asname or module.split('.', 1)[0]).strip()
+                key = ('import', module, '', public_name)
+                if key in seen:
+                    continue
+                seen.add(key)
+                imports.append({
+                    'name': public_name,
+                    'kind': 'import',
+                    'module': module,
+                    'imported': '',
+                    'asname': str(alias.asname or '').strip(),
+                    'source': source_line or f'import {module}',
+                })
+            continue
+
+        if isinstance(node, ast.ImportFrom):
+            module = str(node.module or "").strip()
+            if not module or any(alias.name == '*' for alias in node.names):
+                continue
+            source_line = lines[node.lineno - 1].strip() if 0 < node.lineno <= len(lines) else ""
+            for alias in node.names:
+                imported = str(alias.name or "").strip()
+                if not imported:
+                    continue
+                public_name = str(alias.asname or imported).strip()
+                key = ('from_import', module, imported, public_name)
+                if key in seen:
+                    continue
+                seen.add(key)
+                imports.append({
+                    'name': public_name,
+                    'kind': 'from_import',
+                    'module': module,
+                    'imported': imported,
+                    'asname': str(alias.asname or '').strip(),
+                    'source': source_line or f'from {module} import {imported}',
+                })
+
+    return imports
+
+
+
 def build_generation_request(
     project_root: Path,
     change_request: ChangeRequest,
@@ -1450,10 +1536,23 @@ def build_generation_request(
     insert_scope: str | None = None,
 ) -> dict[str, Any]:
     target = context_pack.target
-    full_file_source = (project_root / target.file_path).read_text(encoding='utf-8')
+    module_source = (project_root / target.file_path).read_text(encoding='utf-8')
+    available_imports = _extract_available_imports_from_source(module_source)
+    full_file_source = module_source
     full_file_included = False
+    preserve_replace_mode = (
+        operation == 'replace_symbol'
+        and mode in {'generate', 'repair'}
+        and _request_asks_to_preserve_existing_behavior_for_codegen(change_request)
+    )
     if mode == 'generate_test':
         full_file_included = bool(config.codegenerator_include_full_file_for_generate_test)
+    elif preserve_replace_mode:
+        # In preserve-mode replacements the whole file is useful context for
+        # imports, module constants, neighboring methods and public data formats.
+        # The codegenerator budget is responsible for trimming only if the final
+        # prompt still overflows.
+        full_file_included = True
     elif target.kind not in {'function', 'method'}:
         full_file_included = bool(config.codegenerator_include_full_file_for_non_symbol_targets)
     if not full_file_included:
@@ -1702,6 +1801,7 @@ def build_generation_request(
             for item in context_pack.neighbors
         ],
         'full_file_source': full_file_source,
+        'available_imports': available_imports,
         'target_symbol': {
             'qualname': target.qualname,
             'name': target.name,
@@ -1763,6 +1863,7 @@ def build_generation_request(
             'generate_test_mode': config.codegenerator_test_generation_mode,
             'required_contracts_count': len(required_contracts),
             'required_class_members_count': len(required_class_members),
+            'available_imports_count': len(available_imports),
         },
     }
     metrics = {
@@ -1770,6 +1871,7 @@ def build_generation_request(
         'target_source_truncated': target_truncated,
         'full_file_chars': len(full_file_source),
         'full_file_included': full_file_included,
+        'available_imports_count': len(available_imports),
         'related_tests_count': len(related_tests),
         'related_test_chars': related_test_chars,
         'related_symbols_count': len(related_symbols),
@@ -1998,11 +2100,13 @@ def build_repair_request(
         parent_qualname=parent_qualname,
     )
 
+    module_source_for_imports = _same_file_module_source(context_pack)
+    available_imports = _extract_available_imports_from_source(module_source_for_imports)
     full_file_source = ''
     full_file_truncated = False
     if config is not None and bool(config.codegenerator_include_full_file_for_repair):
         full_file_source, full_file_truncated = _truncate_source(
-            _same_file_module_source(context_pack),
+            module_source_for_imports,
             max(0, int(config.codegenerator_repair_full_file_chars or 0)),
         )
 
@@ -2174,6 +2278,7 @@ def build_repair_request(
             ],
             'full_file_source': full_file_source,
             'full_file_truncated': full_file_truncated,
+            'available_imports': available_imports,
             'target_symbol': {
                 'qualname': target.qualname,
                 'name': target.name,
@@ -2238,6 +2343,7 @@ def build_repair_request(
             'model_surfaces_count': len(model_surfaces),
             'full_file_included': bool(full_file_source),
             'full_file_truncated': full_file_truncated,
+            'available_imports_count': len(available_imports),
         },
     }
 

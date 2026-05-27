@@ -179,19 +179,34 @@ class ApplyService:
         if not raw_lines:
             return raw_lines
 
-        first_line = raw_lines[0].lstrip()
-        body_lines = raw_lines[1:]
+        def is_method_header(line: str) -> bool:
+            stripped = line.lstrip()
+            return stripped.startswith('def ') or stripped.startswith('async def ')
+
+        header_index = next((idx for idx, line in enumerate(raw_lines) if is_method_header(line)), -1)
+        if header_index < 0:
+            return [line.lstrip() if line.strip() else '' for line in raw_lines]
+
+        prefix_lines = raw_lines[:header_index]
+        method_header = raw_lines[header_index].lstrip()
+        body_lines = raw_lines[header_index + 1:]
+
+        normalized: list[str] = []
+        for line in prefix_lines:
+            if not line.strip():
+                normalized.append('')
+            else:
+                normalized.append(line.lstrip())
+        normalized.append(method_header)
+
+        if not body_lines:
+            return normalized
 
         non_empty_body_indents = [
             len(line) - len(line.lstrip())
             for line in body_lines
             if line.strip()
         ]
-
-        normalized = [first_line]
-        if not body_lines:
-            return normalized
-
         min_body_indent = min(non_empty_body_indents) if non_empty_body_indents else 0
 
         for line in body_lines:
@@ -204,15 +219,36 @@ class ApplyService:
 
         return normalized
 
+    def _class_body_payload_starts_with_method(self, source: str) -> bool:
+        lines = [line for line in source.splitlines() if line.strip()]
+        if not lines:
+            return False
+
+        def is_method_header(line: str) -> bool:
+            stripped = line.lstrip()
+            return stripped.startswith('def ') or stripped.startswith('async def ')
+
+        first = lines[0].lstrip()
+        if is_method_header(first):
+            return True
+        if not first.startswith('@'):
+            return False
+
+        for line in lines[1:]:
+            stripped = line.lstrip()
+            if stripped.startswith('@'):
+                continue
+            return is_method_header(stripped)
+        return False
+
     def _normalize_class_body_method_lines(self, lines: list[str], symbol: SymbolRecord, payload_lines: list[str]) -> list[str]:
         if symbol.kind not in {'method', 'class'}:
             raise ValueError('insert_scope=class_body requires class or method target anchor')
         dedented = textwrap.dedent('\n'.join(payload_lines)).strip('\n')
         if not dedented.strip():
             raise ValueError('Generated method code is empty for class_body insert')
-        stripped = dedented.lstrip()
-        if not (stripped.startswith('def ') or stripped.startswith('async def ')):
-            raise ValueError('insert_scope=class_body expects generated code to start with def or async def')
+        if not self._class_body_payload_starts_with_method(dedented):
+            raise ValueError('insert_scope=class_body expects generated code to start with def, async def, or method decorator')
         method_indent = self._method_indent(lines, symbol)
         normalized_lines = self._normalize_method_snippet_indentation(dedented.splitlines())
         return [method_indent + line if line.strip() else '' for line in normalized_lines]

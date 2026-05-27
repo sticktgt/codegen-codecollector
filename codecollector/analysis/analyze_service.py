@@ -250,6 +250,26 @@ class AnalyzeService:
                 override_scope = self._insert_scope_from_payload(target_recommendation)
                 if override_scope:
                     effective_insert_scope = override_scope
+        class_member_insert_override = self._prefer_member_insert_over_class_replace(
+            services=services,
+            base_query=query,
+            candidates=candidates,
+            target_recommendation=target_recommendation,
+            recommended_target=recommended_target,
+            requested_operation=effective_operation,
+            user_operation=requested_operation,
+            search_plan=search_plan,
+        )
+        if class_member_insert_override is not None:
+            recommended_target, candidates, target_recommendation = class_member_insert_override
+            effective_operation = 'insert_after_symbol'
+            operation_source = 'class_member_insert_override'
+            operation_confidence = self._safe_float(target_recommendation.get('operation_confidence')) or 0.9
+            operation_reason = str(target_recommendation.get('operation_reason') or operation_reason or '').strip() or None
+            override_scope = self._insert_scope_from_payload(target_recommendation)
+            if override_scope:
+                effective_insert_scope = override_scope
+
         if recommended_target:
             recommended_target, candidates, target_recommendation = self._post_process_recommended_target(
                 services=services,
@@ -775,6 +795,131 @@ class AnalyzeService:
         )
         return symbol.qualname, updated_candidates, updated_recommendation
 
+    def _prefer_member_insert_over_class_replace(
+        self,
+        *,
+        services: ProjectServices,
+        base_query: str,
+        candidates: list[SearchCandidate],
+        target_recommendation: dict[str, Any],
+        recommended_target: str | None,
+        requested_operation: str,
+        user_operation: str | None,
+        search_plan: dict[str, Any],
+    ) -> tuple[str, list[SearchCandidate], dict[str, Any]] | None:
+        """Prefer adding a class member over replacing a whole class.
+
+        LLM rerank sometimes maps an analyst-friendly request such as "add a
+        property/attribute to this result object" to replace_symbol on the
+        whole class. Replacing the class is risky because it may drop existing
+        constructor checks and public behavior. When the request is clearly
+        additive, the target is a class, and the expected new symbol is a
+        method/property, keep the analyst CR as-is but normalize the technical
+        operation to insert_after_symbol inside that class.
+        """
+        if requested_operation != 'replace_symbol':
+            return None
+        normalized_user_operation = self._normalize_operation(user_operation or '')
+        # Some callers currently pass replace_symbol as a UI/default operation even
+        # for analyst-friendly additive member requests. Do not let that force a
+        # whole-class replacement when the CR itself asks to add a property/method
+        # and does not explicitly ask to replace the class.
+        target = str(target_recommendation.get('recommended_target') or recommended_target or '').strip()
+        if not target:
+            return None
+        target_symbol = services.store.get_symbol(str(services.project_root), target)
+        if target_symbol is None or target_symbol.kind != 'class':
+            return None
+        expected_kind = self._expected_new_symbol_kind(target_recommendation, search_plan)
+        if expected_kind != 'method':
+            return None
+        if not self._looks_like_add_member_request(base_query, target_recommendation, search_plan):
+            return None
+        if self._looks_like_class_replacement_request(base_query):
+            return None
+
+        reason = (
+            'Запрос выглядит как добавление нового свойства/метода в существующий class, '
+            'а не как замена всего класса. Analyze сохраняет класс как parent/anchor и '
+            'нормализует операцию в insert_after_symbol, чтобы не потерять существующий конструктор '
+            'и публичное поведение класса.'
+        )
+        updated_recommendation = dict(target_recommendation or {})
+        updated_recommendation.update(
+            {
+                'recommended_operation': 'insert_after_symbol',
+                'operation_confidence': max(self._safe_float(updated_recommendation.get('operation_confidence')), 0.9),
+                'operation_reason': reason,
+                'recommended_target': target_symbol.qualname,
+                'target_role': 'parent_class',
+                'target_confidence': max(self._safe_float(updated_recommendation.get('target_confidence')), 0.9),
+                'target_reason': reason,
+                'manual_review_required': False,
+                'expected_new_symbol_kind': 'method',
+                'parent_qualname': target_symbol.qualname,
+                'insert_scope': {
+                    'value': 'class_body',
+                    'confidence': 0.95,
+                    'reason': 'Новый symbol должен быть методом/property внутри найденного класса.',
+                },
+            }
+        )
+        post_processing = dict(updated_recommendation.get('post_processing') or {})
+        post_processing['class_replace_normalized_to_member_insert'] = {
+            'from_operation': requested_operation,
+            'to_operation': 'insert_after_symbol',
+            'target': target_symbol.qualname,
+            'reason': 'additive_class_member_request',
+            'user_operation': normalized_user_operation or None,
+            'user_operation_overridden': normalized_user_operation == 'replace_symbol',
+        }
+        updated_recommendation['post_processing'] = post_processing
+        updated_candidates = self._promote_anchor_candidate(candidates, target_symbol, reason)
+        LOGGER.info(
+            'Analyze normalized class replace to member insert: target=%s',
+            target_symbol.qualname,
+        )
+        return target_symbol.qualname, updated_candidates, updated_recommendation
+
+    def _looks_like_add_member_request(
+        self,
+        base_query: str,
+        target_recommendation: dict[str, Any],
+        search_plan: dict[str, Any],
+    ) -> bool:
+        text_parts = [base_query]
+        for payload in (target_recommendation, search_plan):
+            if not isinstance(payload, dict):
+                continue
+            for key in ('operation_reason', 'target_reason', 'reason'):
+                text_parts.append(str(payload.get(key) or ''))
+            for item in payload.get('constraints') or []:
+                text_parts.append(str(item))
+        text = ' '.join(text_parts).lower()
+        add_markers = (
+            'добав',
+            'предостав',
+            'получить',
+            'возможность',
+            'доступн',
+            'property',
+            'свойств',
+            'атрибут',
+            'метод',
+        )
+        return any(marker in text for marker in add_markers)
+
+    def _looks_like_class_replacement_request(self, text: str) -> bool:
+        normalized = str(text or '').lower()
+        replacement_markers = (
+            'заменить класс',
+            'переписать класс',
+            'замена класса',
+            'заменить существующий класс',
+            'полностью заменить',
+        )
+        return any(marker in normalized for marker in replacement_markers)
+
     def _prefer_existing_stub_target_for_implementation(
         self,
         *,
@@ -1052,6 +1197,8 @@ class AnalyzeService:
             value = str(payload.get('expected_new_symbol_kind') or '').strip().lower()
             if value in {'class', 'function', 'method'}:
                 return value
+            if value == 'property':
+                return 'method'
             symbols = payload.get('expected_new_symbols') or []
             if isinstance(symbols, list):
                 for item in symbols:
@@ -1059,6 +1206,8 @@ class AnalyzeService:
                         kind = str(item.get('kind') or '').strip().lower()
                         if kind in {'class', 'function', 'method'}:
                             return kind
+                        if kind == 'property':
+                            return 'method'
         return None
 
     def _post_process_recommended_target(
@@ -1072,6 +1221,10 @@ class AnalyzeService:
         target_recommendation: dict[str, Any],
     ) -> tuple[str, list[SearchCandidate], dict[str, Any]]:
         if requested_operation != 'insert_after_symbol':
+            return recommended_target, candidates, target_recommendation
+
+        target_symbol = services.store.get_symbol(str(services.project_root), recommended_target)
+        if insert_scope == 'class_body' and target_symbol is not None and target_symbol.kind in {'class', 'method'}:
             return recommended_target, candidates, target_recommendation
 
         anchor_symbol = self._last_top_level_anchor_in_target_file(services, recommended_target)

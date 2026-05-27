@@ -2155,3 +2155,314 @@ def test_generated_test_static_semantics_allows_overriding_visible_helper_method
 
     assert block.ok
     assert block.details['project_attribute_assignment_check']['checked_assignments'][0]['attribute'] == 'search_by_content'
+
+
+def test_generation_request_includes_available_imports_when_full_file_is_not_included(tmp_path: Path) -> None:
+    config = load_config()
+    project_root = tmp_path
+    target_file = project_root / 'app' / 'storage.py'
+    target_file.parent.mkdir(parents=True)
+    module_source = (
+        'import json\n'
+        'from datetime import datetime\n'
+        'from pathlib import Path\n\n'
+        'class Storage:\n'
+        '    def save(self, value):\n'
+        '        return json.dumps({"value": value})\n'
+    )
+    target_file.write_text(module_source, encoding='utf-8')
+    target = _symbol(
+        qualname='app.storage.Storage.save',
+        name='save',
+        kind='method',
+        source='def save(self, value):\n        return json.dumps({"value": value})\n',
+        file_path='app/storage.py',
+        parent='app.storage.Storage',
+    )
+    module = _symbol(
+        qualname='app.storage',
+        name='storage',
+        kind='module',
+        source=module_source,
+        file_path='app/storage.py',
+        parent=None,
+    )
+    context_pack = ContextPack(
+        target=target,
+        neighbors=[module],
+        inbound_relations=[],
+        outbound_relations=[],
+        related_tests=[],
+        related_symbols=[],
+    )
+
+    request = build_generation_request(
+        project_root,
+        ChangeRequest(title='Обновить сохранение', description='Использовать дату.', project='demo'),
+        'app.storage.Storage.save',
+        context_pack,
+        config,
+        operation='replace_symbol',
+    )
+
+    assert request['project_context']['full_file_source'] == ''
+    available = request['project_context']['available_imports']
+    assert {'name': 'json', 'kind': 'import', 'module': 'json', 'imported': '', 'asname': '', 'source': 'import json'} in available
+    assert any(item['name'] == 'datetime' and item['source'] == 'from datetime import datetime' for item in available)
+    assert request['options'].get('available_imports_count') == len(available)
+
+
+def test_patch_static_semantics_rejects_preserved_assignment_used_after_output_data() -> None:
+    original = (
+        'import json\n\n'
+        'class Store:\n'
+        '    def save(self, item):\n'
+        '        path = self.path_for(item)\n'
+        '        if item.identifier is None:\n'
+        '            item.identifier = path.stem\n'
+        '        data = {"id": item.identifier, "name": item.name}\n'
+        '        json.dump(data, open(path, "w"))\n'
+        '        return str(path)\n'
+    )
+    patched = (
+        'import json\n\n'
+        'class Store:\n'
+        '    def save(self, item):\n'
+        '        path = self.path_for(item)\n'
+        '        data = {"id": item.identifier, "name": item.name}\n'
+        '        if item.identifier is None:\n'
+        '            item.identifier = path.stem\n'
+        '        json.dump(data, open(path, "w"))\n'
+        '        return str(path)\n'
+    )
+
+    block = validate_patch_static_semantics(
+        requested_operation='replace_symbol',
+        change_request=ChangeRequest(
+            title='Сохранение объекта',
+            description='При сохранении нужно сохранить текущую структуру записи и не менять формат данных.',
+            project='demo',
+        ),
+        target_qualname='sample.store.Store.save',
+        original_file_text=original,
+        patched_file_text=patched,
+        changed_files=['sample/store.py'],
+        target_file='sample/store.py',
+        related_symbols=[],
+    )
+
+    assert not block.ok
+    assert any(issue.code == 'preserved_assignment_used_before_assignment' for issue in block.issues)
+    details = block.details.get('preserved_assignment_order_check') or {}
+    assert details.get('skipped') is False
+
+
+def test_patch_static_semantics_allows_preserved_assignment_order_when_kept() -> None:
+    original = (
+        'import json\n\n'
+        'class Store:\n'
+        '    def save(self, item):\n'
+        '        path = self.path_for(item)\n'
+        '        if item.identifier is None:\n'
+        '            item.identifier = path.stem\n'
+        '        data = {"id": item.identifier, "name": item.name}\n'
+        '        json.dump(data, open(path, "w"))\n'
+        '        return str(path)\n'
+    )
+    patched = (
+        'import json\n\n'
+        'class Store:\n'
+        '    def save(self, item):\n'
+        '        path = self.path_for(item)\n'
+        '        if item.identifier is None:\n'
+        '            item.identifier = path.stem\n'
+        '        item.updated_at = self.now()\n'
+        '        data = {"id": item.identifier, "name": item.name}\n'
+        '        json.dump(data, open(path, "w"))\n'
+        '        return str(path)\n'
+    )
+
+    block = validate_patch_static_semantics(
+        requested_operation='replace_symbol',
+        change_request=ChangeRequest(
+            title='Сохранение объекта',
+            description='При сохранении нужно сохранить текущую структуру записи и не менять формат данных.',
+            project='demo',
+        ),
+        target_qualname='sample.store.Store.save',
+        original_file_text=original,
+        patched_file_text=patched,
+        changed_files=['sample/store.py'],
+        target_file='sample/store.py',
+        related_symbols=[],
+    )
+
+    assert not any(issue.code == 'preserved_assignment_used_before_assignment' for issue in block.issues)
+
+
+def test_patch_static_semantics_rejects_removed_preserved_dict_key() -> None:
+    original = (
+        'import json\n\n'
+        'class Store:\n'
+        '    def save(self, item):\n'
+        '        data = {"id": item.identifier, "name": item.name, "updated_at": item.updated_at}\n'
+        '        json.dump(data, open("x", "w"))\n'
+        '        return "x"\n'
+    )
+    patched = (
+        'import json\n\n'
+        'class Store:\n'
+        '    def save(self, item):\n'
+        '        item.updated_at = self.now()\n'
+        '        data = {"name": item.name, "updated_at": item.updated_at}\n'
+        '        json.dump(data, open("x", "w"))\n'
+        '        return "x"\n'
+    )
+
+    block = validate_patch_static_semantics(
+        requested_operation='replace_symbol',
+        change_request=ChangeRequest(
+            title='Сохранение объекта',
+            description='При сохранении нужно сохранить текущий формат данных.',
+            project='demo',
+        ),
+        target_qualname='sample.store.Store.save',
+        original_file_text=original,
+        patched_file_text=patched,
+        changed_files=['sample/store.py'],
+        target_file='sample/store.py',
+        related_symbols=[],
+    )
+
+    assert not block.ok
+    assert any(issue.code == 'preserved_dict_key_removed' for issue in block.issues)
+    details = block.details.get('preserved_dict_key_check') or {}
+    assert details.get('skipped') is False
+    assert details['checked_dicts'][0]['removed_keys'] == ['id']
+
+
+def test_patch_static_semantics_allows_preserved_dict_keys_when_kept() -> None:
+    original = (
+        'import json\n\n'
+        'class Store:\n'
+        '    def save(self, item):\n'
+        '        data = {"id": item.identifier, "name": item.name}\n'
+        '        json.dump(data, open("x", "w"))\n'
+        '        return "x"\n'
+    )
+    patched = (
+        'import json\n\n'
+        'class Store:\n'
+        '    def save(self, item):\n'
+        '        item.updated_at = self.now()\n'
+        '        data = {"id": item.identifier, "name": item.name, "updated_at": item.updated_at}\n'
+        '        json.dump(data, open("x", "w"))\n'
+        '        return "x"\n'
+    )
+
+    block = validate_patch_static_semantics(
+        requested_operation='replace_symbol',
+        change_request=ChangeRequest(
+            title='Сохранение объекта',
+            description='При сохранении нужно сохранить текущий формат данных.',
+            project='demo',
+        ),
+        target_qualname='sample.store.Store.save',
+        original_file_text=original,
+        patched_file_text=patched,
+        changed_files=['sample/store.py'],
+        target_file='sample/store.py',
+        related_symbols=[],
+    )
+
+    assert not any(issue.code == 'preserved_dict_key_removed' for issue in block.issues)
+
+
+def test_generated_test_static_semantics_flags_post_init_assignment_to_constructor_field(tmp_path: Path) -> None:
+    module_file = tmp_path / 'note' / 'note_model.py'
+    module_file.parent.mkdir(parents=True)
+    module_file.write_text(
+        'class Note:\n'
+        '    def __init__(self, subject, content, id=None):\n'
+        '        self.subject = subject\n'
+        '        self.content = content\n'
+        '        self._internal = None\n',
+        encoding='utf-8',
+    )
+    test_file = tmp_path / 'tests' / 'test_generated.py'
+    test_file.parent.mkdir(parents=True)
+    test_file.write_text(
+        'from note.note_model import Note\n\n'
+        'def test_note():\n'
+        '    note = Note(subject="s", content="c")\n'
+        '    note.id = "existing"\n'
+        '    assert note.id == "existing"\n',
+        encoding='utf-8',
+    )
+
+    block = validate_generated_test_static_semantics(
+        project_root=tmp_path,
+        test_file_path=test_file,
+        target_qualname='note.note_model.Note.__init__',
+        requested_operation='replace_symbol',
+    )
+
+    assert not block.ok
+    assert any(issue.code == 'generated_test_assigns_project_model_field_after_construction' for issue in block.issues)
+    details = block.details['project_attribute_assignment_check']
+    assert details['checked_assignments'][0]['visible_constructor_fields'] == ['content', 'id', 'subject']
+
+
+def test_generation_request_includes_full_file_for_preserve_replace_mode(tmp_path: Path) -> None:
+    config = load_config()
+    project_root = tmp_path
+    target_file = project_root / 'app' / 'storage.py'
+    target_file.parent.mkdir(parents=True)
+    module_source = (
+        'import json\n\n'
+        'class Storage:\n'
+        '    def save(self, item):\n'
+        '        data = {"id": item.id, "name": item.name}\n'
+        '        return json.dumps(data)\n'
+    )
+    target_file.write_text(module_source, encoding='utf-8')
+    target = _symbol(
+        qualname='app.storage.Storage.save',
+        name='save',
+        kind='method',
+        source='def save(self, item):\n        data = {"id": item.id, "name": item.name}\n        return json.dumps(data)\n',
+        file_path='app/storage.py',
+        parent='app.storage.Storage',
+    )
+    module = _symbol(
+        qualname='app.storage',
+        name='storage',
+        kind='module',
+        source=module_source,
+        file_path='app/storage.py',
+        parent=None,
+    )
+    context_pack = ContextPack(
+        target=target,
+        neighbors=[module],
+        inbound_relations=[],
+        outbound_relations=[],
+        related_tests=[],
+        related_symbols=[],
+    )
+
+    request = build_generation_request(
+        project_root,
+        ChangeRequest(
+            title='Обновить сохранение',
+            description='Сохранить текущую структуру и формат данных при замене метода.',
+            project='demo',
+        ),
+        'app.storage.Storage.save',
+        context_pack,
+        config,
+        operation='replace_symbol',
+    )
+
+    assert request['project_context']['full_file_source'] == module_source
+    assert len(request['project_context']['full_file_source']) == len(module_source)

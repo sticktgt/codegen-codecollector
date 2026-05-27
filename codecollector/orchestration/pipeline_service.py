@@ -1498,6 +1498,55 @@ class PipelineService:
             production_diff = apply_result.diff.unified_diff
         except Exception:
             production_diff = ''
+        review_project_context: dict[str, Any] = {}
+        try:
+            context_request = build_generation_request(
+                self.project_services.project_root,
+                change_request,
+                selected_target,
+                context_pack,
+                self.project_services.config,
+                generated_code_artifact=code_artifact,
+                mode='generate_test',
+                operation=str(code_artifact.get('operation') or 'replace_symbol'),
+                insert_scope=code_artifact.get('insert_scope'),
+            )
+            review_project_context = dict(context_request.get('project_context') or {})
+        except Exception as exc:
+            LOGGER.warning('Failed to build generated-test review project_context from generation request: %s', exc)
+            review_project_context = {}
+
+        if not str(review_project_context.get('full_file_source') or '').strip():
+            try:
+                full_file_source = (self.project_services.project_root / context_pack.target.file_path).read_text(encoding='utf-8')
+                review_project_context['full_file_source'] = full_file_source
+            except Exception as exc:
+                LOGGER.warning('Failed to read full file source for generated-test review: %s', exc)
+        review_project_context.setdefault('target_symbol', {
+            'qualname': context_pack.target.qualname,
+            'name': context_pack.target.name,
+            'kind': context_pack.target.kind,
+            'docstring': context_pack.target.docstring,
+            'source': context_pack.target.source_code,
+        })
+        review_project_context.setdefault('module_outline', [
+            {
+                'qualname': item.qualname,
+                'kind': item.kind,
+                'name': item.name,
+                'docstring': item.docstring,
+            }
+            for item in context_pack.neighbors
+        ])
+        LOGGER.info(
+            'generated-test review context prepared target=%s old_target_chars=%s full_file_chars=%s related_symbols=%s model_surfaces=%s',
+            selected_target,
+            len(str((review_project_context.get('target_symbol') or {}).get('source') or '')),
+            len(str(review_project_context.get('full_file_source') or '')),
+            len(review_project_context.get('related_symbols') or []),
+            len(review_project_context.get('model_surfaces') or []),
+        )
+
         request_payload = {
             'request_id': f'review-generated-test-{selected_target.split(".")[-1]}',
             'mode': 'review_generated_test_failure',
@@ -1525,6 +1574,7 @@ class PipelineService:
                 'apply': dict(generated_test_apply or {}),
             },
             'verification_context': self._compact_generated_test_review_verification_context(verification_report),
+            'project_context': review_project_context,
         }
         call_result = invoke_generated_test_failure_review(run_dir, self.project_services.config, request_payload)
         return dict(call_result.result_payload or {})

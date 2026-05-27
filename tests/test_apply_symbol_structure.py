@@ -79,3 +79,106 @@ def test_replace_symbol_rejects_method_that_would_move_to_module_level(tmp_path:
                 operation='replace_symbol',
             ),
         )
+
+
+def _class_symbol() -> SymbolRecord:
+    return SymbolRecord(
+        file_path='note/note_search.py',
+        module_name='note.note_search',
+        name='SearchResult',
+        qualname='note.note_search.SearchResult',
+        kind='class',
+        parent_qualname='note.note_search',
+        start_line=1,
+        end_line=3,
+        source_code='',
+    )
+
+
+def test_insert_class_body_accepts_decorated_method(tmp_path: Path) -> None:
+    target = tmp_path / 'note_search.py'
+    target.write_text(
+        'class SearchResult:\n'
+        '    def __init__(self, note):\n'
+        '        self.note = note\n'
+        '\n'
+        'class SearchUI:\n'
+        '    pass\n',
+        encoding='utf-8',
+    )
+
+    _service()._apply_operation_to_file(
+        target,
+        _class_symbol(),
+        PatchArtifact(
+            target_qualname='note.note_search.SearchResult',
+            replacement_code=(
+                '@property\n'
+                'def note_id(self):\n'
+                '    return getattr(self.note, "id", None)\n'
+            ),
+            operation='insert_after_symbol',
+            insert_scope='class_body',
+            expected_new_symbol_kind='method',
+            parent_qualname='note.note_search.SearchResult',
+        ),
+    )
+
+    updated = target.read_text(encoding='utf-8')
+    assert '\n    @property\n    def note_id(self):\n' in updated
+    assert '        return getattr(self.note, "id", None)\n' in updated
+    assert '\nclass SearchUI:\n' in updated
+
+
+def test_insert_class_body_reindents_decorated_method_with_class_indent(tmp_path: Path) -> None:
+    target = tmp_path / 'note_search.py'
+    target.write_text(
+        'class SearchResult:\n'
+        '    def __init__(self, note):\n'
+        '        self.note = note\n',
+        encoding='utf-8',
+    )
+
+    _service()._apply_operation_to_file(
+        target,
+        _class_symbol(),
+        PatchArtifact(
+            target_qualname='note.note_search.SearchResult',
+            replacement_code=(
+                '    @property\n'
+                '    def note_id(self):\n'
+                '        return self.note.id\n'
+            ),
+            operation='insert_after_symbol',
+            insert_scope='class_body',
+            expected_new_symbol_kind='method',
+            parent_qualname='note.note_search.SearchResult',
+        ),
+    )
+
+    updated = target.read_text(encoding='utf-8')
+    assert '\n    @property\n    def note_id(self):\n        return self.note.id\n' in updated
+
+
+def test_insert_class_body_rejects_decorator_without_method(tmp_path: Path) -> None:
+    target = tmp_path / 'note_search.py'
+    target.write_text(
+        'class SearchResult:\n'
+        '    def __init__(self, note):\n'
+        '        self.note = note\n',
+        encoding='utf-8',
+    )
+
+    with pytest.raises(ValueError, match='expects generated code to start with def, async def, or method decorator'):
+        _service()._apply_operation_to_file(
+            target,
+            _class_symbol(),
+            PatchArtifact(
+                target_qualname='note.note_search.SearchResult',
+                replacement_code='@property\nnote_id = 1\n',
+                operation='insert_after_symbol',
+                insert_scope='class_body',
+                expected_new_symbol_kind='method',
+                parent_qualname='note.note_search.SearchResult',
+            ),
+        )
