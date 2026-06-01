@@ -9,6 +9,11 @@ JSON-формат ответа:
     "reason": "короткое объяснение",
     "missing_information": ["что нужно уточнить"]
   },
+  "change_kind": {
+    "value": "symbol_change | import_change | file_level_change | uncertain",
+    "confidence": 0.0,
+    "reason": "короткое объяснение"
+  },
   "operation": {
     "value": "replace_symbol | insert_after_symbol | unknown",
     "confidence": 0.0,
@@ -37,6 +42,9 @@ JSON-формат ответа:
 
 Правила:
 - Если user_operation задана человеком, верни ее как operation.value, но можешь добавить предупреждение в reason/warnings.
+- Поле change_kind описывает тип изменения: symbol_change — замена или добавление функции/метода/класса; import_change — изменение способа подключения зависимости или пути import; file_level_change — изменение на уровне файла, которое не сводится к одному symbol; uncertain — тип изменения неясен.
+- Если запрос описывает изменение способа подключения зависимости, import, пути модуля или ситуацию, когда установленный компонент не распознается приложением, используй change_kind="import_change" или change_kind="file_level_change". Не выбирай symbol_change только потому, что рядом есть метод, который использует это имя.
+- Если change_kind="import_change" или change_kind="file_level_change" и в текущей схеме нет надежного symbol-target для такого изменения, используй operation.value="unknown" и manual_review_required=true.
 - Если user_insert_scope задан человеком, верни его как insert_scope.value, но можешь добавить предупреждение в reason/warnings.
 - Для replace_symbol ищем существующий symbol, который нужно заменить целиком.
 - Если запрос звучит как «реализовать/дореализовать/заполнить» поведение, и в проекте уже есть существующий method/function stub с NotImplementedError/TODO, совпадающий по смыслу, предпочитай replace_symbol этого stub, а не insert_after_symbol.

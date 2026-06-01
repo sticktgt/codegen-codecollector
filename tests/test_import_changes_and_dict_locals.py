@@ -158,3 +158,42 @@ def test_import_changes_standard_library_module_is_resolvable(tmp_path) -> None:
     assert not any(issue.code == 'unresolved_import_change_module' for issue in block.issues)
     assert not any(issue.code == 'unresolved_import_change_name' for issue in block.issues)
     assert block.details['import_changes_resolvable_check']['checked'][0]['is_stdlib'] is True
+
+
+def test_remove_import_change_existing_import_is_resolvable(tmp_path) -> None:
+    original = 'import win32com.client\n\nclass OutlookExporter:\n    pass\n'
+    patched = 'class OutlookExporter:\n    pass\n'
+
+    block = validate_patch_static_semantics(
+        requested_operation='replace_symbol',
+        change_request=ChangeRequest(title='Убрать необязательный импорт', description='Не падать без зависимости.', project='demo'),
+        target_qualname='export.outlook_exporter.OutlookExporter',
+        original_file_text=original,
+        patched_file_text=patched,
+        changed_files=['export/outlook_exporter.py'],
+        target_file='export/outlook_exporter.py',
+        import_changes=[{'action': 'remove_import', 'module': 'win32com.client'}],
+        project_root=tmp_path,
+    )
+
+    assert not any(issue.code == 'unresolved_remove_import_change' for issue in block.issues)
+    assert block.details['import_changes_resolvable_check']['checked'][0]['found_in_original_file'] is True
+
+
+def test_remove_import_change_missing_import_is_reported(tmp_path) -> None:
+    original = 'import re\n\nclass OutlookExporter:\n    pass\n'
+    patched = original
+
+    block = validate_patch_static_semantics(
+        requested_operation='replace_symbol',
+        change_request=ChangeRequest(title='Убрать необязательный импорт', description='Не падать без зависимости.', project='demo'),
+        target_qualname='export.outlook_exporter.OutlookExporter',
+        original_file_text=original,
+        patched_file_text=patched,
+        changed_files=['export/outlook_exporter.py'],
+        target_file='export/outlook_exporter.py',
+        import_changes=[{'action': 'remove_import', 'module': 'win32com.client'}],
+        project_root=tmp_path,
+    )
+
+    assert any(issue.code == 'unresolved_remove_import_change' for issue in block.issues)

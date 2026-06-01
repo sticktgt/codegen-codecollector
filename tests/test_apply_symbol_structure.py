@@ -182,3 +182,78 @@ def test_insert_class_body_rejects_decorator_without_method(tmp_path: Path) -> N
                 parent_qualname='note.note_search.SearchResult',
             ),
         )
+
+
+def _module_class_symbol(start_line: int, end_line: int) -> SymbolRecord:
+    return SymbolRecord(
+        file_path='export/outlook_exporter.py',
+        module_name='export.outlook_exporter',
+        name='OutlookExporter',
+        qualname='export.outlook_exporter.OutlookExporter',
+        kind='class',
+        parent_qualname='export.outlook_exporter',
+        start_line=start_line,
+        end_line=end_line,
+        source_code='',
+    )
+
+
+def test_apply_import_changes_removes_plain_import(tmp_path: Path) -> None:
+    target = tmp_path / 'outlook_exporter.py'
+    target.write_text(
+        'import re\n'
+        'import win32com.client\n'
+        'from typing import List\n'
+        '\n'
+        'class OutlookExporter:\n'
+        '    def __init__(self):\n'
+        '        raise NotImplementedError\n',
+        encoding='utf-8',
+    )
+
+    _service()._apply_operation_to_file(
+        target,
+        _module_class_symbol(5, 7),
+        PatchArtifact(
+            target_qualname='export.outlook_exporter.OutlookExporter',
+            replacement_code=(
+                'class OutlookExporter:\n'
+                '    def __init__(self):\n'
+                '        self.outlook_app = None\n'
+            ),
+            operation='replace_symbol',
+            import_changes=[{'action': 'remove_import', 'module': 'win32com.client'}],
+        ),
+    )
+
+    updated = target.read_text(encoding='utf-8')
+    assert 'import win32com.client' not in updated
+    assert 'import re' in updated
+    assert 'from typing import List' in updated
+    assert 'class OutlookExporter:' in updated
+
+
+def test_apply_import_changes_removes_name_from_from_import(tmp_path: Path) -> None:
+    target = tmp_path / 'outlook_exporter.py'
+    target.write_text(
+        'from win32com import client, other\n'
+        '\n'
+        'class OutlookExporter:\n'
+        '    pass\n',
+        encoding='utf-8',
+    )
+
+    _service()._apply_operation_to_file(
+        target,
+        _module_class_symbol(3, 4),
+        PatchArtifact(
+            target_qualname='export.outlook_exporter.OutlookExporter',
+            replacement_code='class OutlookExporter:\n    pass\n',
+            operation='replace_symbol',
+            import_changes=[{'action': 'remove_from_import', 'module': 'win32com', 'names': ['client']}],
+        ),
+    )
+
+    updated = target.read_text(encoding='utf-8')
+    assert 'from win32com import other' in updated
+    assert 'client' not in updated

@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import importlib
 import sys
+import textwrap
 from dataclasses import asdict
 from pathlib import Path
 import re
@@ -188,7 +189,57 @@ def _top_level_defs(tree: ast.AST | None) -> dict[str, str]:
             result[node.name] = "function"
         elif isinstance(node, ast.ClassDef):
             result[node.name] = "class"
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    result[target.id] = "constant"
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            result[node.target.id] = "constant"
     return result
+
+
+
+# Conservative allowlist for methods inherited from external GUI/framework base classes.
+# The checker cannot introspect third-party libraries in generated-code validation, but
+# it can safely allow a small set of stable framework methods when the base class is
+# visible in the target module AST. Keep this registry narrow: it should contain only
+# public methods that are ordinary instance methods and do not hide project-specific
+# behavior.
+_EXTERNAL_BASE_CLASS_METHOD_ALLOWLIST: dict[str, set[str]] = {
+    "QMainWindow": {
+        "addToolBar",
+        "centralWidget",
+        "close",
+        "menuBar",
+        "resize",
+        "setCentralWidget",
+        "setMenuBar",
+        "setStatusBar",
+        "setWindowTitle",
+        "show",
+        "statusBar",
+    },
+    "QWidget": {
+        "close",
+        "layout",
+        "resize",
+        "setEnabled",
+        "setLayout",
+        "setVisible",
+        "setWindowTitle",
+        "show",
+    },
+    "QDialog": {
+        "accept",
+        "close",
+        "exec",
+        "exec_",
+        "reject",
+        "resize",
+        "setWindowTitle",
+        "show",
+    },
+}
 
 def _class_methods(tree: ast.AST | None, class_name: str) -> set[str]:
     if tree is None or not class_name:
@@ -201,6 +252,87 @@ def _class_methods(tree: ast.AST | None, class_name: str) -> set[str]:
                 if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
             }
     return set()
+
+
+
+def _base_class_name(base: ast.AST) -> str:
+    """Return the simple class name for a visible base expression."""
+    if isinstance(base, ast.Name):
+        return base.id
+    if isinstance(base, ast.Attribute):
+        return str(base.attr or "")
+    if isinstance(base, ast.Subscript):
+        return _base_class_name(base.value)
+    return ""
+
+
+def _class_base_names(tree: ast.AST | None, class_name: str) -> list[str]:
+    class_node = _class_node(tree, class_name)
+    if class_node is None:
+        return []
+    names: list[str] = []
+    for base in class_node.bases:
+        name = _base_class_name(base).strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def _inherited_method_names(
+    tree: ast.AST | None,
+    class_name: str,
+    *,
+    _seen: set[str] | None = None,
+) -> tuple[set[str], dict[str, list[str]], list[str]]:
+    """Return methods inherited from visible local bases and known external bases.
+
+    The validation remains conservative: local base classes are resolved only when
+    they are present in the same AST, and external bases are allowed only through
+    the small registry above. This prevents false `unknown_self_method` errors for
+    framework methods such as QMainWindow.setCentralWidget without allowing any
+    arbitrary `self.*` call.
+    """
+    if tree is None or not class_name:
+        return set(), {}, []
+
+    seen = set(_seen or set())
+    if class_name in seen:
+        return set(), {}, []
+    seen.add(class_name)
+
+    inherited: set[str] = set()
+    methods_by_base: dict[str, list[str]] = {}
+    base_names = _class_base_names(tree, class_name)
+
+    for base_name in base_names:
+        base_methods: set[str] = set()
+
+        local_methods = _class_methods(tree, base_name)
+        if local_methods:
+            base_methods.update(local_methods)
+            nested_methods, nested_by_base, _nested_base_names = _inherited_method_names(
+                tree,
+                base_name,
+                _seen=seen,
+            )
+            base_methods.update(nested_methods)
+            for nested_base, nested_list in nested_by_base.items():
+                existing = set(methods_by_base.get(nested_base, []))
+                existing.update(nested_list)
+                methods_by_base[nested_base] = sorted(existing)
+
+        external_methods = _EXTERNAL_BASE_CLASS_METHOD_ALLOWLIST.get(base_name, set())
+        if external_methods:
+            base_methods.update(external_methods)
+
+        if base_methods:
+            inherited.update(base_methods)
+            existing = set(methods_by_base.get(base_name, []))
+            existing.update(base_methods)
+            methods_by_base[base_name] = sorted(existing)
+
+    return inherited, methods_by_base, base_names
+
 
 def _class_node(tree: ast.AST | None, class_name: str) -> ast.ClassDef | None:
     if tree is None or not class_name:
@@ -236,32 +368,64 @@ _TYPING_ANNOTATION_NAMES = {
     "MutableMapping", "List", "Dict", "Set", "Tuple", "Type", "ClassVar", "Protocol",
 }
 
+def _add_module_level_binding_names(names: set[str], node: ast.AST) -> None:
+    """Collect names that are made available while executing module-level code.
+
+    This intentionally stays shallow: it follows only module-level control-flow
+    blocks such as try/except and if/else. It does not inspect functions or
+    classes, because names assigned inside them are not module globals.
+    """
+    if isinstance(node, ast.Import):
+        for alias in node.names:
+            root = (alias.asname or alias.name.split('.', 1)[0]).strip()
+            if root:
+                names.add(root)
+        return
+
+    if isinstance(node, ast.ImportFrom):
+        for alias in node.names:
+            if alias.name == '*':
+                # Star imports are intentionally treated as unknown surface.
+                continue
+            name = (alias.asname or alias.name).strip()
+            if name:
+                names.add(name)
+        return
+
+    if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+        names.add(node.name)
+        return
+
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                names.add(target.id)
+        return
+
+    if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+        names.add(node.target.id)
+        return
+
+    if isinstance(node, ast.Try):
+        for child in [*node.body, *node.orelse, *node.finalbody]:
+            _add_module_level_binding_names(names, child)
+        for handler in node.handlers:
+            for child in handler.body:
+                _add_module_level_binding_names(names, child)
+        return
+
+    if isinstance(node, ast.If):
+        for child in [*node.body, *node.orelse]:
+            _add_module_level_binding_names(names, child)
+        return
+
+
 def _module_available_names(tree: ast.AST | None) -> set[str]:
     names: set[str] = set(_BUILTIN_ANNOTATION_NAMES)
     if tree is None:
         return names
     for node in getattr(tree, "body", []):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                root = (alias.asname or alias.name.split('.', 1)[0]).strip()
-                if root:
-                    names.add(root)
-        elif isinstance(node, ast.ImportFrom):
-            for alias in node.names:
-                if alias.name == '*':
-                    # Star imports are intentionally treated as unknown surface.
-                    continue
-                name = (alias.asname or alias.name).strip()
-                if name:
-                    names.add(name)
-        elif isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
-            names.add(node.name)
-        elif isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name):
-                    names.add(target.id)
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            names.add(node.target.id)
+        _add_module_level_binding_names(names, node)
     return names
 
 def _annotation_name_nodes(annotation: ast.AST | None) -> list[ast.Name]:
@@ -576,7 +740,9 @@ def _check_unknown_self_attribute_usage(
         return [], {"checked_attributes": [], "unknown_attributes": [], "skipped": True, "reason": "no_parent_class"}
 
     known_attributes = _self_attribute_names(owner_tree, parent_class_name)
-    known_methods = _class_methods(owner_tree, parent_class_name)
+    own_methods = _class_methods(owner_tree, parent_class_name)
+    inherited_methods, inherited_methods_by_base, base_class_names = _inherited_method_names(owner_tree, parent_class_name)
+    known_methods = own_methods | inherited_methods
     module_level_names = _module_level_names(owner_tree)
     checked: list[dict[str, Any]] = []
     checked_methods: list[dict[str, Any]] = []
@@ -727,6 +893,10 @@ def _check_unknown_self_attribute_usage(
         "parent_class": parent_class_name,
         "known_attributes": sorted(known_attributes),
         "known_methods": sorted(known_methods),
+        "own_methods": sorted(own_methods),
+        "inherited_methods": sorted(inherited_methods),
+        "inherited_methods_by_base": inherited_methods_by_base,
+        "base_class_names": base_class_names,
         "module_level_names": sorted(module_level_names),
         "checked_attributes": checked,
         "unknown_attributes": unknown_details,
@@ -2410,12 +2580,17 @@ def _method_receiver_matches_contract(func: ast.expr, spec: dict[str, Any]) -> b
 def _top_level_def_nodes(tree: ast.AST | None, names: set[str]) -> list[ast.stmt]:
     if tree is None:
         return []
-    return [
-        node
-        for node in getattr(tree, "body", [])
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-        and node.name in names
-    ]
+    result: list[ast.stmt] = []
+    for node in getattr(tree, "body", []):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name in names:
+            result.append(node)
+        elif isinstance(node, ast.Assign):
+            assigned_names = {target.id for target in node.targets if isinstance(target, ast.Name)}
+            if assigned_names & names:
+                result.append(node)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id in names:
+            result.append(node)
+    return result
 
 
 def _class_method_nodes(tree: ast.AST | None, class_name: str, method_names: set[str]) -> list[ast.stmt]:
@@ -2709,12 +2884,40 @@ def _module_file_for_import_change(project_root: Path, module_name: str) -> Path
     return None
 
 
+def _source_has_import_for_removal(source: str, change: dict[str, Any]) -> bool:
+    module_name = str(change.get('module') or '').strip()
+    action = str(change.get('action') or '').strip()
+    if not module_name:
+        return False
+    names = [str(name).split(' as ')[0].strip() for name in (change.get('names') or []) if str(name).strip()]
+    alias_filter = str(change.get('alias') or change.get('asname') or '').strip()
+    tree = _safe_parse(source)
+    if tree is None:
+        return False
+
+    for node in getattr(tree, 'body', []):
+        if isinstance(node, ast.Import) and action == 'remove_import':
+            for alias in node.names:
+                if alias.name == module_name and (not alias_filter or alias.asname == alias_filter):
+                    return True
+        elif isinstance(node, ast.ImportFrom):
+            node_module = ('.' * int(getattr(node, 'level', 0) or 0)) + (node.module or '')
+            for alias in node.names:
+                full_name = f'{node_module}.{alias.name}' if node_module else alias.name
+                if action == 'remove_import' and full_name == module_name:
+                    return True
+                if action == 'remove_from_import' and node_module == module_name and (not names or alias.name in names):
+                    return True
+    return False
+
+
 def _check_import_changes_resolvable(
     *,
     project_root: Path | None,
     import_changes: list[dict[str, Any]] | None,
     target_file: str,
     target_qualname: str,
+    original_file_text: str = "",
 ) -> tuple[list[VerificationIssue], dict[str, Any]]:
     if project_root is None:
         return [], {'checked': [], 'unresolved': [], 'skipped': True, 'reason': 'project_root_not_provided'}
@@ -2728,6 +2931,34 @@ def _check_import_changes_resolvable(
             continue
         action = str(change.get('action') or '').strip()
         module_name = str(change.get('module') or '').strip()
+        if action in {'remove_import', 'remove_from_import'}:
+            record = {
+                'action': action,
+                'module': module_name,
+            }
+            if action == 'remove_from_import':
+                requested_names = [str(name).split(' as ')[0].strip() for name in (change.get('names') or []) if str(name).strip()]
+                record['requested_names'] = requested_names
+            found = _source_has_import_for_removal(original_file_text, change)
+            record['found_in_original_file'] = found
+            checked.append(record)
+            if not found:
+                unresolved.append(record)
+                issues.append(
+                    VerificationIssue(
+                        code='unresolved_remove_import_change',
+                        message=(
+                            f"import_changes просит удалить импорт `{module_name}`, но такой file-level import "
+                            "не найден в исходном целевом файле. Для repair: удаляй только явно видимый import "
+                            "или убери remove_import из import_changes."
+                        ),
+                        severity='error',
+                        file_path=target_file,
+                        symbol=target_qualname,
+                    )
+                )
+            continue
+
         if action not in {'add_import', 'add_from_import'} or not module_name:
             continue
         module_file = _module_file_for_import_change(project_root, module_name)
@@ -3044,6 +3275,8 @@ def _serialized_value_is_acceptable_for_expected_type(expected: str) -> bool:
 
 
 def _types_are_compatible_for_model_constructor(*, expected: str, actual: str) -> bool:
+    if actual == "None" and _type_allows_none(expected):
+        return True
     if actual == "serialized_value":
         return _serialized_value_is_acceptable_for_expected_type(expected)
     return _types_are_compatible(expected=expected, actual=actual)
@@ -3530,6 +3763,146 @@ def _code_artifact_boundary_issues(
 
     return issues, details
 
+
+
+def _normalize_replace_symbol_code_for_validation(
+    *,
+    code: str,
+    operation: str | None,
+    target_qualname: str | None,
+) -> tuple[str, dict[str, Any]]:
+    """Normalize a single-symbol replacement artifact for standalone checks.
+
+    LLMs often return a method or class exactly as it appears inside the
+    surrounding file, including the class-level indentation before ``def``.
+    Static checks and apply logic work with standalone replacement symbols, so
+    a leading common indentation should not make an otherwise valid one-symbol
+    artifact fail with ``unexpected indent``.
+
+    The normalization is intentionally conservative:
+    - it is only attempted for ``replace_symbol`` artifacts;
+    - it is only used when the raw code does not parse;
+    - the dedented code must parse as Python;
+    - the dedented code must contain a definition with the target name.
+
+    This keeps wider module snippets, malformed code, and wrong-symbol
+    artifacts from being silently accepted.
+    """
+    details: dict[str, Any] = {
+        "applied": False,
+        "reason": "not_attempted",
+        "original_chars": len(code),
+        "normalized_chars": len(code),
+    }
+    if operation != "replace_symbol" or not target_qualname or not code.strip():
+        details["reason"] = "not_replace_symbol_or_missing_target"
+        return code, details
+
+    raw_tree, raw_error = _parse_with_error(code)
+    if raw_tree is not None:
+        details["reason"] = "raw_code_parseable"
+        return code, details
+
+    candidate = textwrap.dedent(code).strip("\n")
+    if code.endswith("\n"):
+        candidate += "\n"
+    candidate_tree, candidate_error = _parse_with_error(candidate)
+    if candidate_tree is None:
+        details.update(
+            {
+                "reason": "dedented_code_not_parseable",
+                "raw_error": str(raw_error) if raw_error else None,
+                "dedented_error": str(candidate_error) if candidate_error else None,
+            }
+        )
+        return code, details
+
+    target_name = str(target_qualname).rsplit(".", 1)[-1]
+    top_level_defs = [
+        node
+        for node in getattr(candidate_tree, "body", [])
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    ]
+    if not any(str(getattr(node, "name", "")) == target_name for node in top_level_defs):
+        details.update(
+            {
+                "reason": "dedented_code_missing_target_symbol",
+                "raw_error": str(raw_error) if raw_error else None,
+                "top_level_symbols": [str(getattr(node, "name", "")) for node in top_level_defs],
+            }
+        )
+        return code, details
+
+    details.update(
+        {
+            "applied": True,
+            "reason": "dedented_single_symbol_candidate_parseable",
+            "original_chars": len(code),
+            "normalized_chars": len(candidate),
+            "raw_error": str(raw_error) if raw_error else None,
+            "top_level_symbols": [str(getattr(node, "name", "")) for node in top_level_defs],
+        }
+    )
+    return candidate, details
+
+def _code_artifact_text_boundary_issues(
+    *,
+    code: str,
+    operation: str | None,
+    target_qualname: str | None,
+    target_file: str | None,
+) -> list[VerificationIssue]:
+    """Best-effort boundary diagnostics for syntax-broken artifacts.
+
+    Some method replacement artifacts fail AST parsing before the normal
+    boundary checker can report that the model returned a sibling method or
+    helper class.  This lightweight textual check is deliberately narrow: it
+    only runs for ``replace_symbol`` and only reports visible definition lines.
+    It does not accept the artifact; it only gives repair a more precise reason
+    than a generic SyntaxError.
+    """
+    if operation != "replace_symbol" or not target_qualname or not code.strip():
+        return []
+
+    target_name = str(target_qualname).rsplit(".", 1)[-1]
+    definitions: list[dict[str, Any]] = []
+    for lineno, line in enumerate(code.splitlines(), start=1):
+        stripped = line.strip()
+        if stripped.startswith("def ") or stripped.startswith("async def "):
+            name_part = stripped.split("def ", 1)[1]
+            name = name_part.split("(", 1)[0].strip()
+            definitions.append({"name": name, "kind": "function", "line": lineno})
+        elif stripped.startswith("class "):
+            name_part = stripped.split("class ", 1)[1]
+            name = name_part.split("(", 1)[0].split(":", 1)[0].strip()
+            definitions.append({"name": name, "kind": "class", "line": lineno})
+
+    if len(definitions) <= 1:
+        return []
+
+    extra_names = [item["name"] for item in definitions if item["name"] != target_name]
+    found_names = ", ".join(item["name"] for item in definitions)
+    extra_text = ", ".join(extra_names) if extra_names else found_names
+    return [
+        VerificationIssue(
+            code="replace_symbol_artifact_contains_extra_symbol_text",
+            message=(
+                "Для replace_symbol code_artifact должен содержать только полный код целевого "
+                f"symbol `{target_name}`. В тексте artifact найдены дополнительные def/class: "
+                f"{extra_text}. Для repair: верни только def/class целевого symbol, не добавляй "
+                "соседние методы, обработчики, локальные helper-функции или новые классы. "
+                "Не подключай сигнал или callback к новому `self.<handler>`, если этот handler "
+                "не является уже видимым методом класса. Если нужна простая вспомогательная "
+                "логика, встрои ее в тело целевого symbol через локальные переменные, lambda, "
+                "setattr, выражения или уже видимый проектный контракт."
+            ),
+            severity="error",
+            file_path=str(target_file or ""),
+            symbol=str(target_qualname or ""),
+        )
+    ]
+
+
 def validate_code_artifact_static_semantics(
     *,
     result_payload: dict[str, Any],
@@ -3567,6 +3940,32 @@ def validate_code_artifact_static_semantics(
                 "target_file": target_file,
             },
         )
+
+    text_boundary_issues = _code_artifact_text_boundary_issues(
+        code=code,
+        operation=operation,
+        target_qualname=target_qualname or expected_target_qualname,
+        target_file=target_file,
+    )
+    # Run the text-level boundary check before AST parsing. Broken method
+    # replacement artifacts often fail with a generic indentation SyntaxError
+    # exactly because the model returned an extra sibling method. Putting this
+    # issue first makes repair focus on the real contract violation: only the
+    # target symbol may be returned for replace_symbol.
+    issues.extend(text_boundary_issues)
+
+    normalized_code, normalization_details = _normalize_replace_symbol_code_for_validation(
+        code=code,
+        operation=operation,
+        target_qualname=target_qualname or expected_target_qualname,
+    )
+    if normalization_details.get("applied"):
+        # Mutate the payload deliberately: all downstream pipeline steps should
+        # apply exactly the standalone code that passed static validation. This
+        # keeps validation and apply behavior consistent for artifacts returned
+        # with class-level indentation.
+        code_artifact["code"] = normalized_code
+        code = normalized_code
 
     tree, syntax_error = _parse_with_error(code)
 
@@ -3633,6 +4032,7 @@ def validate_code_artifact_static_semantics(
             "target_file": target_file,
             "code_chars": len(code),
             "parseable": tree is not None,
+            "code_normalization": normalization_details,
             "expected_operation": expected_operation,
             "expected_target_qualname": expected_target_qualname,
             "artifact_boundary_check": boundary_details,
@@ -4730,6 +5130,7 @@ def validate_patch_static_semantics(
         import_changes=import_changes,
         target_file=target_file,
         target_qualname=target_qualname,
+        original_file_text=original_file_text,
     )
     issues.extend(import_change_resolve_issues)
 

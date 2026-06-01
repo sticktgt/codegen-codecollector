@@ -4,6 +4,11 @@
 
 JSON-формат ответа:
 {
+  "change_kind": {
+    "value": "symbol_change | import_change | file_level_change | uncertain",
+    "confidence": 0.0,
+    "reason": "короткое объяснение"
+  },
   "recommended_operation": "replace_symbol | insert_after_symbol | unknown",
   "operation_confidence": 0.0,
   "operation_reason": "короткое объяснение",
@@ -36,6 +41,7 @@ JSON-формат ответа:
 }
 
 Правила выбора:
+- Сначала определи change_kind. Если запрос или search_plan указывает на import_change/file_level_change, не выбирай метод только потому, что он использует имя из import.
 - Для replace_symbol выбирай symbol, который непосредственно реализует изменяемое поведение.
 - Если CR просит «реализовать/дореализовать/заполнить» поведение и среди candidates есть существующий method/function stub с NotImplementedError/TODO, совпадающий с задачей по смыслу, выбирай replace_symbol этого stub. Не добавляй новый symbol рядом с существующей заглушкой.
 - Не выбирай wrapper/controller/use-case метод, если есть более конкретный callee с нужной логикой.
@@ -47,6 +53,7 @@ JSON-формат ответа:
 - Если пользователь просит добавить top-level helper/function/class, используй insert_scope=module_body.
 - Для insert_after_symbol + module_body выбирай разумный top-level anchor (function/class) в подходящем файле; не возвращай null, если такой candidate есть.
 - Не выбирай method как финальный module_body anchor; если близкий candidate — method, предпочти top-level anchor в том же файле.
+- Если change_kind="import_change" или change_kind="file_level_change", а candidate_cards содержат только методы/классы, которые используют нужное имя, но не определяют сам import/file-level change, верни recommended_target=null и manual_review_required=true.
 - Если правильного target/anchor нет среди candidate_cards, верни recommended_target=null и manual_review_required=true.
 - Если данных недостаточно, честно верни manual_review_required=true.
 - Если user_operation задана и кажется неверной, не меняй ее молча; укажи warning.

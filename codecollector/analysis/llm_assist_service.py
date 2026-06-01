@@ -546,11 +546,16 @@ class AnalysisLlmAssistService:
     def _compact_search_plan(self, search_plan: dict[str, Any]) -> dict[str, Any]:
         plan = search_plan.get('search_plan') or {}
         operation = search_plan.get('operation') or {}
+        change_kind = search_plan.get('change_kind') or {}
         request_quality = search_plan.get('request_quality') or {}
         return {
             'request_quality': {
                 'status': request_quality.get('status'),
                 'missing_information': request_quality.get('missing_information') or [],
+            },
+            'change_kind': {
+                'value': change_kind.get('value'),
+                'confidence': change_kind.get('confidence'),
             },
             'operation': {
                 'value': operation.get('value'),

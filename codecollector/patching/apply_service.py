@@ -112,7 +112,16 @@ class ApplyService:
     def _apply_import_changes(self, source: str, import_changes: list[dict]) -> str:
         if not import_changes:
             return source
-        lines = source.splitlines()
+
+        updated_source = source
+        for item in import_changes:
+            if not isinstance(item, dict):
+                continue
+            action = str(item.get('action') or '').strip()
+            if action in {'remove_import', 'remove_from_import'}:
+                updated_source = self._apply_remove_import_change(updated_source, item)
+
+        lines = updated_source.splitlines()
         existing = {line.strip() for line in lines}
         new_imports: list[str] = []
         for item in import_changes:
@@ -135,10 +144,79 @@ class ApplyService:
             if line not in existing and line not in new_imports:
                 new_imports.append(line)
         if not new_imports:
+            return updated_source.rstrip('\n') + '\n'
+
+        insert_at = self._import_insert_index(updated_source, lines)
+        lines[insert_at:insert_at] = new_imports
+        return '\n'.join(lines).rstrip('\n') + '\n'
+
+    def _apply_remove_import_change(self, source: str, change: dict) -> str:
+        module = str(change.get('module') or '').strip()
+        if not module:
+            return source
+        action = str(change.get('action') or '').strip()
+        names = [str(name).split(' as ')[0].strip() for name in (change.get('names') or []) if str(name).strip()]
+        alias_filter = str(change.get('alias') or change.get('asname') or '').strip()
+
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
             return source
 
-        insert_at = self._import_insert_index(source, lines)
-        lines[insert_at:insert_at] = new_imports
+        lines = source.splitlines()
+        replacements: list[tuple[int, int, list[str]]] = []
+
+        def alias_text(alias: ast.alias) -> str:
+            return alias.name + (f' as {alias.asname}' if alias.asname else '')
+
+        for node in getattr(tree, 'body', []):
+            if not isinstance(node, (ast.Import, ast.ImportFrom)):
+                continue
+            start = int(getattr(node, 'lineno', 0) or 0) - 1
+            end = int(getattr(node, 'end_lineno', 0) or 0)
+            if start < 0 or end <= start:
+                continue
+
+            if isinstance(node, ast.Import) and action == 'remove_import':
+                remaining: list[ast.alias] = []
+                removed = False
+                for alias in node.names:
+                    matches_module = alias.name == module
+                    matches_alias = not alias_filter or alias.asname == alias_filter
+                    if matches_module and matches_alias:
+                        removed = True
+                    else:
+                        remaining.append(alias)
+                if not removed:
+                    continue
+                replacement = [f"import {', '.join(alias_text(alias) for alias in remaining)}"] if remaining else []
+                replacements.append((start, end, replacement))
+
+            elif isinstance(node, ast.ImportFrom):
+                node_module = ('.' * int(getattr(node, 'level', 0) or 0)) + (node.module or '')
+                remaining = []
+                removed = False
+                for alias in node.names:
+                    full_name = f'{node_module}.{alias.name}' if node_module else alias.name
+                    matches = False
+                    if action == 'remove_import':
+                        matches = full_name == module
+                    elif action == 'remove_from_import':
+                        matches = node_module == module and (not names or alias.name in names)
+                    if matches:
+                        removed = True
+                    else:
+                        remaining.append(alias)
+                if not removed:
+                    continue
+                replacement = [f"from {node_module} import {', '.join(alias_text(alias) for alias in remaining)}"] if remaining else []
+                replacements.append((start, end, replacement))
+
+        if not replacements:
+            return source
+
+        for start, end, replacement in sorted(replacements, reverse=True):
+            lines[start:end] = replacement
         return '\n'.join(lines).rstrip('\n') + '\n'
 
     def _import_insert_index(self, source: str, lines: list[str]) -> int:
@@ -331,6 +409,12 @@ class ApplyService:
                 for child in node.body:
                     if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                         qualnames.append(f'{class_qualname}.{child.name}')
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        qualnames.append(f'{module_name}.{target.id}')
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                qualnames.append(f'{module_name}.{node.target.id}')
 
         return qualnames
 

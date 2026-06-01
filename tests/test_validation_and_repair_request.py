@@ -1794,6 +1794,62 @@ def test_patch_static_semantics_accepts_explicit_conversion_for_typed_model_fiel
     assert not any(issue.code == 'model_constructor_field_type_mismatch' for issue in block.issues)
 
 
+def test_patch_static_semantics_accepts_none_for_optional_model_field(tmp_path: Path) -> None:
+    original = (
+        'from datetime import datetime\n'
+        'from note.note_model import Note\n\n'
+        'class EditorWindow:\n'
+        '    def save_note(self) -> None:\n'
+        '        raise NotImplementedError()\n'
+    )
+    patched = original.replace(
+        '    def save_note(self) -> None:\n'
+        '        raise NotImplementedError()\n',
+        '    def save_note(self) -> None:\n'
+        '        self.note = Note(\n'
+        '            subject="Новая заметка",\n'
+        '            content="Текст",\n'
+        '            id=None,\n'
+        '        )\n'
+    )
+
+    block = validate_patch_static_semantics(
+        original_file_text=original,
+        patched_file_text=patched,
+        target_file='editor/editor_window.py',
+        target_qualname='editor.editor_window.EditorWindow.save_note',
+        requested_operation='replace_symbol',
+        insert_scope='class_body',
+        parent_qualname='editor.editor_window.EditorWindow',
+        changed_files=['editor/editor_window.py'],
+        change_request=ChangeRequest(title='Сохранение', description='Создать заметку', project='demo'),
+        related_symbols=[
+            {
+                'kind': 'class',
+                'name': 'Note',
+                'qualname': 'note.note_model.Note',
+                'source_code': (
+                    'from dataclasses import dataclass, field\n'
+                    'from datetime import datetime\n'
+                    'from typing import Optional\n\n'
+                    '@dataclass\n'
+                    'class Note:\n'
+                    '    subject: str\n'
+                    '    content: str\n'
+                    '    created_at: datetime = field(default_factory=datetime.now)\n'
+                    '    updated_at: datetime = field(default_factory=datetime.now)\n'
+                    '    id: Optional[str] = None\n'
+                ),
+            }
+        ],
+    )
+
+    assert block.ok
+    assert not any(issue.code == 'model_constructor_field_type_mismatch' for issue in block.issues)
+    checked = block.details['model_surface_usage_check']['checked_constructor_calls'][0]
+    assert checked['field_type_mismatches'] == []
+
+
 def test_patch_static_semantics_blocks_none_for_default_typed_model_field(tmp_path: Path) -> None:
     original = (
         'import json\n'
@@ -2466,3 +2522,211 @@ def test_generation_request_includes_full_file_for_preserve_replace_mode(tmp_pat
 
     assert request['project_context']['full_file_source'] == module_source
     assert len(request['project_context']['full_file_source']) == len(module_source)
+
+
+def test_insert_after_symbol_accepts_module_level_constants() -> None:
+    from codecollector.domain.models import ChangeRequest
+    from codecollector.validation.semantic_checks import validate_patch_static_semantics
+
+    original = 'class SearchModes:\n    DATE = "date"\n'
+    patched = (
+        'class SearchModes:\n'
+        '    DATE = "date"\n\n'
+        'APP_NAME: str = "Заметки"\n'
+        'AUTO_SAVE_INTERVAL_MS: int = 300000\n'
+        'NOTES_DIR: str = "notes"\n'
+    )
+
+    block = validate_patch_static_semantics(
+        requested_operation='insert_after_symbol',
+        change_request=ChangeRequest(
+            title='Добавить общие значения',
+            description='Добавить константы уровня модуля.',
+            project='demo',
+        ),
+        target_qualname='common.constants.SearchModes',
+        original_file_text=original,
+        patched_file_text=patched,
+        changed_files=['common/constants.py'],
+        target_file='common/constants.py',
+        insert_scope='module_body',
+    )
+
+    assert block.ok, [issue.code for issue in block.issues]
+    assert block.details['new_symbols'] == {
+        'APP_NAME': 'constant',
+        'AUTO_SAVE_INTERVAL_MS': 'constant',
+        'NOTES_DIR': 'constant',
+    }
+
+
+def test_patch_static_semantics_accepts_methods_from_visible_local_base_class(tmp_path: Path) -> None:
+    original = (
+        'class BaseWindow:\n'
+        '    def set_content(self, widget):\n'
+        '        pass\n\n'
+        'class EditorWindow(BaseWindow):\n'
+        '    def __init__(self):\n'
+        '        self.editor = object()\n'
+        '    def _setup_ui(self) -> None:\n'
+        '        raise NotImplementedError()\n'
+    )
+    patched = (
+        'class BaseWindow:\n'
+        '    def set_content(self, widget):\n'
+        '        pass\n\n'
+        'class EditorWindow(BaseWindow):\n'
+        '    def __init__(self):\n'
+        '        self.editor = object()\n'
+        '    def _setup_ui(self) -> None:\n'
+        '        self.set_content(self.editor)\n'
+    )
+
+    block = validate_patch_static_semantics(
+        original_file_text=original,
+        patched_file_text=patched,
+        target_file='editor/editor_window.py',
+        target_qualname='editor.editor_window.EditorWindow._setup_ui',
+        requested_operation='replace_symbol',
+        insert_scope='class_body',
+        parent_qualname='editor.editor_window.EditorWindow',
+        changed_files=['editor/editor_window.py'],
+        change_request=ChangeRequest(title='UI', description='Минимальная настройка UI', project='demo'),
+    )
+
+    assert block.ok
+    details = block.details['self_attribute_usage_check']
+    assert 'set_content' in details['inherited_methods']
+    assert details['inherited_methods_by_base']['BaseWindow'] == ['set_content']
+
+
+def test_patch_static_semantics_accepts_allowlisted_external_base_class_methods(tmp_path: Path) -> None:
+    original = (
+        'from PyQt5.QtWidgets import QMainWindow\n\n'
+        'class EditorWindow(QMainWindow):\n'
+        '    def __init__(self):\n'
+        '        self.editor = object()\n'
+        '    def _setup_ui(self) -> None:\n'
+        '        raise NotImplementedError()\n'
+    )
+    patched = (
+        'from PyQt5.QtWidgets import QMainWindow\n\n'
+        'class EditorWindow(QMainWindow):\n'
+        '    def __init__(self):\n'
+        '        self.editor = object()\n'
+        '    def _setup_ui(self) -> None:\n'
+        '        self.setCentralWidget(self.editor)\n'
+        '        self.statusBar().showMessage("Готов к работе")\n'
+    )
+
+    block = validate_patch_static_semantics(
+        original_file_text=original,
+        patched_file_text=patched,
+        target_file='editor/editor_window.py',
+        target_qualname='editor.editor_window.EditorWindow._setup_ui',
+        requested_operation='replace_symbol',
+        insert_scope='class_body',
+        parent_qualname='editor.editor_window.EditorWindow',
+        changed_files=['editor/editor_window.py'],
+        change_request=ChangeRequest(title='UI', description='Минимальная настройка UI', project='demo'),
+    )
+
+    assert block.ok
+    details = block.details['self_attribute_usage_check']
+    assert details['base_class_names'] == ['QMainWindow']
+    assert 'setCentralWidget' in details['inherited_methods']
+    assert 'statusBar' in details['inherited_methods']
+
+
+
+def test_patch_static_semantics_accepts_guarded_import_names_in_annotations() -> None:
+    original = (
+        'try:\n'
+        '    from optional_pkg.widgets import Widget\n'
+        'except ImportError:\n'
+        '    Widget = None\n\n'
+        'class Window:\n'
+        '    def build(self):\n'
+        '        self.widget = None\n'
+    )
+    patched = original.replace(
+        '    def build(self):\n'
+        '        self.widget = None\n',
+        '    def build(self):\n'
+        '        self.widget: Widget = self.create_widget()\n',
+    )
+
+    block = validate_patch_static_semantics(
+        original_file_text=original,
+        patched_file_text=patched,
+        target_file='app/window.py',
+        target_qualname='app.window.Window.build',
+        requested_operation='replace_symbol',
+        insert_scope='class_body',
+        parent_qualname='app.window.Window',
+        changed_files=['app/window.py'],
+        change_request=ChangeRequest(title='Окно', description='Обновить построение окна', project='demo'),
+        related_symbols=[],
+    )
+
+    assert not any(issue.code in {'unknown_runtime_name', 'unknown_annotation_name'} for issue in block.issues)
+    assert 'Widget' in block.details['runtime_name_check']['available_names']
+
+
+def test_generation_request_includes_guarded_imports_in_available_imports(tmp_path: Path) -> None:
+    config = load_config()
+    project_root = tmp_path
+    target_file = project_root / 'app' / 'window.py'
+    target_file.parent.mkdir(parents=True)
+    module_source = (
+        'try:\n'
+        '    from optional_pkg.widgets import Widget\n'
+        'except ImportError:\n'
+        '    Widget = None\n\n'
+        'class Window:\n'
+        '    def build(self):\n'
+        '        self.widget = Widget()\n'
+    )
+    target_file.write_text(module_source, encoding='utf-8')
+    target = _symbol(
+        qualname='app.window.Window.build',
+        name='build',
+        kind='method',
+        source='def build(self):\n        self.widget = Widget()\n',
+        file_path='app/window.py',
+        parent='app.window.Window',
+    )
+    module = _symbol(
+        qualname='app.window',
+        name='window',
+        kind='module',
+        source=module_source,
+        file_path='app/window.py',
+        parent=None,
+    )
+    context_pack = ContextPack(
+        target=target,
+        neighbors=[module],
+        inbound_relations=[],
+        outbound_relations=[],
+        related_tests=[],
+        related_symbols=[],
+    )
+
+    request = build_generation_request(
+        project_root,
+        ChangeRequest(title='Окно', description='Обновить построение окна', project='demo'),
+        'app.window.Window.build',
+        context_pack,
+        config,
+        operation='replace_symbol',
+    )
+
+    available = request['project_context']['available_imports']
+    assert any(
+        item['name'] == 'Widget'
+        and item['kind'] == 'from_import'
+        and item['module'] == 'optional_pkg.widgets'
+        and item['source'] == 'from optional_pkg.widgets import Widget'
+        for item in available
+    )

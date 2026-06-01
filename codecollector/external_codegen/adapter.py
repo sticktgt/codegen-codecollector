@@ -4,6 +4,7 @@ import ast
 import json
 import re
 import subprocess
+import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -144,6 +145,257 @@ def _dedupe_related_symbol_payloads(items: list[dict[str, Any]]) -> list[dict[st
         seen.add(key)
         result.append(item)
     return result
+
+
+def _change_request_text(change_request: ChangeRequest) -> str:
+    return ' '.join(
+        part
+        for part in [
+            str(change_request.title or ''),
+            str(change_request.description or ''),
+            ' '.join(str(item) for item in (change_request.constraints or [])),
+            ' '.join(str(item) for item in (change_request.notes or [])),
+        ]
+        if part
+    )
+
+
+def _target_module_name_for_payload(target: Any) -> str:
+    module_name = str(getattr(target, 'module_name', '') or '').strip()
+    if module_name:
+        return module_name
+    qualname = str(getattr(target, 'qualname', '') or '').strip()
+    if qualname:
+        parts = qualname.split('.')
+        if len(parts) > 1:
+            return '.'.join(parts[:-1])
+    file_path = str(getattr(target, 'file_path', '') or '').strip()
+    if file_path.endswith('.py'):
+        return file_path[:-3].replace('/', '.').replace('\\', '.')
+    return ''
+
+
+def _target_looks_like_settings_module(target: Any) -> bool:
+    file_path = str(getattr(target, 'file_path', '') or '').replace('\\', '/').casefold()
+    module_name = _target_module_name_for_payload(target).casefold()
+    tokens = ('constant', 'constants', 'settings', 'setting', 'config', 'configuration', 'констант', 'настро')
+    return any(token in file_path or token in module_name for token in tokens)
+
+
+def _request_mentions_existing_consumer_values(change_request: ChangeRequest) -> bool:
+    text = _change_request_text(change_request).casefold()
+    if not text:
+        return False
+    value_terms = ('значен', 'констант', 'настрой', 'config', 'setting', 'constant')
+    consumer_terms = (
+        'уже использ',
+        'уже ожида',
+        'существующ',
+        'без изменен',
+        'напрямую',
+        'имена',
+        'доступны',
+        'доступными',
+        'должен иметь возможность получить',
+    )
+    return any(term in text for term in value_terms) and any(term in text for term in consumer_terms)
+
+
+def _request_indicates_module_constants(change_request: ChangeRequest, target: Any) -> bool:
+    text = _change_request_text(change_request).casefold()
+    if not text or not _target_looks_like_settings_module(target):
+        return False
+    if _request_indicates_new_dataclass_or_class(change_request):
+        return False
+    value_terms = ('констант', 'значен', 'настрой', 'constant', 'setting')
+    module_terms = ('модул', 'module', 'common.constants', 'config', 'settings')
+    return any(term in text for term in value_terms) and any(term in text for term in module_terms)
+
+
+def _safe_parse_python_source(source: str) -> ast.AST | None:
+    try:
+        return ast.parse(source or '')
+    except SyntaxError:
+        return None
+
+
+def _module_level_assignment_names(tree: ast.AST | None) -> set[str]:
+    names: set[str] = set()
+    if tree is None:
+        return names
+    for node in getattr(tree, 'body', []):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    names.add(target.id)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names.add(node.target.id)
+    return names
+
+
+def _imported_names_from_module(tree: ast.AST | None, module_name: str) -> dict[str, list[int]]:
+    """Return imported public names and source lines for imports from module_name."""
+    result: dict[str, list[int]] = {}
+    if tree is None or not module_name:
+        return result
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and str(node.module or '') == module_name:
+            for alias in node.names:
+                if alias.name == '*':
+                    continue
+                result.setdefault(alias.name, []).append(int(getattr(node, 'lineno', 0) or 0))
+        elif isinstance(node, ast.Import):
+            aliases = [alias for alias in node.names if alias.name == module_name]
+            if not aliases:
+                continue
+            alias_names = {alias.asname or alias.name.rsplit('.', 1)[-1] for alias in aliases}
+            for attr_node in ast.walk(tree):
+                if not isinstance(attr_node, ast.Attribute):
+                    continue
+                value = attr_node.value
+                if isinstance(value, ast.Name) and value.id in alias_names:
+                    result.setdefault(attr_node.attr, []).append(int(getattr(attr_node, 'lineno', 0) or 0))
+    return result
+
+
+def _consumer_context_excerpt(source_text: str, names_by_line: dict[str, list[int]], *, max_chars: int) -> str:
+    lines = source_text.splitlines()
+    selected_lines: dict[int, str] = {}
+    wanted_names = set(names_by_line)
+    import_line_numbers = {line_no for line_numbers in names_by_line.values() for line_no in line_numbers if line_no > 0}
+
+    for line_no in import_line_numbers:
+        if 1 <= line_no <= len(lines):
+            selected_lines[line_no] = lines[line_no - 1]
+
+    for idx, line in enumerate(lines, start=1):
+        if idx in selected_lines:
+            continue
+        if any(re.search(rf'\b{re.escape(name)}\b', line) for name in wanted_names):
+            selected_lines[idx] = line
+
+    if not selected_lines:
+        return ''
+
+    rendered_lines: list[str] = []
+    previous: int | None = None
+    for line_no in sorted(selected_lines):
+        if previous is not None and line_no > previous + 1:
+            rendered_lines.append('...')
+        rendered_lines.append(f'{line_no}: {selected_lines[line_no]}')
+        previous = line_no
+
+    expected_names = ', '.join(sorted(wanted_names))
+    header = (
+        '# Existing consumer code expects these names from the target module: '
+        + expected_names
+    )
+    excerpt = header + '\n' + '\n'.join(rendered_lines)
+    if max_chars > 0 and len(excerpt) > max_chars:
+        excerpt, _ = _truncate_source(excerpt, max_chars)
+    return excerpt
+
+
+def _collect_existing_consumer_contexts(
+    *,
+    project_root: Path,
+    change_request: ChangeRequest,
+    target: Any,
+    source_chars: int,
+    max_items: int = 3,
+) -> list[dict[str, Any]]:
+    """Collect code snippets that already consume names from the target module.
+
+    This is used for constants/settings changes where the request says that
+    other existing code already expects the values. The snippets give
+    codegenerator the exact public names and access path instead of forcing it
+    to guess new names or a new wrapper class.
+    """
+    if not _request_mentions_existing_consumer_values(change_request):
+        return []
+    if not _target_looks_like_settings_module(target):
+        return []
+
+    module_name = _target_module_name_for_payload(target)
+    if not module_name:
+        return []
+
+    target_file = str(getattr(target, 'file_path', '') or '').replace('\\', '/')
+    target_path = (project_root / target_file).resolve() if target_file else None
+    try:
+        target_source = target_path.read_text(encoding='utf-8') if target_path else ''
+    except OSError:
+        target_source = ''
+    existing_names = _module_level_assignment_names(_safe_parse_python_source(target_source))
+
+    payloads: list[dict[str, Any]] = []
+    seen_files: set[str] = set()
+    excluded_parts = {'.git', '.venv', 'venv', '__pycache__', '.pytest_cache'}
+    for file_path in sorted(project_root.rglob('*.py')):
+        try:
+            rel_path = file_path.relative_to(project_root).as_posix()
+        except ValueError:
+            continue
+        if rel_path == target_file or any(part in excluded_parts for part in file_path.parts):
+            continue
+        if '/tests/' in f'/{rel_path}' or rel_path.startswith('tests/'):
+            continue
+        try:
+            source_text = file_path.read_text(encoding='utf-8')
+        except OSError:
+            continue
+        tree = _safe_parse_python_source(source_text)
+        imported = _imported_names_from_module(tree, module_name)
+        expected_names = sorted(name for name in imported if name not in existing_names)
+        if not expected_names:
+            continue
+        names_by_line = {name: imported.get(name, []) for name in expected_names}
+        excerpt = _consumer_context_excerpt(
+            source_text,
+            names_by_line,
+            max_chars=max(200, source_chars),
+        )
+        if not excerpt:
+            continue
+        module_qualname = rel_path[:-3].replace('/', '.') if rel_path.endswith('.py') else rel_path.replace('/', '.')
+        key = f'{module_qualname}: ' + ', '.join(expected_names)
+        if key in seen_files:
+            continue
+        seen_files.add(key)
+        payloads.append({
+            'qualname': f'{module_name}.__consumer__.{module_qualname}',
+            'file_path': rel_path,
+            'module_name': module_qualname,
+            'name': module_qualname.rsplit('.', 1)[-1],
+            'kind': 'module',
+            'parent_qualname': None,
+            'role': 'existing_consumer_context',
+            'origin_qualname': str(getattr(target, 'qualname', '') or module_name),
+            'relation_kind': 'imports',
+            'relation_direction': 'inbound',
+            'relation_source': 'index',
+            'relation_confidence': 'high',
+            'signature': f'expects exports from {module_name}: ' + ', '.join(expected_names),
+            'docstring': (
+                'Existing code already imports these names from the target module; '
+                'new code must keep this access path available.'
+            ),
+            'source_excerpt': excerpt,
+            'truncated': len(excerpt) >= max(200, source_chars),
+            'required_export_names': expected_names,
+            'selection_reason': 'existing_consumer_import_from_target_module',
+        })
+        if len(payloads) >= max_items:
+            break
+
+    if payloads:
+        LOGGER.info(
+            'Existing consumer contexts added: target_module=%s count=%s exports=%s',
+            module_name,
+            len(payloads),
+            [item.get('required_export_names') for item in payloads],
+        )
+    return payloads
 
 
 def _module_file_for_module_name(project_root: Path, module_name: str) -> Path | None:
@@ -472,7 +724,10 @@ def _normalize_insert_target_metadata(
         expected_new_symbol_kind = 'method'
     elif normalized_insert_scope == 'module_body':
         parent_qualname = _module_parent_qualname_for_insert_anchor(target)
-        expected_new_symbol_kind = 'class' if request_wants_new_class else 'function'
+        if _request_indicates_module_constants(change_request, target):
+            expected_new_symbol_kind = 'module_constants'
+        else:
+            expected_new_symbol_kind = 'class' if request_wants_new_class else 'function'
 
     return normalized_insert_scope, parent_qualname, expected_new_symbol_kind
 
@@ -1224,6 +1479,53 @@ def _annotation_name_for_allowed_surface(annotation: Any) -> str:
         return ""
 
 
+def _annotation_dependency_type_name(annotation: Any) -> str:
+    """Return the concrete project type name from a visible annotation."""
+    import ast
+
+    if annotation is None:
+        return ""
+    if isinstance(annotation, ast.Subscript):
+        base_name = _annotation_name_for_allowed_surface(annotation.value).rsplit(".", 1)[-1]
+        if base_name in {"Optional", "Union"}:
+            candidates = []
+            slice_node = annotation.slice
+            if isinstance(slice_node, ast.Tuple):
+                candidates = list(slice_node.elts)
+            else:
+                candidates = [slice_node]
+            for candidate in candidates:
+                name = _annotation_dependency_type_name(candidate)
+                if name and name not in {"None", "NoneType"}:
+                    return name
+            return ""
+        return _annotation_name_for_allowed_surface(annotation).rsplit(".", 1)[-1]
+    if isinstance(annotation, ast.Constant) and annotation.value is None:
+        return "NoneType"
+    return _annotation_name_for_allowed_surface(annotation).rsplit(".", 1)[-1]
+
+
+def _call_type_name_for_allowed_surface(value: Any) -> str:
+    import ast
+
+    if not isinstance(value, ast.Call):
+        return ""
+    return _call_display_name_for_allowed_surface(value.func).rsplit(".", 1)[-1]
+
+
+def _self_attribute_name_for_allowed_surface(target: Any) -> str:
+    import ast
+
+    if (
+        isinstance(target, ast.Attribute)
+        and isinstance(target.value, ast.Name)
+        and target.value.id == "self"
+        and target.attr
+    ):
+        return target.attr
+    return ""
+
+
 def _self_attribute_types_from_source(source: str) -> dict[str, str]:
     import ast
 
@@ -1249,7 +1551,7 @@ def _self_attribute_types_from_source(source: str) -> dict[str, str]:
             continue
 
         arg_types = {
-            arg.arg: _annotation_name_for_allowed_surface(arg.annotation).rsplit(".", 1)[-1]
+            arg.arg: _annotation_dependency_type_name(arg.annotation)
             for arg in [
                 *init_node.args.posonlyargs,
                 *init_node.args.args,
@@ -1259,18 +1561,30 @@ def _self_attribute_types_from_source(source: str) -> dict[str, str]:
         }
 
         for node in ast.walk(init_node):
-            if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Name):
+            if isinstance(node, ast.AnnAssign):
+                attr_name = _self_attribute_name_for_allowed_surface(node.target)
+                if not attr_name:
+                    continue
+                type_name = _annotation_dependency_type_name(node.annotation) or _call_type_name_for_allowed_surface(node.value)
+                if type_name and type_name not in {"None", "NoneType"}:
+                    result[attr_name] = type_name
                 continue
-            type_name = arg_types.get(node.value.id, "")
+
+            if not isinstance(node, ast.Assign):
+                continue
+
+            type_name = ""
+            if isinstance(node.value, ast.Name):
+                type_name = arg_types.get(node.value.id, "")
             if not type_name:
+                type_name = _call_type_name_for_allowed_surface(node.value)
+            if not type_name or type_name in {"None", "NoneType"}:
                 continue
+
             for target in node.targets:
-                if (
-                    isinstance(target, ast.Attribute)
-                    and isinstance(target.value, ast.Name)
-                    and target.value.id == "self"
-                ):
-                    result[target.attr] = type_name
+                attr_name = _self_attribute_name_for_allowed_surface(target)
+                if attr_name:
+                    result[attr_name] = type_name
 
     return result
 
@@ -1353,6 +1667,67 @@ def _allowed_method_payload(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _allowed_methods_from_related_class_payload(item: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extract public method signatures from a visible related class source."""
+    import ast
+
+    source = str(item.get("source_excerpt") or item.get("source_code") or item.get("source") or "")
+    if not source.strip():
+        return []
+    tree = _parse_python_tree_for_allowed_surface(source)
+    if tree is None:
+        return []
+
+    class_name = str(item.get("name") or item.get("qualname", "").rsplit(".", 1)[-1]).strip()
+    class_qualname = str(item.get("qualname") or "").strip()
+    methods: list[dict[str, Any]] = []
+    for node in getattr(tree, "body", []):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        if class_name and node.name != class_name:
+            continue
+        for child in getattr(node, "body", []):
+            if not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            method_name = str(child.name or "").strip()
+            if not method_name or method_name == "__init__" or method_name.startswith("_"):
+                continue
+            methods.append({
+                "name": method_name,
+                "qualname": f"{class_qualname}.{method_name}" if class_qualname else method_name,
+                "signature": _method_signature_from_ast(child),
+                "file_path": str(item.get("file_path") or "").strip(),
+                "origin_qualname": str(item.get("origin_qualname") or class_qualname).strip(),
+                "relation": "/".join(
+                    part
+                    for part in [
+                        str(item.get("relation_direction") or "").strip(),
+                        str(item.get("relation_kind") or "").strip(),
+                        str(item.get("relation_confidence") or "").strip(),
+                    ]
+                    if part
+                ),
+                "source": "related_class_symbol_method",
+            })
+        break
+    return methods
+
+
+def _append_allowed_method(
+    methods_by_type: dict[str, list[dict[str, Any]]],
+    type_name: str,
+    method: dict[str, Any],
+) -> None:
+    type_name = str(type_name or "").strip()
+    method_name = str(method.get("name") or "").strip()
+    if not type_name or not method_name:
+        return
+    bucket = methods_by_type.setdefault(type_name, [])
+    if any(str(item.get("name") or "") == method_name for item in bucket):
+        return
+    bucket.append(method)
+
+
 def _build_allowed_api_surface(
     *,
     target_source: str,
@@ -1388,7 +1763,12 @@ def _build_allowed_api_surface(
         if kind == "method":
             parent_type = str(item.get("parent_qualname") or "").rsplit(".", 1)[-1]
             if parent_type:
-                methods_by_type.setdefault(parent_type, []).append(_allowed_method_payload(item))
+                _append_allowed_method(methods_by_type, parent_type, _allowed_method_payload(item))
+        elif kind == "class":
+            class_type = str(item.get("name") or item.get("qualname", "").rsplit(".", 1)[-1]).strip()
+            if class_type in set(self_attr_types.values()):
+                for method in _allowed_methods_from_related_class_payload(item):
+                    _append_allowed_method(methods_by_type, class_type, method)
         elif kind == "function":
             free_functions.append(_allowed_method_payload(item))
 
@@ -1461,6 +1841,73 @@ def _request_asks_to_preserve_existing_behavior_for_codegen(change_request: Chan
     return any(marker in text for marker in _CODEGEN_PRESERVE_MARKERS)
 
 
+def _append_available_imports_from_node(
+    *,
+    node: ast.AST,
+    lines: list[str],
+    imports: list[dict[str, Any]],
+    seen: set[tuple[str, str, str, str]],
+) -> None:
+    """Collect imports visible from module-level code, including guarded imports."""
+    if isinstance(node, ast.Import):
+        source_line = lines[node.lineno - 1].strip() if 0 < node.lineno <= len(lines) else ""
+        for alias in node.names:
+            module = str(alias.name or "").strip()
+            if not module:
+                continue
+            public_name = str(alias.asname or module.split('.', 1)[0]).strip()
+            key = ('import', module, '', public_name)
+            if key in seen:
+                continue
+            seen.add(key)
+            imports.append({
+                'name': public_name,
+                'kind': 'import',
+                'module': module,
+                'imported': '',
+                'asname': str(alias.asname or '').strip(),
+                'source': source_line or f'import {module}',
+            })
+        return
+
+    if isinstance(node, ast.ImportFrom):
+        module = str(node.module or "").strip()
+        if not module or any(alias.name == '*' for alias in node.names):
+            return
+        source_line = lines[node.lineno - 1].strip() if 0 < node.lineno <= len(lines) else ""
+        for alias in node.names:
+            imported = str(alias.name or "").strip()
+            if not imported:
+                continue
+            public_name = str(alias.asname or imported).strip()
+            key = ('from_import', module, imported, public_name)
+            if key in seen:
+                continue
+            seen.add(key)
+            imports.append({
+                'name': public_name,
+                'kind': 'from_import',
+                'module': module,
+                'imported': imported,
+                'asname': str(alias.asname or '').strip(),
+                'source': source_line or f'from {module} import {imported}',
+            })
+        return
+
+    if isinstance(node, ast.Try):
+        for child in [*node.body, *node.orelse, *node.finalbody]:
+            _append_available_imports_from_node(node=child, lines=lines, imports=imports, seen=seen)
+        for handler in node.handlers:
+            for child in handler.body:
+                _append_available_imports_from_node(node=child, lines=lines, imports=imports, seen=seen)
+        return
+
+    if isinstance(node, ast.If):
+        for child in [*node.body, *node.orelse]:
+            _append_available_imports_from_node(node=child, lines=lines, imports=imports, seen=seen)
+        return
+
+
 def _extract_available_imports_from_source(source: str) -> list[dict[str, Any]]:
     """Return compact module-level import surface for code generation prompts."""
     text = str(source or "")
@@ -1476,49 +1923,7 @@ def _extract_available_imports_from_source(source: str) -> list[dict[str, Any]]:
     seen: set[tuple[str, str, str, str]] = set()
 
     for node in tree.body:
-        if isinstance(node, ast.Import):
-            source_line = lines[node.lineno - 1].strip() if 0 < node.lineno <= len(lines) else ""
-            for alias in node.names:
-                module = str(alias.name or "").strip()
-                if not module:
-                    continue
-                public_name = str(alias.asname or module.split('.', 1)[0]).strip()
-                key = ('import', module, '', public_name)
-                if key in seen:
-                    continue
-                seen.add(key)
-                imports.append({
-                    'name': public_name,
-                    'kind': 'import',
-                    'module': module,
-                    'imported': '',
-                    'asname': str(alias.asname or '').strip(),
-                    'source': source_line or f'import {module}',
-                })
-            continue
-
-        if isinstance(node, ast.ImportFrom):
-            module = str(node.module or "").strip()
-            if not module or any(alias.name == '*' for alias in node.names):
-                continue
-            source_line = lines[node.lineno - 1].strip() if 0 < node.lineno <= len(lines) else ""
-            for alias in node.names:
-                imported = str(alias.name or "").strip()
-                if not imported:
-                    continue
-                public_name = str(alias.asname or imported).strip()
-                key = ('from_import', module, imported, public_name)
-                if key in seen:
-                    continue
-                seen.add(key)
-                imports.append({
-                    'name': public_name,
-                    'kind': 'from_import',
-                    'module': module,
-                    'imported': imported,
-                    'asname': str(alias.asname or '').strip(),
-                    'source': source_line or f'from {module} import {imported}',
-                })
+        _append_available_imports_from_node(node=node, lines=lines, imports=imports, seen=seen)
 
     return imports
 
@@ -1631,6 +2036,26 @@ def build_generation_request(
             explicit_related_chars,
         )
 
+    consumer_contexts = _collect_existing_consumer_contexts(
+        project_root=project_root,
+        change_request=change_request,
+        target=target,
+        source_chars=related_symbol_char_limit or 900,
+    )
+    if consumer_contexts:
+        related_symbols = _dedupe_related_symbol_payloads([*consumer_contexts, *related_symbols])
+        all_related_symbols = _dedupe_related_symbol_payloads([*consumer_contexts, *all_related_symbols])
+        consumer_context_chars = sum(len(str(item.get('source_excerpt') or '')) for item in consumer_contexts)
+        related_symbol_chars += consumer_context_chars
+        LOGGER.info(
+            'Existing consumer contexts included in generation context: mode=%s count=%s chars=%s',
+            mode,
+            len(consumer_contexts),
+            consumer_context_chars,
+        )
+    else:
+        consumer_contexts = []
+
     selected_reference_items = list(context_pack.reference_artifacts[:max(0, int(reference_limits.get(mode, 0) or 0))])
     LOGGER.info(
         'Reference artifact candidates: count=%s items=%s',
@@ -1730,13 +2155,17 @@ def build_generation_request(
                     'docstring': item.docstring,
                 })
 
+    raw_related_symbols = _dedupe_related_symbol_payloads([
+        *_raw_related_symbol_payloads(context_pack),
+        *explicit_related_symbols,
+        *consumer_contexts,
+    ])
     allowed_api_surface = _build_allowed_api_surface(
         target_source=target.source_code or '',
         parent_source=(parent_symbol_payload or {}).get('source', '') if parent_symbol_payload else '',
         neighbor_sources=[str(item.source_code or '') for item in context_pack.neighbors],
-        related_symbols=all_related_symbols,
+        related_symbols=raw_related_symbols,
     )
-    raw_related_symbols = _dedupe_related_symbol_payloads([*_raw_related_symbol_payloads(context_pack), *explicit_related_symbols])
     model_surfaces = _build_model_surfaces(raw_related_symbols)
     if model_surfaces:
         LOGGER.info(
@@ -1829,6 +2258,7 @@ def build_generation_request(
         'same_class_methods': same_class_methods,
         'reuse_existing_logic': reuse_existing_logic,
         'recommended_tests': list(context_pack.recommended_tests),
+        'consumer_context': consumer_contexts,
     }
     context_pack.reference_summary = {
         'count': len(reference_artifacts),
@@ -1864,6 +2294,7 @@ def build_generation_request(
             'required_contracts_count': len(required_contracts),
             'required_class_members_count': len(required_class_members),
             'available_imports_count': len(available_imports),
+            'consumer_context_count': len(consumer_contexts),
         },
     }
     metrics = {
@@ -1876,6 +2307,7 @@ def build_generation_request(
         'related_test_chars': related_test_chars,
         'related_symbols_count': len(related_symbols),
         'related_symbol_chars': related_symbol_chars,
+        'consumer_context_count': len(consumer_contexts),
         'related_symbol_limit': related_symbol_limit,
         'related_symbol_char_limit': related_symbol_char_limit,
         'reference_artifacts_count': len(reference_artifacts),
@@ -2133,6 +2565,10 @@ def build_repair_request(
                 [item.get('qualname') for item in explicit_related_symbols],
             )
 
+    raw_related_symbols = _dedupe_related_symbol_payloads([
+        *_raw_related_symbol_payloads(context_pack),
+        *explicit_related_symbols,
+    ])
     allowed_api_surface = _allowed_api_surface_from_previous_request(previous_generation_request)
     allowed_api_surface_source = 'previous_generation_request' if allowed_api_surface else 'rebuilt_from_context_pack'
     if allowed_api_surface is None:
@@ -2140,9 +2576,8 @@ def build_repair_request(
             target_source=target.source_code or '',
             parent_source=(parent_symbol_payload or {}).get('source', '') if parent_symbol_payload else '',
             neighbor_sources=[str(item.source_code or '') for item in context_pack.neighbors],
-            related_symbols=all_related_symbols,
+            related_symbols=raw_related_symbols,
         )
-    raw_related_symbols = _dedupe_related_symbol_payloads([*_raw_related_symbol_payloads(context_pack), *explicit_related_symbols])
     model_surfaces = []
     previous_project_context = (previous_generation_request or {}).get('project_context') if isinstance(previous_generation_request, dict) else {}
     if isinstance(previous_project_context, dict):
@@ -2378,6 +2813,43 @@ def invoke_repair(run_dir: Path, config: AppConfig, request_payload: dict[str, A
     return CodeGeneratorCallResult(request_path=str(request_path), result_path=str(result_path), command=command, request_payload=request_payload, result_payload=result_payload, trace_path=result_payload.get('trace_path'), stdout_path=str(stdout_path), stderr_path=str(stderr_path))
 
 
+
+def _normalize_replace_symbol_replacement_code(
+    *,
+    code: str,
+    operation: str,
+    target_qualname: str,
+) -> str:
+    """Return standalone replacement code for a replace_symbol artifact.
+
+    Validation normally performs the same normalization and mutates the payload,
+    but this helper keeps direct adapter use and future call paths safe. It is
+    deliberately conservative: only code that fails raw AST parsing and succeeds
+    after common-indent removal is changed, and only when the dedented snippet
+    contains the requested target symbol.
+    """
+    if operation != "replace_symbol" or not target_qualname or not str(code).strip():
+        return code
+    try:
+        ast.parse(code)
+        return code
+    except SyntaxError:
+        pass
+
+    candidate = textwrap.dedent(code).strip("\n")
+    if code.endswith("\n"):
+        candidate += "\n"
+    try:
+        tree = ast.parse(candidate)
+    except SyntaxError:
+        return code
+
+    target_name = str(target_qualname).rsplit(".", 1)[-1]
+    for node in getattr(tree, "body", []):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and getattr(node, "name", "") == target_name:
+            return candidate
+    return code
+
 def patch_artifact_from_result(result_payload: dict[str, Any], fallback_target_qualname: str) -> PatchArtifact:
     status = result_payload.get('status')
     if status != 'ok':
@@ -2398,8 +2870,15 @@ def patch_artifact_from_result(result_payload: dict[str, Any], fallback_target_q
     code = artifact.get('code')
     if not code:
         raise ValueError('codegenerator result does not contain code_artifact.code')
+    target_qualname = str(artifact.get('target_qualname') or fallback_target_qualname)
+    code = _normalize_replace_symbol_replacement_code(
+        code=str(code),
+        operation=operation,
+        target_qualname=target_qualname,
+    )
+    artifact['code'] = code
     return PatchArtifact(
-        target_qualname=str(artifact.get('target_qualname') or fallback_target_qualname),
+        target_qualname=target_qualname,
         replacement_code=str(code),
         operation=operation,
         insert_scope=str(artifact.get('insert_scope') or '') or None,

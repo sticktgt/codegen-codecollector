@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from codecollector.config import load_config
-from codecollector.domain.models import ChangeRequest, ContextPack, SymbolRecord
+from codecollector.domain.models import ChangeRequest, ContextPack, RelatedSymbolContext, SymbolRecord
 from codecollector.external_codegen.adapter import build_generation_request
 
 
@@ -325,3 +325,196 @@ class NoteStorage:
 
     surfaces = {item['qualname']: item for item in request['project_context']['model_surfaces']}
     assert surfaces['note.note_search.SearchResult']['constructor_fields'] == ['note', 'preview', 'match_positions']
+
+
+def test_generation_request_includes_existing_consumer_import_context_for_constants(tmp_path: Path) -> None:
+    constants_source = '''class FileExtensions:
+    NOTE: str = ".note"
+
+class SearchModes:
+    DATE: str = "date"
+    CONTENT: str = "content"
+'''
+    constants_dir = tmp_path / 'common'
+    constants_dir.mkdir()
+    (constants_dir / 'constants.py').write_text(constants_source, encoding='utf-8')
+
+    editor_dir = tmp_path / 'editor'
+    editor_dir.mkdir()
+    (editor_dir / 'editor_window.py').write_text(
+        'from common.constants import APP_NAME, AUTO_SAVE_INTERVAL_MS, NOTES_DIR\n\n'
+        'class EditorWindow:\n'
+        '    def __init__(self):\n'
+        '        self.title = APP_NAME\n'
+        '        self.interval = AUTO_SAVE_INTERVAL_MS\n'
+        '        self.notes_dir = NOTES_DIR\n',
+        encoding='utf-8',
+    )
+
+    target = SymbolRecord(
+        file_path='common/constants.py',
+        module_name='common.constants',
+        name='SearchModes',
+        qualname='common.constants.SearchModes',
+        kind='class',
+        parent_qualname='common.constants',
+        start_line=4,
+        end_line=6,
+        docstring='',
+        source_code='class SearchModes:\n    DATE: str = "date"\n    CONTENT: str = "content"',
+    )
+    module = SymbolRecord(
+        file_path='common/constants.py',
+        module_name='common.constants',
+        name='constants',
+        qualname='common.constants',
+        kind='module',
+        parent_qualname=None,
+        start_line=1,
+        end_line=6,
+        docstring='',
+        source_code=constants_source,
+    )
+    context_pack = ContextPack(
+        target=target,
+        neighbors=[module],
+        inbound_relations=[],
+        outbound_relations=[],
+        related_tests=[],
+        related_symbols=[],
+    )
+    change_request = ChangeRequest(
+        title='Добавить общие значения, необходимые для запуска главного окна',
+        description=(
+            'В модуле общих констант нужно добавить значения, которые уже ожидает существующий код. '
+            'После доработки существующий код должен получить эти значения из common.constants без изменения редактора.'
+        ),
+        project='demo',
+        constraints=[
+            'Имена добавляемых значений должны соответствовать тому, как они уже используются в существующем коде.',
+            'Не добавлять новый способ доступа к этим значениям, если существующий код уже обращается к ним напрямую из модуля общих констант.',
+        ],
+    )
+
+    request = build_generation_request(
+        tmp_path,
+        change_request,
+        target.qualname,
+        context_pack,
+        load_config(),
+        mode='generate',
+        operation='insert_after_symbol',
+        insert_scope='module_body',
+    )
+
+    assert request['target']['expected_new_symbol_kind'] == 'module_constants'
+    consumer_context = request['project_context']['consumer_context']
+    assert consumer_context
+    rendered = consumer_context[0]['source_excerpt']
+    assert 'from common.constants import APP_NAME, AUTO_SAVE_INTERVAL_MS, NOTES_DIR' in rendered
+    assert consumer_context[0]['required_export_names'] == [
+        'APP_NAME',
+        'AUTO_SAVE_INTERVAL_MS',
+        'NOTES_DIR',
+    ]
+    related = request['project_context']['contract_context']['related_symbols']
+    assert any(item.get('role') == 'existing_consumer_context' for item in related)
+
+
+def test_generation_request_builds_dependency_api_from_related_class_methods(tmp_path: Path) -> None:
+    editor_dir = tmp_path / 'editor'
+    note_dir = tmp_path / 'note'
+    editor_dir.mkdir()
+    note_dir.mkdir()
+
+    editor_source = '''from note.note_storage import NoteStorage
+
+class EditorWindow:
+    def __init__(self):
+        self.storage: NoteStorage = NoteStorage(base_dir="notes")
+        self.note = None
+
+    def save_note(self) -> None:
+        raise NotImplementedError
+'''
+    storage_source = '''class NoteStorage:
+    def __init__(self, base_dir: str) -> None:
+        self.base_dir = base_dir
+
+    def save(self, note):
+        return "saved"
+'''
+    (editor_dir / 'editor_window.py').write_text(editor_source, encoding='utf-8')
+    (note_dir / 'note_storage.py').write_text(storage_source, encoding='utf-8')
+
+    target = SymbolRecord(
+        file_path='editor/editor_window.py',
+        module_name='editor.editor_window',
+        name='save_note',
+        qualname='editor.editor_window.EditorWindow.save_note',
+        kind='method',
+        parent_qualname='editor.editor_window.EditorWindow',
+        start_line=8,
+        end_line=9,
+        docstring='',
+        source_code='    def save_note(self) -> None:\n        raise NotImplementedError',
+    )
+    parent = SymbolRecord(
+        file_path='editor/editor_window.py',
+        module_name='editor.editor_window',
+        name='EditorWindow',
+        qualname='editor.editor_window.EditorWindow',
+        kind='class',
+        parent_qualname=None,
+        start_line=3,
+        end_line=9,
+        docstring='',
+        source_code=editor_source,
+    )
+    storage = RelatedSymbolContext(
+        qualname='note.note_storage.NoteStorage',
+        file_path='note/note_storage.py',
+        module_name='note.note_storage',
+        name='NoteStorage',
+        kind='class',
+        parent_qualname=None,
+        relation_kind='imports',
+        relation_direction='outbound',
+        relation_source='index',
+        relation_confidence='high',
+        role='imported_contract',
+        origin_qualname='editor.editor_window',
+        signature='class NoteStorage:',
+        docstring='',
+        source_code=storage_source,
+    )
+    context_pack = ContextPack(
+        target=target,
+        neighbors=[parent],
+        inbound_relations=[],
+        outbound_relations=[],
+        related_tests=[],
+        related_symbols=[storage],
+    )
+
+    request = build_generation_request(
+        tmp_path,
+        ChangeRequest(
+            title='Реализовать сохранение заметки',
+            description='Использовать существующее хранилище заметок для сохранения текущей заметки.',
+            project='demo',
+        ),
+        target.qualname,
+        context_pack,
+        load_config(),
+        mode='generate',
+        operation='replace_symbol',
+    )
+
+    dependencies = {
+        item['access_path']: item
+        for item in request['project_context']['allowed_api_surface']['dependencies']
+    }
+    assert 'self.storage' in dependencies
+    assert dependencies['self.storage']['type_name'] == 'NoteStorage'
+    assert 'save' in {item['name'] for item in dependencies['self.storage']['allowed_methods']}

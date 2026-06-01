@@ -1252,13 +1252,17 @@ class PipelineService:
                         failed_paths.add(path)
                         continue
 
-            # Pytest setup errors often include a separate source line such as:
+            # Pytest setup errors and fatal tracebacks often include source lines such as:
             #   file /workspace/tests/test_generated.py, line 10
+            #   File "/workspace/tests/test_generated.py", line 10 in test_name
             if normalized.startswith('file ') and '.py' in normalized:
                 candidate = normalized[len('file '):].split(',', 1)[0].strip()
+                candidate = candidate.strip('\"\'')
                 marker = '/tests/'
                 if marker in candidate:
                     candidate = 'tests/' + candidate.split(marker, 1)[1]
+                elif not candidate.startswith('tests/'):
+                    continue
                 if candidate.endswith('.py'):
                     failed_paths.add(candidate)
 

@@ -790,3 +790,33 @@ def new_function(payload: dict) -> str:
     assert block.ok, [issue.code for issue in block.issues]
     skipped_calls = block.details['contract_call_signature_check']['skipped_calls']
     assert any(item['call'] == 'payload.get' for item in skipped_calls)
+
+
+
+def test_pytest_error_output_detects_generated_test_path_with_quotes() -> None:
+    from codecollector.orchestration.pipeline_service import PipelineService
+
+    service = PipelineService.__new__(PipelineService)
+
+    output = '  File "/tmp/workspace/tests/test_generated_generate_test_auto_save.py", line 8 in test_auto_save_noop_when_not_modified'
+
+    assert service._pytest_failed_paths_from_output(output) == {
+        'tests/test_generated_generate_test_auto_save.py'
+    }
+
+
+def test_fatal_traceback_output_detects_generated_test_path() -> None:
+    from codecollector.orchestration.pipeline_service import PipelineService
+
+    service = PipelineService.__new__(PipelineService)
+
+    output = '''Fatal Python error: Aborted
+
+Current thread 0x00000000 (most recent call first):
+  File "/tmp/workspace/editor/editor_window.py", line 99 in __init__
+  File "/tmp/workspace/tests/test_generated_generate_test_auto_save.py", line 8 in test_auto_save_noop_when_not_modified
+'''
+
+    assert service._pytest_failed_paths_from_output(output) == {
+        'tests/test_generated_generate_test_auto_save.py'
+    }

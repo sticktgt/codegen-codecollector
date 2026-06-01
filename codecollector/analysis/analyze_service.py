@@ -136,6 +136,7 @@ class AnalyzeService:
 
         recall_search_started_at = time.perf_counter()
         explicit_symbol_names = self._explicit_symbol_name_hints(input_requirements)
+        import_level_change = self._request_is_import_level_change(input_requirements)
         candidates = self._collect_recall_candidates(
             services=services,
             base_query=query,
@@ -144,6 +145,7 @@ class AnalyzeService:
             limit=limit,
             use_vector_search=use_vector_search,
             explicit_symbol_names=explicit_symbol_names,
+            import_level_change=import_level_change,
         )
         record_timing('recall_search_sec', recall_search_started_at)
 
@@ -214,6 +216,10 @@ class AnalyzeService:
             if override_scope:
                 effective_insert_scope = override_scope
 
+        target_recommendation = self._mark_manual_review_for_unsupported_new_container(
+            target_recommendation
+        )
+
         stub_override = self._prefer_existing_stub_target_for_implementation(
             services=services,
             base_query=query,
@@ -269,6 +275,24 @@ class AnalyzeService:
             override_scope = self._insert_scope_from_payload(target_recommendation)
             if override_scope:
                 effective_insert_scope = override_scope
+
+        non_symbol_change = self._non_symbol_change_kind(target_recommendation, search_plan)
+        if non_symbol_change is not None:
+            recommended_target, target_recommendation = self._mark_manual_review_for_non_symbol_change(
+                target_recommendation=target_recommendation,
+                search_plan=search_plan,
+                recommended_target=recommended_target,
+                change_kind=non_symbol_change,
+            )
+            warnings.append(
+                {
+                    'code': 'non_symbol_change_requires_manual_review',
+                    'message': (
+                        f'LLM classified this request as {non_symbol_change}; current analyze/generate flow '
+                        'does not safely target import-level changes automatically.'
+                    ),
+                }
+            )
 
         if recommended_target:
             recommended_target, candidates, target_recommendation = self._post_process_recommended_target(
@@ -389,13 +413,76 @@ class AnalyzeService:
             ),
         )
 
+    def _non_symbol_change_kind(self, target_recommendation: dict[str, Any], search_plan: dict[str, Any]) -> str | None:
+        """Return an LLM-declared change kind that must stop auto-targeting.
+
+        This deliberately relies on the LLM's structured classification rather
+        than re-parsing the user's CR text with local keyword rules. Only
+        import-level changes are blocked here: a file-level classification can
+        still be safely represented by a normal symbol target such as ``__init__``
+        or ``_setup_ui`` when rerank has found a concrete target.
+        """
+        for payload in (target_recommendation or {}, search_plan or {}):
+            change_kind = payload.get("change_kind") if isinstance(payload, dict) else None
+            if not isinstance(change_kind, dict):
+                continue
+            value = str(change_kind.get("value") or "").strip()
+            confidence = self._safe_float(change_kind.get("confidence"))
+            if value == "import_change" and confidence >= 0.6:
+                return value
+        return None
+
+    def _mark_manual_review_for_non_symbol_change(
+        self,
+        *,
+        target_recommendation: dict[str, Any],
+        search_plan: dict[str, Any],
+        recommended_target: str | None,
+        change_kind: str,
+    ) -> tuple[str | None, dict[str, Any]]:
+        updated = dict(target_recommendation or {})
+        existing_warnings = list(updated.get("warnings") or [])
+        existing_warnings.append(
+            {
+                "code": "non_symbol_change_not_supported_for_auto_target",
+                "message": (
+                    f"LLM classified this request as {change_kind}. "
+                    "The current automatic generation flow supports symbol replacement/insertion, "
+                    "so import-level changes require manual review or a dedicated generation path."
+                ),
+            }
+        )
+        change_payload = (updated.get("change_kind") or (search_plan or {}).get("change_kind") or {})
+        updated.update(
+            {
+                "change_kind": change_payload,
+                "recommended_target": None,
+                "target_role": "import_change",
+                "target_confidence": 0.0,
+                "target_reason": (
+                    "Запрос классифицирован как изменение import-уровня, "
+                    "а текущий flow не умеет безопасно выбирать для него один method/function/class symbol."
+                ),
+                "manual_review_required": True,
+                "warnings": existing_warnings,
+                "post_processing": {
+                    **(updated.get("post_processing") or {}),
+                    "non_symbol_change_manual_review": {
+                        "change_kind": change_kind,
+                        "previous_recommended_target": recommended_target,
+                    },
+                },
+            }
+        )
+        return None, updated
+
     def _explicit_symbol_name_hints(self, input_requirements: list[dict[str, Any]]) -> set[str]:
-        """Extract explicit code-like symbol names from user-facing CR text.
+        """Extract explicit code-like target names from user-facing CR text.
 
         The extraction is deliberately conservative. It only treats identifiers
-        containing underscores or dotted names as explicit symbol hints. This
-        avoids interpreting ordinary words as target names while still covering
-        names such as ``search_by_content`` or ``NoteStorage.load``.
+        containing underscores or dotted names as explicit target hints. Names
+        mentioned only in protective constraints such as "do not change X" are
+        skipped: those names describe boundaries, not target selection.
         """
         texts: list[str] = []
         for item in input_requirements or []:
@@ -409,7 +496,10 @@ class AnalyzeService:
                     texts.extend(str(part) for part in value if str(part))
             constraints = item.get("constraints") or []
             if isinstance(constraints, list):
-                texts.extend(str(part) for part in constraints if str(part))
+                for part in constraints:
+                    text = str(part or "").strip()
+                    if text and not self._is_protective_constraint_text(text):
+                        texts.append(text)
         full_text = "\n".join(texts)
         hints: set[str] = set()
         for match in re.finditer(r"\b[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\b", full_text):
@@ -420,9 +510,88 @@ class AnalyzeService:
                 continue
             if token.startswith(".") or token.endswith("."):
                 continue
+            if token.startswith("__") and token.endswith("__"):
+                continue
             hints.add(token)
-            hints.add(token.rsplit(".", 1)[-1])
+            short_name = token.rsplit(".", 1)[-1]
+            if not (short_name.startswith("__") and short_name.endswith("__")):
+                hints.add(short_name)
         return hints
+
+    def _is_protective_constraint_text(self, text: str) -> bool:
+        normalized = re.sub(r"^[\s\-–—•]+", "", text).casefold().strip()
+        protective_prefixes = (
+            "не менять",
+            "не изменять",
+            "не трогать",
+            "не реализовывать",
+            "не подключать",
+            "не добавлять",
+            "не создавать",
+            "не дублировать",
+            "не удалять",
+            "сохранить ",
+            "оставить ",
+            "do not change",
+            "do not modify",
+            "do not touch",
+            "keep ",
+            "preserve ",
+        )
+        return any(normalized.startswith(prefix) for prefix in protective_prefixes)
+
+    def _request_is_import_level_change(self, input_requirements: list[dict[str, Any]]) -> bool:
+        text_parts: list[str] = []
+        for item in input_requirements or []:
+            if not isinstance(item, dict):
+                continue
+            for field in ("title", "description", "note", "notes"):
+                value = item.get(field)
+                if isinstance(value, str):
+                    text_parts.append(value)
+                elif isinstance(value, list):
+                    text_parts.extend(str(part) for part in value if str(part))
+            constraints = item.get("constraints") or []
+            if isinstance(constraints, list):
+                text_parts.extend(str(part) for part in constraints if str(part))
+        text = "\n".join(text_parts).casefold()
+        import_terms = ("import", "импорт")
+        change_terms = ("измен", "замен", "исправ", "удал", "добав", "change", "replace", "fix", "remove", "add")
+        if any(term in text for term in import_terms) and any(term in text for term in change_terms):
+            return True
+
+        # Analyst-friendly CRs often describe import problems through observable
+        # behavior: an installed dependency/component is still reported as missing.
+        # Treat these as import-level changes for recall weighting, without turning
+        # arbitrary dependency work into import work.
+        dependency_terms = (
+            "зависим",
+            "компонент",
+            "библиотек",
+            "пакет",
+            "dependency",
+            "component",
+            "library",
+            "package",
+        )
+        connection_terms = (
+            "подключ",
+            "распозна",
+            "не найден",
+            "не найдена",
+            "недоступ",
+            "установлен",
+            "installed",
+            "not found",
+            "unavailable",
+            "detect",
+        )
+        change_like_terms = ("исправ", "почин", "fix", "repair")
+        return (
+            any(term in text for term in dependency_terms)
+            and any(term in text for term in connection_terms)
+            and any(term in text for term in change_like_terms)
+        )
 
     def _add_exact_symbol_name_candidates(
         self,
@@ -518,6 +687,7 @@ class AnalyzeService:
         limit: int | None,
         use_vector_search: bool | None,
         explicit_symbol_names: set[str] | None = None,
+        import_level_change: bool = False,
     ) -> list[SearchCandidate]:
         query_limit = max(limit or self.config.search_default_limit, self.config.analysis_base_search_limit)
         queries = [base_query]
@@ -546,7 +716,12 @@ class AnalyzeService:
                 if existing is None or candidate.score > existing.score:
                     by_qualname[candidate.qualname] = candidate
 
-        self._add_hint_candidates(by_qualname, services, search_plan)
+        self._add_hint_candidates(
+            by_qualname,
+            services,
+            search_plan,
+            strong_preferred_files=import_level_change,
+        )
         self._add_exact_symbol_name_candidates(by_qualname, services, explicit_symbol_names or set())
         candidates = list(by_qualname.values())
         LOGGER.info('Analyze recall collected candidates_count=%s before_limit=%s', len(candidates), max(limit or self.config.search_default_limit, self.config.analysis_max_recall_candidates))
@@ -558,6 +733,7 @@ class AnalyzeService:
         by_qualname: dict[str, SearchCandidate],
         services: ProjectServices,
         search_plan: dict[str, Any],
+        strong_preferred_files: bool = False,
     ) -> None:
         plan = search_plan.get('search_plan') or {}
         preferred_qualnames = [str(item).strip() for item in plan.get('preferred_qualnames', []) or [] if str(item).strip()]
@@ -568,11 +744,21 @@ class AnalyzeService:
             if symbol and symbol.kind != 'module' and symbol.qualname not in by_qualname:
                 by_qualname[symbol.qualname] = self._candidate_from_symbol(symbol, score=6.0, reason='symbol предложен LLM search plan')
         if preferred_files:
+            preferred_file_score = 80.0 if strong_preferred_files else 5.0
+            preferred_file_reason = (
+                'файл предложен LLM search plan для изменения import'
+                if strong_preferred_files
+                else 'файл предложен LLM search plan'
+            )
             for symbol in services.store.list_symbols(project_key):
                 if symbol.kind == 'module':
                     continue
                 if symbol.file_path in preferred_files and symbol.qualname not in by_qualname:
-                    by_qualname[symbol.qualname] = self._candidate_from_symbol(symbol, score=5.0, reason='файл предложен LLM search plan')
+                    by_qualname[symbol.qualname] = self._candidate_from_symbol(
+                        symbol,
+                        score=preferred_file_score,
+                        reason=preferred_file_reason,
+                    )
 
     def _candidate_from_symbol(self, symbol: SymbolRecord, *, score: float, reason: str) -> SearchCandidate:
         return SearchCandidate(
@@ -589,6 +775,57 @@ class AnalyzeService:
             requirements=[],
         )
 
+    def _has_warning_code(self, payload: dict[str, Any], codes: set[str]) -> bool:
+        warnings = payload.get('warnings') if isinstance(payload, dict) else None
+        if not isinstance(warnings, list):
+            return False
+        expected = {str(code) for code in codes}
+        for warning in warnings:
+            if isinstance(warning, dict) and str(warning.get('code') or '') in expected:
+                return True
+        return False
+
+    def _mark_manual_review_for_unsupported_new_container(
+        self,
+        target_recommendation: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Keep LLM intent when a new file/module is required but unsupported.
+
+        Some CRs ask for a new stub/module. The LLM can correctly report that
+        no suitable existing module exists via a structured warning such as
+        ``missing_stub_module``. In that case deterministic stub post-processing
+        must not retarget the request to the nearest NotImplementedError method:
+        replacing that method would hide the real limitation and generate an
+        unrelated partial fix.
+        """
+        if not isinstance(target_recommendation, dict):
+            return target_recommendation
+        if not self._has_warning_code(target_recommendation, {'missing_stub_module'}):
+            return target_recommendation
+
+        updated = dict(target_recommendation)
+        updated['manual_review_required'] = True
+        warnings = list(updated.get('warnings') or [])
+        if not any(isinstance(item, dict) and item.get('code') == 'unsupported_new_file_required' for item in warnings):
+            warnings.append(
+                {
+                    'code': 'unsupported_new_file_required',
+                    'message': (
+                        'LLM analysis indicates that the request needs a new module/file, ' 
+                        'but automatic new-file creation is not supported yet. Manual review is required; ' 
+                        'do not retarget the request to a nearby NotImplementedError stub.'
+                    ),
+                }
+            )
+        updated['warnings'] = warnings
+        post_processing = dict(updated.get('post_processing') or {})
+        post_processing['new_file_requirement_preserved'] = {
+            'reason': 'missing_stub_module_warning',
+            'manual_review_required': True,
+        }
+        updated['post_processing'] = post_processing
+        return updated
+
     def _manual_review_required(
         self,
         search_plan: dict[str, Any],
@@ -600,6 +837,8 @@ class AnalyzeService:
         if not target_recommendation:
             return bool(search_plan.get('manual_review_required')) or recommended_target is None
         if bool(target_recommendation.get('manual_review_required')):
+            return True
+        if self._has_warning_code(target_recommendation, {'missing_stub_module', 'unsupported_new_file_required'}):
             return True
         if self._has_accepted_target(candidates, target_recommendation, recommended_target=recommended_target):
             return False
@@ -721,6 +960,10 @@ class AnalyzeService:
         not normalize that method into a class/module anchor for insertion.
         """
         if requested_operation != 'insert_after_symbol':
+            return None
+        if bool(target_recommendation.get('manual_review_required')):
+            return None
+        if self._has_warning_code(target_recommendation, {'missing_stub_module', 'unsupported_new_file_required'}):
             return None
         if not self._looks_like_implementation_request(base_query):
             return None
@@ -938,6 +1181,10 @@ class AnalyzeService:
         API next to a clearly intended placeholder implementation.
         """
         if requested_operation != 'insert_after_symbol':
+            return None
+        if bool(target_recommendation.get('manual_review_required')):
+            return None
+        if self._has_warning_code(target_recommendation, {'missing_stub_module', 'unsupported_new_file_required'}):
             return None
         normalized_user_operation = self._normalize_operation(user_operation or '')
         if normalized_user_operation and normalized_user_operation != 'insert_after_symbol':

@@ -410,3 +410,81 @@ def test_analyze_overrides_ui_replace_symbol_for_additive_class_property_request
     assert target_recommendation['parent_qualname'] == symbol.qualname
     assert target_recommendation['expected_new_symbol_kind'] == 'method'
     assert target_recommendation['post_processing']['class_replace_normalized_to_member_insert']['user_operation_overridden'] is True
+
+
+def test_analyze_does_not_replace_stub_when_llm_reported_missing_stub_module(tmp_path: Path) -> None:
+    service = AnalyzeService.__new__(AnalyzeService)
+    symbol = SymbolRecord(
+        file_path='export/outlook_exporter.py',
+        module_name='export.outlook_exporter',
+        name='__init__',
+        qualname='export.outlook_exporter.OutlookExporter.__init__',
+        kind='method',
+        parent_qualname='export.outlook_exporter.OutlookExporter',
+        start_line=10,
+        end_line=20,
+        docstring='Инициализация экспортера Outlook.',
+        source_code='    def __init__(self):\n        raise NotImplementedError("Конструктор требует реализации")\n',
+    )
+    candidates = [
+        SearchCandidate(
+            qualname=symbol.qualname,
+            name=symbol.name,
+            kind=symbol.kind,
+            file_path=symbol.file_path,
+            score=50.0,
+            confidence=1.0,
+            docstring=symbol.docstring,
+        )
+    ]
+    services = SimpleNamespace(project_root=tmp_path, store=_FakeStore({symbol.qualname: symbol}))
+    target_recommendation = {
+        'recommended_operation': 'insert_after_symbol',
+        'recommended_target': 'export.outlook_exporter.OutlookExporter',
+        'target_confidence': 0.95,
+        'warnings': [
+            {
+                'code': 'missing_stub_module',
+                'message': 'В проекте не найден кандидат-модуль для размещения заглушки.',
+            }
+        ],
+    }
+
+    marked = service._mark_manual_review_for_unsupported_new_container(target_recommendation)
+    result = service._prefer_existing_stub_target_for_implementation(
+        services=services,
+        base_query='Добавить минимальную локальную заглушку модуля win32com.client.',
+        candidates=candidates,
+        target_recommendation=marked,
+        requested_operation='insert_after_symbol',
+        user_operation=None,
+    )
+
+    assert result is None
+    assert marked['manual_review_required'] is True
+    assert any(item.get('code') == 'unsupported_new_file_required' for item in marked['warnings'])
+    assert marked['post_processing']['new_file_requirement_preserved']['manual_review_required'] is True
+
+
+def test_manual_review_required_for_missing_stub_module_warning(tmp_path: Path) -> None:
+    service = AnalyzeService.__new__(AnalyzeService)
+    service.config = SimpleNamespace(analysis_min_confidence_auto_recommend_target=0.75)
+    candidate = SearchCandidate(
+        qualname='export.outlook_exporter.OutlookExporter.__init__',
+        name='__init__',
+        kind='method',
+        file_path='export/outlook_exporter.py',
+        score=50.0,
+        confidence=1.0,
+    )
+
+    assert service._manual_review_required(
+        {},
+        {
+            'recommended_target': candidate.qualname,
+            'target_confidence': 1.0,
+            'warnings': [{'code': 'missing_stub_module', 'message': 'Нужен новый stub-модуль.'}],
+        },
+        [candidate],
+        recommended_target=candidate.qualname,
+    ) is True
