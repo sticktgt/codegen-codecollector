@@ -121,6 +121,7 @@ class ApplyService:
             if action in {'remove_import', 'remove_from_import'}:
                 updated_source = self._apply_remove_import_change(updated_source, item)
 
+        used_names = self._loaded_names(updated_source)
         lines = updated_source.splitlines()
         existing = {line.strip() for line in lines}
         new_imports: list[str] = []
@@ -133,12 +134,18 @@ class ApplyService:
                 continue
             if action == 'add_import':
                 alias = str(item.get('alias') or '').strip()
+                imported_name = alias or module.split('.', 1)[0]
+                if imported_name and imported_name not in used_names:
+                    continue
                 line = f'import {module}' + (f' as {alias}' if alias else '')
             elif action == 'add_from_import':
                 names = [str(name).strip() for name in (item.get('names') or []) if str(name).strip()]
                 if not names:
                     continue
-                line = f'from {module} import {", ".join(names)}'
+                used_items = [name for name in names if self._from_import_binding_name(name) in used_names]
+                if not used_items:
+                    continue
+                line = f'from {module} import {", ".join(used_items)}'
             else:
                 continue
             if line not in existing and line not in new_imports:
@@ -149,6 +156,19 @@ class ApplyService:
         insert_at = self._import_insert_index(updated_source, lines)
         lines[insert_at:insert_at] = new_imports
         return '\n'.join(lines).rstrip('\n') + '\n'
+
+    def _loaded_names(self, source: str) -> set[str]:
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            return set()
+        return {node.id for node in ast.walk(tree) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)}
+
+    def _from_import_binding_name(self, name: str) -> str:
+        raw = str(name or '').strip()
+        if ' as ' in raw:
+            return raw.rsplit(' as ', 1)[1].strip()
+        return raw.split('.', 1)[0].strip()
 
     def _apply_remove_import_change(self, source: str, change: dict) -> str:
         module = str(change.get('module') or '').strip()

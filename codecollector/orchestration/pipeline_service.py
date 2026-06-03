@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+import ast
 import json
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from time import perf_counter
@@ -860,6 +862,10 @@ class PipelineService:
                 verification_report,
                 generated_test_apply,
             )
+            verification_report = self._mark_generated_test_generation_failure(
+                verification_report,
+                generated_test_apply,
+            )
 
             if self._is_generated_test_only_verdict(verification_report):
                 excluded_files = list((verification_report.summary or {}).get('generated_test_excluded_files') or [])
@@ -869,10 +875,16 @@ class PipelineService:
                     generated_test_apply['merge_recommended'] = False
                     generated_test_apply['excluded_files'] = excluded_files
 
-                warning_message = (
-                    'Сгенерированный тест не прошел verification; основной код можно рассматривать отдельно, '
-                    'generated test будет исключен из apply/merge.'
-                )
+                if self._is_generated_test_generation_failed_verdict(verification_report):
+                    warning_message = (
+                        'Generated test не был создан из-за ошибки генерации; основной код можно рассматривать отдельно, '
+                        'но результат требует ручной проверки без generated test.'
+                    )
+                else:
+                    warning_message = (
+                        'Сгенерированный тест не прошел verification; основной код можно рассматривать отдельно, '
+                        'generated test будет исключен из apply/merge.'
+                    )
                 if warning_message not in warnings:
                     warnings.append(warning_message)
                 LOGGER.warning(warning_message)
@@ -947,20 +959,33 @@ class PipelineService:
                 verification_report,
                 generated_test_apply,
             )
+            verification_report = self._mark_generated_test_generation_failure(
+                verification_report,
+                generated_test_apply,
+            )
 
             if (
                 apply_result is not None
                 and self._is_generated_test_only_verdict(verification_report)
             ):
                 notes = list(apply_result.impact.notes or [])
-                special_note = (
-                    'Основное изменение прошло проверки, но упал только сгенерированный тест; требуется ручная оценка качества generated test.'
-                )
+                if self._is_generated_test_generation_failed_verdict(verification_report):
+                    special_note = (
+                        'Generated test не был создан из-за ошибки генерации; требуется ручная проверка без advisory review generated test.'
+                    )
+                else:
+                    special_note = (
+                        'Основное изменение прошло проверки, но упал только сгенерированный тест; требуется ручная оценка качества generated test.'
+                    )
                 if special_note not in notes:
                     notes.append(special_note)
                     apply_result.impact.notes = notes
 
-                if external_test_generation is not None:
+                if self._should_run_generated_test_failure_review(
+                    verification_report=verification_report,
+                    generated_test_apply=generated_test_apply,
+                    external_test_generation=external_test_generation,
+                ):
                     try:
                         generated_test_review = self._run_step(
                             steps,
@@ -972,6 +997,7 @@ class PipelineService:
                                 selected_target=selected_target,
                                 context_pack=context_pack,
                                 final_payload=final_payload,
+                                planner_result=dict(external_code_result_payload.get('planner_result') or {}),
                                 apply_result=apply_result,
                                 external_test_generation=external_test_generation,
                                 generated_test_apply=generated_test_apply,
@@ -1181,9 +1207,68 @@ class PipelineService:
         if verification_report is None:
             return False
         return (
-            verification_report.verdict == 'generated_test_verification_failed'
+            verification_report.verdict in {'generated_test_verification_failed', 'generated_test_generation_failed'}
             or bool((verification_report.summary or {}).get('generated_test_runtime_only'))
-        )    
+            or bool((verification_report.summary or {}).get('generated_test_generation_failed'))
+        )
+
+    def _is_generated_test_generation_failed_verdict(
+        self,
+        verification_report: VerificationReport | None,
+    ) -> bool:
+        if verification_report is None:
+            return False
+        return (
+            verification_report.verdict == 'generated_test_generation_failed'
+            or bool((verification_report.summary or {}).get('generated_test_generation_failed'))
+        )
+
+    def _should_run_generated_test_failure_review(
+        self,
+        *,
+        verification_report: VerificationReport | None,
+        generated_test_apply: dict[str, Any] | None,
+        external_test_generation: ExternalGenerationCall | None,
+    ) -> bool:
+        if external_test_generation is None or verification_report is None:
+            return False
+        if self._is_generated_test_generation_failed_verdict(verification_report):
+            return False
+
+        apply_reason = str((generated_test_apply or {}).get('reason') or '').strip()
+        if apply_reason in {'generated_test_generation_failed', 'no_generated_tests'}:
+            return False
+
+        external_error = self._external_result_error(external_test_generation, None)
+        if external_error:
+            return False
+
+        return self._generated_test_failure_only(verification_report, generated_test_apply)
+
+    def _mark_generated_test_generation_failure(
+        self,
+        verification_report: VerificationReport,
+        generated_test_apply: dict[str, Any] | None,
+    ) -> VerificationReport:
+        if not generated_test_apply:
+            return verification_report
+        if generated_test_apply.get('reason') != 'generated_test_generation_failed':
+            return verification_report
+
+        summary = dict(verification_report.summary or {})
+        summary['production_failed'] = bool(summary.get('production_failed'))
+        summary['generated_test_failed'] = True
+        summary['generated_test_generation_failed'] = True
+        summary['generated_test_generation_error_type'] = generated_test_apply.get('error_type')
+        summary['generated_test_generation_message'] = generated_test_apply.get('message')
+        summary['generated_test_trace_path'] = generated_test_apply.get('trace_path')
+
+        return VerificationReport(
+            verdict='generated_test_generation_failed',
+            passed=False,
+            blocks=list(verification_report.blocks),
+            summary=summary,
+        )
 
     def _generated_test_applied_paths(
         self,
@@ -1488,6 +1573,7 @@ class PipelineService:
         selected_target: str,
         context_pack: ContextPack,
         final_payload: dict[str, Any],
+        planner_result: dict[str, Any] | None,
         apply_result: ApplyResult,
         external_test_generation: ExternalGenerationCall,
         generated_test_apply: dict[str, Any] | None,
@@ -1566,6 +1652,7 @@ class PipelineService:
                 'kind': context_pack.target.kind,
                 'operation': code_artifact.get('operation'),
             },
+            'planner_result': dict(planner_result or final_payload.get('planner_result') or {}),
             'production_artifact': {
                 'code': code_artifact.get('code') or '',
                 'diff': production_diff,
@@ -1697,6 +1784,16 @@ class PipelineService:
             project_root=self.project_services.project_root,
         )
         call_result = invoke_repair(run_dir, self.project_services.config, request_payload)
+        raw_repaired_payload = dict(call_result.result_payload or {})
+        if self._is_documentation_or_import_only_repair_context(repair_context):
+            raw_repaired_payload = self._preserve_previous_code_for_docstring_repair(
+                previous_result_payload,
+                raw_repaired_payload,
+            )
+        repaired_payload = self._merge_repair_import_changes(
+            previous_result_payload,
+            raw_repaired_payload,
+        )
         external_call = ExternalGenerationCall(
             mode='cli_json',
             command=call_result.command,
@@ -1704,9 +1801,178 @@ class PipelineService:
             result_path=call_result.result_path,
             trace_path=call_result.trace_path,
             request_summary=self._summarize_external_request(call_result.request_payload),
-            result_summary=self._summarize_external_result(call_result.result_payload),
+            result_summary=self._summarize_external_result(repaired_payload),
         )
-        return external_call, call_result.result_payload
+        return external_call, repaired_payload
+
+    def _merge_repair_import_changes(
+        self,
+        previous_result_payload: dict[str, Any],
+        repair_result_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        previous_artifact = dict((previous_result_payload or {}).get('code_artifact') or {})
+        repaired_artifact = dict((repair_result_payload or {}).get('code_artifact') or {})
+        previous_import_changes = [
+            dict(item)
+            for item in (previous_artifact.get('import_changes') or [])
+            if isinstance(item, dict)
+        ]
+        if not previous_import_changes or not repaired_artifact:
+            return repair_result_payload
+
+        repaired_code = str(repaired_artifact.get('code') or '')
+        current_import_changes = [
+            dict(item)
+            for item in (repaired_artifact.get('import_changes') or [])
+            if isinstance(item, dict)
+        ]
+        merged_import_changes = list(current_import_changes)
+
+        def _is_duplicate(candidate: dict[str, Any]) -> bool:
+            return any(existing == candidate for existing in merged_import_changes)
+
+        def _change_is_still_used(change: dict[str, Any]) -> bool:
+            action = str(change.get('action') or '')
+            if action == 'add_import':
+                module = str(change.get('module') or '').split('.')[0]
+                return bool(module and re.search(rf'\b{re.escape(module)}\b', repaired_code))
+            if action == 'add_from_import':
+                for name in change.get('names') or []:
+                    raw_name = str(name or '').strip()
+                    imported_name = raw_name.split(' as ')[-1].strip() if ' as ' in raw_name else raw_name
+                    if imported_name and re.search(rf'\b{re.escape(imported_name)}\b', repaired_code):
+                        return True
+            return False
+
+        for change in previous_import_changes:
+            if _change_is_still_used(change) and not _is_duplicate(change):
+                merged_import_changes.append(change)
+
+        if len(merged_import_changes) == len(current_import_changes):
+            return repair_result_payload
+
+        repaired_artifact['import_changes'] = merged_import_changes
+        repair_result_payload['code_artifact'] = repaired_artifact
+        return repair_result_payload
+
+    def _repair_issue_codes(self, repair_context: dict[str, Any]) -> list[str]:
+        failure_summary = dict((repair_context or {}).get('failure_summary') or {})
+        failed_blocks = [
+            item for item in (failure_summary.get('failed_blocks') or [])
+            if isinstance(item, dict)
+        ]
+        issue_codes: list[str] = []
+        for block in failed_blocks:
+            for issue in block.get('issues') or []:
+                if isinstance(issue, dict):
+                    code = str(issue.get('code') or '').strip()
+                    if code:
+                        issue_codes.append(code)
+        return issue_codes
+
+    def _is_missing_docstring_only_repair_context(self, repair_context: dict[str, Any]) -> bool:
+        issue_codes = self._repair_issue_codes(repair_context)
+        return bool(issue_codes) and set(issue_codes) == {'missing_docstring_after_replace'}
+
+    def _is_documentation_or_import_only_repair_context(self, repair_context: dict[str, Any]) -> bool:
+        """Return True when repair must not rewrite executable logic.
+
+        Missing docstring is a documentation issue. A missing runtime name next to
+        it is commonly a dropped import_changes entry after generation. In that
+        case repair may supply a docstring/import correction, but the already
+        generated executable body should stay unchanged. Do not treat unresolved
+        external import modules as import-only: those may require changing code
+        to remove the unsupported dependency.
+        """
+        issue_codes = set(self._repair_issue_codes(repair_context))
+        if not issue_codes or 'missing_docstring_after_replace' not in issue_codes:
+            return False
+        import_only_codes = {'unknown_runtime_name', 'unused_import_change', 'duplicated_import_change_with_local_import'}
+        return issue_codes.issubset({'missing_docstring_after_replace', *import_only_codes})
+
+    def _first_symbol_node(self, code: str) -> ast.AST | None:
+        try:
+            module = ast.parse(code)
+        except SyntaxError:
+            return None
+        for node in module.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                return node
+        return None
+
+    def _extract_symbol_docstring(self, code: str) -> str | None:
+        node = self._first_symbol_node(code)
+        if node is None:
+            return None
+        docstring = ast.get_docstring(node, clean=False)
+        if docstring is None:
+            return None
+        docstring = str(docstring).strip()
+        return docstring or None
+
+    def _insert_or_replace_symbol_docstring(self, code: str, docstring: str) -> str | None:
+        node = self._first_symbol_node(code)
+        if node is None:
+            return None
+        lines = code.splitlines()
+        if not lines:
+            return None
+
+        body = list(getattr(node, 'body', []) or [])
+        if not body:
+            return None
+
+        first_body = body[0]
+        start = max(int(getattr(first_body, 'lineno', 1)) - 1, 0)
+        end = start
+        if isinstance(first_body, ast.Expr) and isinstance(getattr(first_body, 'value', None), ast.Constant) and isinstance(first_body.value.value, str):
+            end = max(int(getattr(first_body, 'end_lineno', first_body.lineno)), start + 1)
+        else:
+            end = start
+
+        indent_source_index = min(start, len(lines) - 1)
+        indent_match = re.match(r'^(\s*)', lines[indent_source_index])
+        indent = indent_match.group(1) if indent_match else '    '
+        if not indent:
+            indent = '    '
+
+        safe_docstring = docstring.replace('"""', '\"\"\"')
+        doc_lines = safe_docstring.splitlines() or ['']
+        if len(doc_lines) == 1:
+            rendered = [f'{indent}"""{doc_lines[0]}"""']
+        else:
+            rendered = [f'{indent}"""{doc_lines[0]}']
+            rendered.extend(f'{indent}{line}' for line in doc_lines[1:])
+            rendered.append(f'{indent}"""')
+
+        new_lines = list(lines)
+        new_lines[start:end] = rendered
+        suffix = '\n' if code.endswith('\n') else ''
+        return '\n'.join(new_lines) + suffix
+
+    def _preserve_previous_code_for_docstring_repair(
+        self,
+        previous_result_payload: dict[str, Any],
+        repair_result_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        previous_artifact = dict((previous_result_payload or {}).get('code_artifact') or {})
+        repaired_artifact = dict((repair_result_payload or {}).get('code_artifact') or {})
+        previous_code = str(previous_artifact.get('code') or '')
+        repaired_code = str(repaired_artifact.get('code') or '')
+        if not previous_code or not repaired_code or not repaired_artifact:
+            return repair_result_payload
+
+        repaired_docstring = self._extract_symbol_docstring(repaired_code)
+        if not repaired_docstring:
+            return repair_result_payload
+
+        merged_code = self._insert_or_replace_symbol_docstring(previous_code, repaired_docstring)
+        if not merged_code:
+            return repair_result_payload
+
+        repaired_artifact['code'] = merged_code
+        repair_result_payload['code_artifact'] = repaired_artifact
+        return repair_result_payload
 
     def _read_generation_request_payload(self, run_dir: Path) -> dict[str, Any] | None:
         request_format = str(self.project_services.config.codegenerator_request_format or 'json').lower()
@@ -2252,6 +2518,7 @@ class PipelineService:
     ) -> MergePlan:
         verification_ok = True if verification_report is None else bool(verification_report.passed)
         generated_test_only_failed = self._is_generated_test_only_verdict(verification_report)
+        generated_test_generation_failed = self._is_generated_test_generation_failed_verdict(verification_report)
 
         excluded_files = []
         if generated_test_only_failed and verification_report is not None:
@@ -2264,23 +2531,24 @@ class PipelineService:
         ready_for_manual_merge_review = (
             apply_result.validation.is_valid
             and (verification_ok or generated_test_only_failed)
+            and not generated_test_generation_failed
         )
 
-        status_line = (
-            'Структурная валидация и тестовые проверки прошли, но итоговое решение о merge принимает человек.'
-            if verification_ok
-            else (
-                'Основное изменение прошло проверки, но упал только сгенерированный тест; merge возможен после ручной оценки.'
-                if generated_test_only_failed
-                else 'Есть ошибки валидации или тестов, merge не рекомендуется без дополнительной проверки.'
-            )
-        )
+        if verification_ok:
+            status_line = 'Структурная валидация и тестовые проверки прошли, но итоговое решение о merge принимает человек.'
+        elif generated_test_generation_failed:
+            status_line = 'Основное изменение прошло проверки, но generated test не был создан из-за ошибки генерации; merge возможен только после ручной оценки.'
+        elif generated_test_only_failed:
+            status_line = 'Основное изменение прошло проверки, но упал только сгенерированный тест; merge возможен после ручной оценки.'
+        else:
+            status_line = 'Есть ошибки валидации или тестов, merge не рекомендуется без дополнительной проверки.'
 
-        post_apply_line = (
-            'Проверки после apply: only generated test failed'
-            if generated_test_only_failed
-            else f'Проверки после apply: {"passed" if verification_ok else "failed"}'
-        )
+        if generated_test_generation_failed:
+            post_apply_line = 'Проверки после apply: generated test generation failed'
+        elif generated_test_only_failed:
+            post_apply_line = 'Проверки после apply: only generated test failed'
+        else:
+            post_apply_line = f'Проверки после apply: {"passed" if verification_ok else "failed"}'
 
         excluded_line = (
             f'Исключены из apply/merge: {", ".join(excluded_files)}'
@@ -2329,8 +2597,12 @@ class PipelineService:
         started = datetime.now(tz=UTC)
         started_perf = perf_counter()
         status = 'ok'
+        step_error: dict[str, Any] | None = None
         try:
             payload = func()
+            step_error = self._extract_step_payload_error(step_name, payload)
+            if step_error:
+                status = 'error'
         except Exception as exc:
             status = 'error'
             finished = datetime.now(tz=UTC)
@@ -2354,5 +2626,45 @@ class PipelineService:
             finished_at=finished.isoformat(),
             duration_ms=int((perf_counter() - started_perf) * 1000),
             summary=summary,
+            error_type=(step_error or {}).get('error_type'),
+            error_message=(step_error or {}).get('message'),
+            exception_class=(step_error or {}).get('exception_class'),
         ))
         return payload
+
+    def _extract_step_payload_error(
+        self,
+        step_name: str,
+        payload: Any,
+    ) -> dict[str, Any] | None:
+        external_steps = {
+            'external_generate',
+            'external_generate_test',
+            'external_repair',
+            'external_repair_after_patch_static_semantics',
+            'generated_test_failure_review',
+        }
+        if step_name not in external_steps:
+            return None
+
+        external_call: ExternalGenerationCall | None = None
+        result_payload: dict[str, Any] | None = None
+
+        if isinstance(payload, tuple) and len(payload) == 2:
+            maybe_call, maybe_payload = payload
+            if isinstance(maybe_call, ExternalGenerationCall):
+                external_call = maybe_call
+            if isinstance(maybe_payload, dict):
+                result_payload = maybe_payload
+        elif isinstance(payload, dict):
+            result_payload = payload
+
+        if external_call is not None or result_payload is not None:
+            error = self._external_result_error(external_call, result_payload)
+            if error:
+                return {
+                    'error_type': error.get('error_type') or 'external_generation_error',
+                    'message': error.get('message') or 'external generation step returned error status',
+                    'exception_class': error.get('error_type'),
+                }
+        return None

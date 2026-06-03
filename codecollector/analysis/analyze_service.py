@@ -164,7 +164,13 @@ class AnalyzeService:
                     services=services,
                 )
                 record_timing('candidate_rerank_total_sec', candidate_rerank_started_at)
+                candidates_before_rerank = list(candidates)
                 candidates = self.llm_assist.reorder_candidates(candidates, target_recommendation)
+                self._attach_rerank_mapping_diagnostics(
+                    target_recommendation,
+                    before=candidates_before_rerank,
+                    after=candidates,
+                )
                 request_quality = self._resolved_request_quality(request_quality, target_recommendation)
                 warnings.extend(self._warnings_from_plan(target_recommendation))
                 self._record_llm_usage(llm_usage_steps, 'candidate_rerank', target_recommendation)
@@ -320,6 +326,16 @@ class AnalyzeService:
             candidates,
             recommended_target=recommended_target,
         )
+        self._attach_target_selection_diagnostics(
+            target_recommendation,
+            search_plan=search_plan,
+            candidates=candidates,
+            recommended_target=recommended_target,
+            manual_review_required=manual_review_required,
+            effective_operation=effective_operation,
+            operation_source=operation_source,
+            skip_rerank_reason=skip_rerank_reason,
+        )
         warnings = self._final_top_level_warnings(
             warnings,
             manual_review_required=manual_review_required,
@@ -412,6 +428,99 @@ class AnalyzeService:
                 analysis_usage=analysis_usage,
             ),
         )
+
+    def _attach_rerank_mapping_diagnostics(
+        self,
+        target_recommendation: dict[str, Any],
+        *,
+        before: list[SearchCandidate],
+        after: list[SearchCandidate],
+    ) -> None:
+        if self.llm_assist is None:
+            return
+        diagnostics = dict(target_recommendation.get('_diagnostics') or {})
+        diagnostics['rerank_mapping'] = self.llm_assist.rerank_mapping_diagnostics(
+            before=before,
+            after=after,
+            recommendation=target_recommendation,
+        )
+        target_recommendation['_diagnostics'] = diagnostics
+
+    def _attach_target_selection_diagnostics(
+        self,
+        target_recommendation: dict[str, Any],
+        *,
+        search_plan: dict[str, Any],
+        candidates: list[SearchCandidate],
+        recommended_target: str | None,
+        manual_review_required: bool,
+        effective_operation: str,
+        operation_source: str,
+        skip_rerank_reason: str | None,
+    ) -> None:
+        diagnostics = dict(target_recommendation.get('_diagnostics') or {}) if isinstance(target_recommendation, dict) else {}
+        preferred_qualnames = self._preferred_qualnames_from_search_plan(search_plan)
+        top_candidate = candidates[0].qualname if candidates else None
+        recommendation_target = str(target_recommendation.get('recommended_target') or '').strip() if isinstance(target_recommendation, dict) else ''
+        recommendation_confidence = self._safe_float(target_recommendation.get('target_confidence')) if isinstance(target_recommendation, dict) else 0.0
+        recommendation_manual_review = bool(target_recommendation.get('manual_review_required')) if isinstance(target_recommendation, dict) else False
+        reason = 'auto_target_selected'
+        if manual_review_required:
+            if not recommended_target:
+                if not target_recommendation:
+                    reason = 'no_target_recommendation_payload'
+                elif recommendation_manual_review:
+                    reason = 'target_recommendation_requested_manual_review'
+                elif not recommendation_target:
+                    reason = 'target_recommendation_missing_recommended_target'
+                elif recommendation_confidence < self.config.analysis_min_confidence_auto_recommend_target:
+                    reason = 'target_confidence_below_threshold'
+                else:
+                    reason = 'recommended_target_not_selected'
+            else:
+                reason = 'manual_review_flag_set_with_target'
+        diagnostics['target_selection'] = {
+            'recommended_target': recommended_target,
+            'manual_review_required': manual_review_required,
+            'manual_review_reason': reason,
+            'effective_operation': effective_operation,
+            'operation_source': operation_source,
+            'skip_rerank_reason': skip_rerank_reason,
+            'search_plan_manual_review_required': bool(search_plan.get('manual_review_required')) if isinstance(search_plan, dict) else False,
+            'search_plan_multi_target_likely': bool(search_plan.get('multi_target_likely')) if isinstance(search_plan, dict) else False,
+            'search_plan_preferred_qualnames': preferred_qualnames,
+            'top_candidate': top_candidate,
+            'target_recommendation_present': bool(target_recommendation),
+            'target_recommendation_recommended_target': recommendation_target or None,
+            'target_recommendation_target_confidence': recommendation_confidence,
+            'target_recommendation_manual_review_required': recommendation_manual_review,
+            'target_recommendation_source': str(target_recommendation.get('source') or '') if isinstance(target_recommendation, dict) else '',
+            'candidate_count': len(candidates),
+            'candidate_qualnames': [candidate.qualname for candidate in candidates[: min(10, len(candidates))]],
+            'llm_ranked_candidate_count': sum(1 for candidate in candidates if candidate.ranked_by_llm),
+            'llm_ranked_qualnames': [candidate.qualname for candidate in candidates if candidate.ranked_by_llm][:10],
+        }
+        if isinstance(target_recommendation, dict):
+            target_recommendation['_diagnostics'] = diagnostics
+        LOGGER.info(
+            'Analyze target selection decision: recommended_target=%s manual_review_required=%s reason=%s operation=%s operation_source=%s recommendation_target=%s recommendation_confidence=%s search_plan_manual_review=%s top_candidate=%s llm_ranked_count=%s',
+            recommended_target,
+            manual_review_required,
+            reason,
+            effective_operation,
+            operation_source,
+            recommendation_target or None,
+            recommendation_confidence,
+            bool(search_plan.get('manual_review_required')) if isinstance(search_plan, dict) else False,
+            top_candidate,
+            diagnostics['target_selection']['llm_ranked_candidate_count'],
+        )
+
+    def _preferred_qualnames_from_search_plan(self, search_plan: dict[str, Any]) -> list[str]:
+        plan = search_plan.get('search_plan') if isinstance(search_plan, dict) else None
+        if not isinstance(plan, dict):
+            return []
+        return [str(value).strip() for value in plan.get('preferred_qualnames') or [] if str(value).strip()]
 
     def _non_symbol_change_kind(self, target_recommendation: dict[str, Any], search_plan: dict[str, Any]) -> str | None:
         """Return an LLM-declared change kind that must stop auto-targeting.
@@ -1680,9 +1789,14 @@ class AnalyzeService:
         # Search-plan warnings are diagnostic after rerank resolved the request with
         # a confident target. Keep only real execution failures at the top level.
         result: list[dict[str, Any]] = []
+        persistent_warning_codes = {
+            'analysis_llm_rerank_invalid_json_contract',
+        }
         for warning in warnings:
             code = str(warning.get('code') or '')
             if code.startswith('analysis_llm_') and code.endswith('_failed'):
+                result.append(warning)
+            elif code in persistent_warning_codes:
                 result.append(warning)
         return result
 

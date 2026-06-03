@@ -88,6 +88,7 @@ class AppConfig:
     analysis_llm_rerank_candidate_drop_fields: list[str]
     analysis_llm_rerank_candidate_keep_fields: list[str]
     analysis_llm_rerank_emergency_min_candidate_cards: int
+    analysis_llm_rerank_raw_preview_chars: int
     analysis_prompt_dir: str
     analysis_system_template: str
     analysis_search_plan_template: str
@@ -312,6 +313,7 @@ def load_config(config_path: Path | None = None) -> AppConfig:
         analysis_llm_rerank_candidate_drop_fields=list(llm_assist.get('rerank_candidate_drop_fields', [])),
         analysis_llm_rerank_candidate_keep_fields=list(llm_assist.get('rerank_candidate_keep_fields', [])),
         analysis_llm_rerank_emergency_min_candidate_cards=int(llm_assist.get('rerank_emergency_min_candidate_cards', candidate_context.get('min_candidate_cards', 5))),
+        analysis_llm_rerank_raw_preview_chars=int(llm_assist.get('rerank_raw_preview_chars', 1200)),
         analysis_prompt_dir=str(prompts.get('dir', 'codecollector/prompts')),
         analysis_system_template=str(prompts.get('system_template', 'codecollector/prompts/analyze_system_template.txt')),
         analysis_search_plan_template=str(prompts.get('search_plan_template', 'codecollector/prompts/analyze_search_plan_user_template.txt')),

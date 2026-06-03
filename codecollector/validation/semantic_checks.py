@@ -1739,6 +1739,180 @@ def _target_qualname_exists_in_tree(tree: ast.AST | None, target_file: str, targ
         return bool(_class_method_nodes(tree, class_name, {method_name}))
     return False
 
+
+def _target_def_node(tree: ast.AST | None, target_file: str, target_qualname: str) -> ast.AST | None:
+    if tree is None:
+        return None
+    parts = _target_relative_parts(target_file, target_qualname)
+    if len(parts) == 1:
+        name = parts[0]
+        for node in getattr(tree, "body", []):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == name:
+                return node
+        return None
+    if len(parts) == 2:
+        class_name, method_name = parts
+        nodes = _class_method_nodes(tree, class_name, {method_name})
+        return nodes[0] if nodes else None
+    return None
+
+
+
+
+def _target_def_node_from_project_root(project_root: Path, target_qualname: str) -> tuple[ast.AST | None, str]:
+    parts = [part for part in str(target_qualname or "").split(".") if part]
+    if len(parts) < 2:
+        return None, ""
+    for module_len in range(len(parts) - 1, 0, -1):
+        module_parts = parts[:module_len]
+        rel_path = Path(*module_parts).with_suffix(".py")
+        module_file = project_root / rel_path
+        if not module_file.exists():
+            continue
+        try:
+            tree = _safe_parse(module_file.read_text(encoding="utf-8"))
+        except OSError:
+            return None, str(rel_path)
+        return _target_def_node(tree, str(rel_path), target_qualname), str(rel_path)
+    return None, ""
+
+
+def _function_uses_first_argument(node: ast.AST | None) -> bool:
+    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return True
+    if not node.args.args:
+        return True
+    first_arg = node.args.args[0].arg
+    for child in ast.walk(node):
+        if isinstance(child, ast.Name) and child.id == first_arg:
+            return True
+    return False
+
+
+def _check_generated_test_unnecessary_parent_instance_for_selfless_target(
+    *,
+    tree: ast.AST,
+    project_root: Path,
+    imported_names: dict[str, str],
+    target_qualname: str,
+    test_file_path: Path,
+) -> tuple[list[VerificationIssue], dict[str, Any]]:
+    parts = [part for part in str(target_qualname or "").split(".") if part]
+    if len(parts) < 2 or parts[-1] == "__init__":
+        return [], {"checked": False, "reason": "not_class_method_target"}
+
+    parent_class_name = parts[-2]
+    target_node, target_file = _target_def_node_from_project_root(project_root, target_qualname)
+    if not isinstance(target_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return [], {"checked": False, "reason": "target_source_not_found", "target_file": target_file}
+
+    uses_self = _function_uses_first_argument(target_node)
+    constructor_calls: list[dict[str, Any]] = []
+    if not uses_self and parent_class_name in imported_names:
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if isinstance(node.func, ast.Name) and node.func.id == parent_class_name:
+                constructor_calls.append({
+                    "class_name": parent_class_name,
+                    "line": getattr(node, "lineno", None),
+                    "args_count": len(node.args),
+                    "keywords": [kw.arg for kw in node.keywords if kw.arg],
+                })
+
+    issues = [
+        VerificationIssue(
+            code="generated_test_unnecessary_parent_instance_for_selfless_target",
+            message=(
+                f"Generated test создает экземпляр {parent_class_name}, хотя target method не использует self. "
+                "Для simple test вызывай метод как unbound method через parent class с None/fake self "
+                "и не запускай constructor parent class без необходимости."
+            ),
+            file_path=str(test_file_path),
+            symbol=parent_class_name,
+        )
+        for _ in constructor_calls[:1]
+    ]
+    return issues, {
+        "checked": True,
+        "target_file": target_file,
+        "parent_class_name": parent_class_name,
+        "target_uses_self": uses_self,
+        "parent_class_imported": parent_class_name in imported_names,
+        "constructor_calls": constructor_calls,
+    }
+
+def _docstring_preview(value: str, max_chars: int = 180) -> str:
+    compact = " ".join(str(value or "").strip().split())
+    if len(compact) <= max_chars:
+        return compact
+    return compact[: max(0, max_chars - 3)].rstrip() + "..."
+
+
+def _check_target_docstring_preserved_after_replace(
+    *,
+    before_tree: ast.AST | None,
+    after_tree: ast.AST | None,
+    requested_operation: str,
+    target_file: str,
+    target_qualname: str,
+) -> tuple[list[VerificationIssue], dict[str, Any]]:
+    details: dict[str, Any] = {
+        "skipped": True,
+        "reason": "not_replace_symbol",
+        "target_qualname": target_qualname,
+        "target_file": target_file,
+    }
+    if requested_operation != "replace_symbol":
+        return [], details
+
+    before_node = _target_def_node(before_tree, target_file, target_qualname)
+    after_node = _target_def_node(after_tree, target_file, target_qualname)
+    before_doc = ast.get_docstring(before_node, clean=True) if before_node is not None else None
+    after_doc = ast.get_docstring(after_node, clean=True) if after_node is not None else None
+
+    details.update(
+        {
+            "skipped": False,
+            "reason": "",
+            "target_exists_before": before_node is not None,
+            "target_exists_after": after_node is not None,
+            "before_has_docstring": bool(before_doc),
+            "after_has_docstring": bool(after_doc),
+            "before_docstring_preview": _docstring_preview(before_doc or ""),
+            "after_docstring_preview": _docstring_preview(after_doc or ""),
+            "issues": [],
+        }
+    )
+
+    if before_node is None or after_node is None:
+        details["reason"] = "target_missing_before_or_after"
+        return [], details
+
+    if not before_doc:
+        details["reason"] = "original_target_has_no_docstring"
+        return [], details
+
+    if after_doc:
+        details["reason"] = "docstring_preserved"
+        return [], details
+
+    issue = VerificationIssue(
+        code="missing_docstring_after_replace",
+        message=(
+            "После replace_symbol у target symbol удален docstring, который был в исходном коде. "
+            "Для repair добавь короткий docstring на русском языке или обнови прежний docstring так, "
+            "чтобы он соответствовал новому поведению и пользовательскому запросу; "
+            "не меняй исполняемую логику без необходимости."
+        ),
+        severity="error",
+        file_path=target_file,
+        symbol=target_qualname,
+    )
+    details["issues"] = [issue.code]
+    details["reason"] = "docstring_removed"
+    return [issue], details
+
 def _project_module_exists(project_root: Path, module_name: str) -> bool:
     module_path = module_name.replace(".", "/")
     py_path = project_root / f"{module_path}.py"
@@ -2768,8 +2942,9 @@ def _check_import_changes_usage(
 
     import_changes are part of the generated artifact contract. If the model asks
     codecollector to add a file-level import, the generated symbol should use the
-    imported name. Otherwise the artifact is internally inconsistent and should
-    be repaired instead of leaving dead imports in the target file.
+    imported name. An unused add-import is usually a non-fatal apply-plan issue:
+    codecollector may ignore it during apply and report a warning instead of
+    sending the artifact to repair.
     """
     added_names = _import_change_added_names(import_changes)
     if scan_tree is None or not added_names:
@@ -2796,9 +2971,10 @@ def _check_import_changes_usage(
                     code="unused_import_change",
                     message=(
                         f"import_changes добавляет импорт `{name}`, но generated symbol не использует это имя. "
-                        "Для repair: удали лишний import_changes или измени code так, чтобы использовалось импортированное имя."
+                        "Такой add-import будет проигнорирован при применении; repair не требуется, "
+                        "если нет других ошибок import_changes или runtime-name."
                     ),
-                    severity="error",
+                    severity="warning",
                     file_path=target_file,
                     symbol=target_qualname,
                 )
@@ -4939,6 +5115,10 @@ def validate_patch_static_semantics(
         "checked_targets": [],
         "issues": [],
     }
+    docstring_preservation_details: dict[str, Any] = {
+        "skipped": True,
+        "reason": "not_checked",
+    }
 
     target_is_class_method = _target_is_class_method(target_file, target_qualname)
 
@@ -5250,6 +5430,15 @@ def validate_patch_static_semantics(
     )
     issues.extend(dict_key_issues)
 
+    docstring_issues, docstring_preservation_details = _check_target_docstring_preserved_after_replace(
+        before_tree=before_tree,
+        after_tree=after_tree,
+        requested_operation=requested_operation,
+        target_file=target_file,
+        target_qualname=target_qualname,
+    )
+    issues.extend(docstring_issues)
+
     duplicate_symbols = find_duplicate_symbol_definitions(
         patched_file_text,
         _module_name_from_target_file(target_file),
@@ -5273,10 +5462,12 @@ def validate_patch_static_semantics(
             )
         )
 
+    error_issues = [issue for issue in issues if issue.severity == "error"]
+
     return VerificationBlock(
         name="patch_static_semantics",
-        ok=not issues,
-        severity="error" if issues else "info",
+        ok=not error_issues,
+        severity="error" if error_issues else ("warning" if issues else "info"),
         issues=issues,
         details={
             "requested_operation": requested_operation,
@@ -5297,6 +5488,7 @@ def validate_patch_static_semantics(
             "possible_existing_method_contract_lost": possible_method_contract_details,
             "preserved_assignment_order_check": assignment_order_details,
             "preserved_dict_key_check": dict_key_details,
+            "docstring_preservation_check": docstring_preservation_details,
             "annotation_name_check": annotation_name_details,
             "runtime_name_check": runtime_name_details,
             "import_changes_usage_check": import_change_details,
@@ -6056,6 +6248,15 @@ def validate_generated_test_static_semantics(
     )
     issues.extend(unsafe_new_issues)
 
+    selfless_parent_issues, selfless_parent_details = _check_generated_test_unnecessary_parent_instance_for_selfless_target(
+        tree=tree,
+        project_root=project_root,
+        imported_names=imported_names,
+        target_qualname=target_qualname,
+        test_file_path=test_file_path,
+    )
+    issues.extend(selfless_parent_issues)
+
     constructor_keyword_issues, constructor_keyword_details = _check_generated_test_constructor_keywords(
         tree=tree,
         project_root=project_root,
@@ -6196,6 +6397,7 @@ def validate_generated_test_static_semantics(
             "target_reference_names": sorted(target_reference_names),
             "project_import_check": project_import_details,
             "unsafe_project_new_usage_check": unsafe_new_details,
+            "selfless_parent_instance_check": selfless_parent_details,
             "constructor_keyword_check": constructor_keyword_details,
             "project_method_call_check": project_method_details,
             "project_attribute_assignment_check": attribute_assignment_details,

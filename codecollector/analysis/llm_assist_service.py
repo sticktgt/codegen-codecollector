@@ -77,10 +77,12 @@ class AnalysisLlmAssistService:
     ) -> dict[str, Any]:
         candidate_cards = self._candidate_cards(candidates, services)
         LOGGER.info(
-            'analysis rerank context: recall_candidates=%s candidate_cards=%s effective_operation=%s',
+            'analysis rerank context: recall_candidates=%s candidate_cards=%s effective_operation=%s candidate_ids=%s candidate_qualnames=%s',
             len(candidates),
             len(candidate_cards),
             effective_operation,
+            [str(card.get('candidate_id') or '') for card in candidate_cards],
+            [str(card.get('qualname') or '') for card in candidate_cards],
         )
         payload = {
             'request': self._request_payload(requirements),
@@ -98,12 +100,47 @@ class AnalysisLlmAssistService:
             user_prompt=user_prompt,
             max_prompt_chars=int(prompt_budget.get('max_prompt_chars') or self.config.analysis_llm_rerank_max_prompt_chars),
         )
+        parse_recovered = False
+        parse_error_message: str | None = None
         try:
             parsed = self._parse_json_object(call.content)
+            if self._rerank_parse_lost_selection_fields(call.content, parsed):
+                raise json.JSONDecodeError(
+                    'Rerank JSON was parsed only partially; selection fields are present in raw response but missing from parsed object',
+                    str(call.content or ''),
+                    0,
+                )
         except json.JSONDecodeError as exc:
+            parse_recovered = True
+            parse_error_message = str(exc)
             parsed = self._fallback_parse_rerank_response(call.content, candidate_cards, exc)
+        if parse_recovered:
+            parsed = self._ensure_invalid_json_contract_warning(parsed, parse_error_message)
         parsed.setdefault('llm_usage', call.usage_dict())
         parsed.setdefault('prompt_budget', prompt_budget)
+        diagnostics = self._rerank_response_diagnostics(
+            call_content=call.content,
+            parsed=parsed,
+            candidate_cards=candidate_cards,
+            parse_recovered=parse_recovered,
+            parse_error_message=parse_error_message,
+        )
+        parsed['_diagnostics'] = {
+            **dict(parsed.get('_diagnostics') or {}),
+            'rerank_response': diagnostics,
+        }
+        LOGGER.info(
+            'analysis rerank parsed: keys=%s recommended_candidate_id=%s recommended_target=%s target_confidence=%s ranked_candidates_count=%s alternatives_count=%s manual_review_required=%s parse_recovered=%s raw_preview=%r',
+            diagnostics.get('parsed_top_level_keys'),
+            diagnostics.get('recommended_candidate_id'),
+            diagnostics.get('recommended_target'),
+            diagnostics.get('target_confidence'),
+            diagnostics.get('ranked_candidates_count'),
+            diagnostics.get('alternatives_count'),
+            diagnostics.get('manual_review_required'),
+            diagnostics.get('parse_recovered'),
+            diagnostics.get('raw_preview'),
+        )
         return parsed
 
 
@@ -322,6 +359,158 @@ class AnalysisLlmAssistService:
             limit,
             trim_steps,
         )
+
+    def _ensure_invalid_json_contract_warning(
+        self,
+        parsed: dict[str, Any],
+        parse_error_message: str | None,
+    ) -> dict[str, Any]:
+        updated = dict(parsed or {})
+        warnings = [item for item in updated.get('warnings') or [] if isinstance(item, dict)]
+        if not any(str(item.get('code') or '') == 'analysis_llm_rerank_invalid_json_contract' for item in warnings):
+            warnings.append(
+                {
+                    'code': 'analysis_llm_rerank_invalid_json_contract',
+                    'message': (
+                        'LLM вернула невалидный JSON для analyze rerank. ' 
+                        'Часть полей могла быть восстановлена из raw-ответа; ' 
+                        f'исходная ошибка парсинга: {parse_error_message or "unknown"}'
+                    ),
+                }
+            )
+        updated['warnings'] = warnings
+        diagnostics = dict(updated.get('_diagnostics') or {})
+        diagnostics['invalid_json_contract'] = {
+            'step': 'analyze_candidate_rerank',
+            'parse_recovered': True,
+            'parse_error': parse_error_message or '',
+        }
+        updated['_diagnostics'] = diagnostics
+        return updated
+
+    def _rerank_parse_lost_selection_fields(self, content: str, parsed: dict[str, Any]) -> bool:
+        if not isinstance(parsed, dict):
+            return False
+        has_parsed_selection = any(
+            key in parsed
+            for key in (
+                'recommended_candidate_id',
+                'recommended_target',
+                'target_confidence',
+                'target_reason',
+                'ranked_candidates',
+                'alternatives',
+            )
+        )
+        if has_parsed_selection:
+            return False
+
+        raw = str(content or '')
+        return any(
+            f'"{key}"' in raw
+            for key in (
+                'recommended_candidate_id',
+                'recommended_target',
+                'target_confidence',
+                'target_reason',
+                'ranked_candidates',
+                'alternatives',
+            )
+        )
+
+    def _rerank_response_diagnostics(
+        self,
+        *,
+        call_content: str,
+        parsed: dict[str, Any],
+        candidate_cards: list[dict[str, Any]],
+        parse_recovered: bool,
+        parse_error_message: str | None = None,
+    ) -> dict[str, Any]:
+        ranked = parsed.get('ranked_candidates') if isinstance(parsed, dict) else None
+        alternatives = parsed.get('alternatives') if isinstance(parsed, dict) else None
+        candidate_ids = [str(card.get('candidate_id') or '') for card in candidate_cards]
+        candidate_qualnames = [str(card.get('qualname') or '') for card in candidate_cards]
+        ranked_ids: list[str] = []
+        if isinstance(ranked, list):
+            for item in ranked:
+                if isinstance(item, dict):
+                    candidate_id = str(item.get('candidate_id') or '').strip()
+                    if candidate_id:
+                        ranked_ids.append(candidate_id)
+        recommended_candidate_id = str(parsed.get('recommended_candidate_id') or '').strip()
+        return {
+            'candidate_cards_count': len(candidate_cards),
+            'candidate_ids': candidate_ids,
+            'candidate_qualnames': candidate_qualnames,
+            'raw_chars': len(str(call_content or '')),
+            'raw_preview': str(call_content or '')[: self.config.analysis_llm_rerank_raw_preview_chars],
+            'strict_json_contract_ok': not parse_recovered,
+            'invalid_json_contract': bool(parse_recovered),
+            'parse_recovered': parse_recovered,
+            'parse_error': parse_error_message or None,
+            'parsed_top_level_keys': sorted(str(key) for key in parsed.keys()),
+            'recommended_candidate_id': recommended_candidate_id or None,
+            'recommended_target': str(parsed.get('recommended_target') or '').strip() or None,
+            'target_confidence': self._safe_float(parsed.get('target_confidence')),
+            'manual_review_required': bool(parsed.get('manual_review_required')),
+            'ranked_candidates_count': len(ranked) if isinstance(ranked, list) else 0,
+            'ranked_candidate_ids': ranked_ids,
+            'ranked_candidate_ids_not_in_cards': [candidate_id for candidate_id in ranked_ids if candidate_id not in candidate_ids],
+            'recommended_candidate_id_in_cards': bool(recommended_candidate_id and recommended_candidate_id in candidate_ids),
+            'alternatives_count': len(alternatives) if isinstance(alternatives, list) else 0,
+        }
+
+    def rerank_mapping_diagnostics(
+        self,
+        *,
+        before: list[SearchCandidate],
+        after: list[SearchCandidate],
+        recommendation: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        recommendation = recommendation or {}
+        id_to_candidate = {
+            f'c{index}': candidate
+            for index, candidate in enumerate(before[: self.config.analysis_max_candidate_cards], start=1)
+        }
+        ranked_items = self._ranked_candidate_items(recommendation)
+        ranked_ids = [str(item.get('candidate_id') or '').strip() for item in ranked_items]
+        matched_qualnames: list[str] = []
+        unmatched_ids: list[str] = []
+        for candidate_id in ranked_ids:
+            candidate = id_to_candidate.get(candidate_id)
+            if candidate is None:
+                unmatched_ids.append(candidate_id)
+            else:
+                matched_qualnames.append(candidate.qualname)
+        recommended_target = str(recommendation.get('recommended_target') or '').strip()
+        ranked_after = [candidate for candidate in after if candidate.ranked_by_llm]
+        diagnostics = {
+            'before_count': len(before),
+            'after_count': len(after),
+            'candidate_id_to_qualname': {candidate_id: candidate.qualname for candidate_id, candidate in id_to_candidate.items()},
+            'ranked_items_count': len(ranked_items),
+            'ranked_candidate_ids': ranked_ids,
+            'matched_count': len(matched_qualnames),
+            'matched_qualnames': matched_qualnames,
+            'unmatched_candidate_ids': unmatched_ids,
+            'recommended_target': recommended_target or None,
+            'recommended_target_in_candidates': any(candidate.qualname == recommended_target for candidate in before) if recommended_target else False,
+            'ranked_after_count': len(ranked_after),
+            'ranked_after_qualnames': [candidate.qualname for candidate in ranked_after],
+            'top_after_qualnames': [candidate.qualname for candidate in after[: min(5, len(after))]],
+        }
+        LOGGER.info(
+            'analysis rerank mapping: ranked_items=%s matched=%s unmatched_ids=%s recommended_target=%s recommended_target_in_candidates=%s ranked_after=%s top_after=%s',
+            diagnostics['ranked_items_count'],
+            diagnostics['matched_count'],
+            diagnostics['unmatched_candidate_ids'],
+            diagnostics['recommended_target'],
+            diagnostics['recommended_target_in_candidates'],
+            diagnostics['ranked_after_qualnames'],
+            diagnostics['top_after_qualnames'],
+        )
+        return diagnostics
 
     def reorder_candidates(
         self,
@@ -773,8 +962,11 @@ class AnalysisLlmAssistService:
             'manual_review_required': False,
             'warnings': [
                 {
-                    'code': 'analysis_llm_rerank_json_recovered',
-                    'message': f'LLM вернула невалидный JSON для rerank; часть полей восстановлена эвристически: {parse_error}',
+                    'code': 'analysis_llm_rerank_invalid_json_contract',
+                    'message': (
+                        'LLM вернула невалидный JSON для analyze rerank; '
+                        f'часть полей восстановлена эвристически: {parse_error}'
+                    ),
                 }
             ],
             'ranked_candidates': ranked_candidates,
