@@ -66,9 +66,11 @@ class AppConfig:
     codegenerator_test_generation_mode: str
     codegenerator_repair_enabled: bool
     codegenerator_max_repair_attempts: int
+    codegenerator_test_repair_enabled: bool
     verification_run_ruff: bool
     verification_run_recommended_tests: bool
     verification_run_full_project_tests: bool
+    verification_known_call_return_types: dict[str, Any]
     analysis_llm_enabled: bool
     analysis_llm_base_url: str
     analysis_llm_api_key: str
@@ -291,9 +293,11 @@ def load_config(config_path: Path | None = None) -> AppConfig:
         codegenerator_test_generation_mode=str(codegen.get('test_generation_mode', 'always')),
         codegenerator_repair_enabled=bool(codegen.get('repair_enabled', True)),
         codegenerator_max_repair_attempts=int(codegen.get('max_repair_attempts', 1)),
+        codegenerator_test_repair_enabled=bool(codegen.get('test_repair_enabled', True)),
         verification_run_ruff=bool(payload.get('verification', {}).get('run_ruff', False)),
         verification_run_recommended_tests=bool(payload.get('verification', {}).get('run_recommended_tests', True)),
         verification_run_full_project_tests=bool(payload.get('verification', {}).get('run_full_project_tests', False)),
+        verification_known_call_return_types=dict(payload.get('verification', {}).get('known_call_return_types') or {}),
         analysis_llm_enabled=bool(llm_assist.get('enabled', True)),
         analysis_llm_base_url=str(llm_assist.get('base_url', '')),
         analysis_llm_api_key=str(llm_assist.get('api_key', '')),

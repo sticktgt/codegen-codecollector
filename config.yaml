@@ -63,10 +63,24 @@ codegenerator:
   test_generation_mode: always
   repair_enabled: true
   max_repair_attempts: 1
+  test_repair_enabled: true
 verification:
   run_ruff: false
   run_recommended_tests: true
   run_full_project_tests: false
+  known_call_return_types:
+    QFileDialog.getOpenFileName:
+      tuple_items:
+        - str
+        - str
+    QFileDialog.getSaveFileName:
+      tuple_items:
+        - str
+        - str
+    QFileDialog.getOpenFileNames:
+      tuple_items:
+        - list
+        - str
 analysis:
   llm_assist:
     enabled: true

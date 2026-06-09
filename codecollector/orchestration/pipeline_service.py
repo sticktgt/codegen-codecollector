@@ -4,6 +4,7 @@ from dataclasses import asdict
 import ast
 import json
 import re
+
 from datetime import UTC, datetime
 from pathlib import Path
 from time import perf_counter
@@ -59,6 +60,32 @@ class PipelineService:
     def __init__(self, project_services: "ProjectServices", artifacts_manager: RunArtifactsManager) -> None:
         self.project_services = project_services
         self.artifacts_manager = artifacts_manager
+
+    def _indexed_project_import_roots(self) -> list[str]:
+        """Return root imports collected during project indexing.
+
+        The validation layer uses these roots to distinguish already-used project
+        runtime dependencies from arbitrary new external imports. This method does
+        not scan the filesystem; it reads import relations produced by the indexer.
+        """
+        project_root = str(self.project_services.project_root)
+        roots: set[str] = set()
+        try:
+            relations = self.project_services.store.list_relations_by_kind(project_root, 'imports')
+        except Exception as exc:  # pragma: no cover - defensive logging, validation remains conservative.
+            LOGGER.warning(
+                'Failed to load indexed project import roots for %s: %s',
+                project_root,
+                exc,
+            )
+            return []
+
+        for relation in relations:
+            target = str(relation.target_qualname or relation.target_ref or '').strip()
+            root = target.split('.', 1)[0].strip()
+            if root:
+                roots.add(root)
+        return sorted(roots)
 
     def run_replay(
         self,
@@ -466,6 +493,7 @@ class PipelineService:
 
             final_payload = external_code_result_payload
             generated_tests: list[dict[str, str]] = []
+            repair_gate_blocks: list[VerificationBlock] = []
 
             try:
                 self._run_step(
@@ -562,6 +590,7 @@ class PipelineService:
             target_file = str(context_pack.target.file_path or "").strip()
             original_target_file_path = self.project_services.project_root / target_file
             patched_target_file_path = apply_result.workspace_path / target_file
+            project_import_roots = self._indexed_project_import_roots()
 
             patch_static_block = self._run_step(
                 steps,
@@ -583,6 +612,8 @@ class PipelineService:
                     required_class_members=required_class_members,
                     model_surfaces=model_surfaces,
                     project_root=self.project_services.project_root,
+                    project_import_roots=project_import_roots,
+                    known_call_return_types=self.project_services.config.verification_known_call_return_types,
                 ),
             )
 
@@ -630,44 +661,85 @@ class PipelineService:
                         ),
                     )
 
-                    final_payload = repair_result_payload
-                    apply_result = self._replace_active_apply_result(
-                        apply_result,
-                        self._run_step(
-                            steps,
-                            'apply_repair_staging_after_patch_static_semantics',
-                            'Применить исправленный артефакт в staging workspace после patch_static_semantics',
-                            lambda: self.project_services.apply(
-                                patch_artifact_from_result(final_payload, selected_target),
-                                generated_tests=[],
-                            ),
-                        ),
-                    )
-
-                    patched_target_file_path = apply_result.workspace_path / target_file
-                    patch_static_block = self._run_step(
+                    repair_candidate_apply_payload = self._run_step(
                         steps,
-                        'patch_static_semantics_after_repair',
-                        'Повторно проверить patch статическими семантическими правилами после repair',
-                        lambda: validate_patch_static_semantics(
-                            requested_operation=requested_operation,
-                            change_request=change_request,
-                            target_qualname=selected_target,
-                            original_file_text=original_target_file_path.read_text(encoding='utf-8'),
-                            patched_file_text=patched_target_file_path.read_text(encoding='utf-8'),
-                            changed_files=list(apply_result.impact.changed_files),
-                            target_file=target_file,
-                            insert_scope=insert_scope,
-                            parent_qualname=self._parent_qualname_for_insert_scope(context_pack, insert_scope),
-                            related_symbols=list(context_pack.related_symbols or []),
-                            import_changes=list((final_payload.get('code_artifact') or {}).get('import_changes') or []),
-                            required_contracts=required_contracts,
-                            required_class_members=required_class_members,
-                            model_surfaces=model_surfaces,
-                            project_root=self.project_services.project_root,
+                        'apply_repair_candidate_staging_after_patch_static_semantics',
+                        'Применить repair artifact в отдельный candidate workspace',
+                        lambda: self._try_apply_repair_candidate(
+                            repair_result_payload=repair_result_payload,
+                            selected_target=selected_target,
+                            generated_tests=[],
                         ),
                     )
+                    repair_candidate_apply = repair_candidate_apply_payload.get('apply_result')
+                    if repair_candidate_apply is None:
+                        repair_candidate_gate_block = self._run_step(
+                            steps,
+                            'repair_candidate_gate_after_patch_static_semantics',
+                            'Отклонить repair candidate после неуспешного apply',
+                            lambda: self._build_repair_candidate_gate_block(
+                                stage='apply',
+                                original_blocks=[patch_static_block],
+                                candidate_blocks=[self._repair_candidate_apply_failure_block(repair_candidate_apply_payload)],
+                            ),
+                        )
+                        repair_gate_blocks.append(repair_candidate_gate_block)
+                        warning_message = self._repair_candidate_rejection_warning(repair_candidate_gate_block)
+                        if warning_message not in warnings:
+                            warnings.append(warning_message)
+                        LOGGER.warning(warning_message)
+                    else:
+                        repair_candidate_file_path = repair_candidate_apply.workspace_path / target_file
+                        repair_candidate_patch_static_block = self._run_step(
+                            steps,
+                            'patch_static_semantics_repair_candidate',
+                            'Проверить repair candidate статическими семантическими правилами до принятия',
+                            lambda: validate_patch_static_semantics(
+                                requested_operation=requested_operation,
+                                change_request=change_request,
+                                target_qualname=selected_target,
+                                original_file_text=original_target_file_path.read_text(encoding='utf-8'),
+                                patched_file_text=repair_candidate_file_path.read_text(encoding='utf-8'),
+                                changed_files=list(repair_candidate_apply.impact.changed_files),
+                                target_file=target_file,
+                                insert_scope=insert_scope,
+                                parent_qualname=self._parent_qualname_for_insert_scope(context_pack, insert_scope),
+                                related_symbols=list(context_pack.related_symbols or []),
+                                import_changes=list((repair_result_payload.get('code_artifact') or {}).get('import_changes') or []),
+                                required_contracts=required_contracts,
+                                required_class_members=required_class_members,
+                                model_surfaces=model_surfaces,
+                                project_root=self.project_services.project_root,
+                                project_import_roots=project_import_roots,
+                                known_call_return_types=self.project_services.config.verification_known_call_return_types,
+                            ),
+                        )
+                        repair_candidate_gate_block = self._run_step(
+                            steps,
+                            'repair_candidate_gate_after_patch_static_semantics',
+                            'Решить, можно ли принимать repair candidate после semantic checks',
+                            lambda: self._build_repair_candidate_gate_block(
+                                stage='patch_static_semantics',
+                                original_blocks=[patch_static_block],
+                                candidate_blocks=[repair_candidate_patch_static_block],
+                            ),
+                        )
 
+                        if repair_candidate_gate_block.ok:
+                            final_payload = repair_result_payload
+                            apply_result = self._replace_active_apply_result(
+                                apply_result,
+                                repair_candidate_apply,
+                            )
+                            patched_target_file_path = apply_result.workspace_path / target_file
+                            patch_static_block = repair_candidate_patch_static_block
+                        else:
+                            repair_gate_blocks.append(repair_candidate_gate_block)
+                            self._delete_apply_workspace(repair_candidate_apply)
+                            warning_message = self._repair_candidate_rejection_warning(repair_candidate_gate_block)
+                            if warning_message not in warnings:
+                                warnings.append(warning_message)
+                            LOGGER.warning(warning_message)
                 if not patch_static_block.ok:
                     runtime_blocks = self._run_step(
                         steps,
@@ -679,7 +751,7 @@ class PipelineService:
                         ),
                     )
                     verification_report = build_verification_report(
-                        blocks=[patch_static_block, *runtime_blocks],
+                        blocks=[patch_static_block, *repair_gate_blocks, *runtime_blocks],
                     )
                     merge_plan = self._run_step(
                         steps,
@@ -928,32 +1000,77 @@ class PipelineService:
                         ),
                     )
 
-                    final_payload = repair_result_payload
-                    apply_result = self._replace_active_apply_result(
-                        apply_result,
-                        self._run_step(
-                            steps,
-                            'apply_repair_staging',
-                            'Применить исправленный артефакт в staging workspace',
-                            lambda: self.project_services.apply(
-                                patch_artifact_from_result(final_payload, selected_target),
-                                generated_tests=generated_tests if generated_test_apply and generated_test_apply.get('applied_tests') else [],
-                            ),
-                        ),
-                    )
-                    runtime_blocks = self._run_step(
+                    repair_candidate_apply_payload = self._run_step(
                         steps,
-                        'verification_after_repair',
-                        'Повторно запустить runtime-проверки проекта после repair',
-                        lambda: self._run_runtime_verification_blocks(
-                            apply_result,
-                            generated_test_apply,
+                        'apply_repair_candidate_staging',
+                        'Применить repair artifact в отдельный candidate workspace',
+                        lambda: self._try_apply_repair_candidate(
+                            repair_result_payload=repair_result_payload,
+                            selected_target=selected_target,
+                            generated_tests=generated_tests if generated_test_apply and generated_test_apply.get('applied_tests') else [],
                         ),
                     )
+                    repair_candidate_apply = repair_candidate_apply_payload.get('apply_result')
+                    if repair_candidate_apply is None:
+                        repair_candidate_gate_block = self._run_step(
+                            steps,
+                            'repair_candidate_gate_after_verification',
+                            'Отклонить repair candidate после неуспешного apply',
+                            lambda: self._build_repair_candidate_gate_block(
+                                stage='apply',
+                                original_blocks=list(verification_report.blocks),
+                                candidate_blocks=[self._repair_candidate_apply_failure_block(repair_candidate_apply_payload)],
+                            ),
+                        )
+                        repair_gate_blocks.append(repair_candidate_gate_block)
+                        warning_message = self._repair_candidate_rejection_warning(repair_candidate_gate_block)
+                        if warning_message not in warnings:
+                            warnings.append(warning_message)
+                        LOGGER.warning(warning_message)
+                        verification_report = build_verification_report(
+                            blocks=[*verification_report.blocks, repair_candidate_gate_block],
+                        )
+                    else:
+                        repair_candidate_runtime_blocks = self._run_step(
+                            steps,
+                            'verification_repair_candidate',
+                            'Запустить runtime-проверки repair candidate до принятия',
+                            lambda: self._run_runtime_verification_blocks(
+                                repair_candidate_apply,
+                                generated_test_apply,
+                            ),
+                        )
+                        repair_candidate_report = build_verification_report(
+                            blocks=[patch_static_block, *generated_test_blocks, *repair_candidate_runtime_blocks],
+                        )
+                        repair_candidate_gate_block = self._run_step(
+                            steps,
+                            'repair_candidate_gate_after_verification',
+                            'Решить, можно ли принимать repair candidate после runtime verification',
+                            lambda: self._build_repair_candidate_gate_block(
+                                stage='verification',
+                                original_blocks=list(verification_report.blocks),
+                                candidate_blocks=list(repair_candidate_report.blocks),
+                            ),
+                        )
 
-                    verification_report = build_verification_report(
-                        blocks=[patch_static_block, *generated_test_blocks, *runtime_blocks],
-                    )
+                        if repair_candidate_gate_block.ok:
+                            final_payload = repair_result_payload
+                            apply_result = self._replace_active_apply_result(
+                                apply_result,
+                                repair_candidate_apply,
+                            )
+                            verification_report = repair_candidate_report
+                        else:
+                            repair_gate_blocks.append(repair_candidate_gate_block)
+                            self._delete_apply_workspace(repair_candidate_apply)
+                            warning_message = self._repair_candidate_rejection_warning(repair_candidate_gate_block)
+                            if warning_message not in warnings:
+                                warnings.append(warning_message)
+                            LOGGER.warning(warning_message)
+                            verification_report = build_verification_report(
+                                blocks=[*verification_report.blocks, repair_candidate_gate_block],
+                            )
 
             verification_report = self._reclassify_generated_test_failure_only(
                 verification_report,
@@ -1012,6 +1129,15 @@ class PipelineService:
                         }
                         warnings.append(f'Generated test failure review failed: {review_exc}')
                         LOGGER.warning('Generated test failure review failed: %s', review_exc)
+
+                if generated_test_review is not None:
+                    warning_message = (
+                        'Generated test failure review completed; generated-test auto-repair is disabled, '
+                        'pipeline stops at advisory review.'
+                    )
+                    if warning_message not in warnings:
+                        warnings.append(warning_message)
+                    LOGGER.info(warning_message)
 
             merge_plan = self._run_step(
                 steps,
@@ -1123,6 +1249,114 @@ class PipelineService:
     def _has_code_artifact(self, result_payload: dict[str, Any]) -> bool:
         code_artifact = result_payload.get('code_artifact') or {}
         return bool(str(code_artifact.get('code', '') or '').strip())
+
+    def _try_apply_repair_candidate(
+        self,
+        *,
+        repair_result_payload: dict[str, Any],
+        selected_target: str,
+        generated_tests: list[dict[str, str]],
+    ) -> dict[str, Any]:
+        try:
+            apply_result = self.project_services.apply(
+                patch_artifact_from_result(repair_result_payload, selected_target),
+                generated_tests=generated_tests,
+            )
+            return {'ok': True, 'apply_result': apply_result}
+        except Exception as exc:
+            LOGGER.warning(
+                'Repair candidate apply failed and will be treated as rejected candidate: %s',
+                exc,
+            )
+            return {
+                'ok': False,
+                'error_type': exc.__class__.__name__,
+                'message': str(exc),
+            }
+
+    def _repair_candidate_apply_failure_block(self, payload: dict[str, Any]) -> VerificationBlock:
+        message = str(payload.get('message') or 'repair candidate apply failed')
+        return VerificationBlock(
+            name='repair_candidate_apply',
+            ok=False,
+            severity='error',
+            issues=[
+                VerificationIssue(
+                    code='repair_candidate_apply_failed',
+                    message=message,
+                )
+            ],
+            details={
+                'error_type': payload.get('error_type'),
+                'message': message,
+            },
+        )
+
+    def _build_repair_candidate_gate_block(
+        self,
+        *,
+        stage: str,
+        original_blocks: list[VerificationBlock],
+        candidate_blocks: list[VerificationBlock],
+    ) -> VerificationBlock:
+        failed_candidate_blocks = [block for block in candidate_blocks if not block.ok]
+        if not failed_candidate_blocks:
+            return VerificationBlock(
+                name='repair_candidate_gate',
+                ok=True,
+                severity='info',
+                details={
+                    'stage': stage,
+                    'decision': 'accepted',
+                    'original_issue_codes': self._verification_issue_codes(original_blocks),
+                    'candidate_issue_codes': [],
+                },
+            )
+
+        candidate_issue_codes = self._verification_issue_codes(failed_candidate_blocks)
+        original_issue_codes = self._verification_issue_codes(original_blocks)
+        return VerificationBlock(
+            name='repair_candidate_gate',
+            ok=False,
+            severity='error',
+            issues=[
+                VerificationIssue(
+                    code='repair_candidate_rejected',
+                    message=(
+                        'Repair candidate отклонен: после repair остались или появились blocking issues. '
+                        'Pipeline не применяет repair artifact автоматически.'
+                    ),
+                )
+            ],
+            details={
+                'stage': stage,
+                'decision': 'rejected',
+                'original_issue_codes': original_issue_codes,
+                'candidate_issue_codes': candidate_issue_codes,
+                'candidate_failed_blocks': [block.name for block in failed_candidate_blocks],
+            },
+        )
+
+    def _verification_issue_codes(self, blocks: list[VerificationBlock]) -> list[str]:
+        codes: list[str] = []
+        for block in blocks:
+            if block.ok:
+                continue
+            for issue in block.issues or []:
+                code = str(issue.code or '').strip()
+                if code and code not in codes:
+                    codes.append(code)
+        return codes
+
+    def _repair_candidate_rejection_warning(self, block: VerificationBlock) -> str:
+        details = dict(block.details or {})
+        stage = str(details.get('stage') or 'unknown')
+        candidate_codes = details.get('candidate_issue_codes') or []
+        codes_text = ', '.join(str(item) for item in candidate_codes) or 'unknown'
+        return (
+            f'Repair candidate rejected at {stage}: candidate still has blocking issues: {codes_text}. '
+            'Original artifact/workspace kept for manual review.'
+        )
     
     def _ensure_code_artifact_static_semantics(
         self,
@@ -1481,6 +1715,7 @@ class PipelineService:
             external_code_generation=external_code_generation,
             external_test_generation=external_test_generation,
             repair_generation=repair_generation,
+            generated_test_review=generated_test_review,
             usage_summary=usage_summary,
         )     
         return PipelineRunResult(
@@ -1678,6 +1913,38 @@ class PipelineService:
         except Exception as exc:
             LOGGER.warning('Failed to load JSON file %s: %s', path, exc)
         return {}
+
+
+    def _generated_test_review_payload(self, generated_test_review: dict[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(generated_test_review, dict):
+            return {}
+        review = generated_test_review.get('review')
+        return dict(review) if isinstance(review, dict) else {}
+
+    def _compact_generated_test_review_summary(self, generated_test_review: dict[str, Any] | None) -> dict[str, Any] | None:
+        review = self._generated_test_review_payload(generated_test_review)
+        if not review:
+            return None
+        fields = (
+            'verdict',
+            'confidence',
+            'production_code_quality',
+            'generated_test_quality',
+            'should_keep_production_code',
+            'recommended_action',
+            'recommendation_summary',
+        )
+        summary = {field: review.get(field) for field in fields if field in review}
+        for list_field in (
+            'reasons',
+            'production_risks',
+            'test_issues',
+            'next_steps',
+        ):
+            value = review.get(list_field)
+            if isinstance(value, list):
+                summary[list_field] = value[:5]
+        return summary
 
     def _external_generate_test(
         self,
@@ -2224,6 +2491,7 @@ class PipelineService:
         external_code_generation: ExternalGenerationCall | None,
         external_test_generation: ExternalGenerationCall | None,
         repair_generation: ExternalGenerationCall | None,
+        generated_test_review: dict[str, Any] | None,
         usage_summary: dict[str, Any] | None,
     ) -> PipelineExecutionSummary:
         code_result_summary = (external_code_generation.result_summary if external_code_generation else {}) or {}
@@ -2274,6 +2542,12 @@ class PipelineService:
             code_artifact_summary.get('insert_scope')
             or request_target_summary.get('insert_scope')
         )
+        generated_test_review_summary = self._compact_generated_test_review_summary(generated_test_review)
+        generated_test_review_usage = (
+            (generated_test_review.get('llm_usage') or {})
+            if isinstance(generated_test_review, dict)
+            else None
+        )
 
         return PipelineExecutionSummary(
             status=status,
@@ -2296,6 +2570,8 @@ class PipelineService:
             code_generation_usage=(usage_summary or {}).get('code_generation'),
             test_generation_usage=(usage_summary or {}).get('test_generation'),
             repair_generation_usage=(usage_summary or {}).get('repair_generation'),
+            generated_test_review_usage=generated_test_review_usage,
+            generated_test_review=generated_test_review_summary,
             embedding_usage=(usage_summary or {}).get('embedding'),
             insert_scope=insert_scope,
         )

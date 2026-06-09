@@ -76,7 +76,11 @@ def test_import_changes_unused_import_is_reported() -> None:
         import_changes=[{'action': 'add_from_import', 'module': 're', 'names': ['escape']}],
     )
 
-    assert any(issue.code == 'unused_import_change' for issue in block.issues)
+    unused_issues = [issue for issue in block.issues if issue.code == 'unused_import_change']
+    assert unused_issues
+    assert unused_issues[0].severity == 'warning'
+    assert block.ok is True
+    assert block.severity == 'warning'
     assert 'escape' in block.details['import_changes_usage_check']['unused_imports']
 
 

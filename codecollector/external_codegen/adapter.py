@@ -2468,6 +2468,7 @@ def invoke_generate_test(run_dir: Path, config: AppConfig, request_payload: dict
         stderr_path=str(stderr_path),
     )
 
+
 def build_repair_request(
     change_request: ChangeRequest,
     target_qualname: str,

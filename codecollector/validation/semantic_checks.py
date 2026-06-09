@@ -799,12 +799,13 @@ def _check_unknown_self_attribute_usage(
         if attr in known_attributes or attr in known_methods:
             continue
 
-        is_call = isinstance(getattr(node, "ctx", None), ast.Load) and isinstance(getattr(node, "parent", None), ast.Call)
-        # parent links are not available on the parsed tree, so detect calls with a second pass below.
-        if attr.startswith("_") and attr.lstrip("_") in known_attributes:
-            unknown[(attr, getattr(node, "lineno", None))] = node
-        elif attr in module_level_names:
-            unknown[(attr, getattr(node, "lineno", None))] = node
+        # Any read of an unknown self attribute in generated production code is
+        # unsafe. Earlier versions only reported private/module-level lookalikes,
+        # which allowed invented aliases such as ``self.<dependency_name>`` to pass
+        # until runtime. Do not repair or normalize the generated code here; just
+        # report the contract violation so generation/repair can produce a valid
+        # artifact.
+        unknown[(attr, getattr(node, "lineno", None))] = node
 
     for node in ast.walk(scan_tree):
         if not isinstance(node, ast.Call):
@@ -1201,6 +1202,169 @@ def _visible_self_call_path_types(
     return result
 
 
+def _visible_self_dependency_method_surface(owner_tree: ast.AST | None, parent_class_name: str) -> dict[str, set[str]]:
+    """Return method names already used on self dependency paths in visible class code."""
+    class_node = _class_node(owner_tree, parent_class_name)
+    if class_node is None:
+        return {}
+
+    result: dict[str, set[str]] = {}
+    for node in ast.walk(class_node):
+        if not isinstance(node, ast.Call):
+            continue
+        match = _self_dependency_method_call(node.func)
+        if match is None:
+            continue
+        access_path, method_name = match
+        if access_path.count(".") < 1 or not method_name:
+            continue
+        result.setdefault(access_path, set()).add(method_name)
+    return result
+
+
+def _self_attribute_access_path(expr: ast.AST) -> str:
+    parts: list[str] = []
+    cursor = expr
+    while isinstance(cursor, ast.Attribute):
+        parts.append(cursor.attr)
+        cursor = cursor.value
+    if isinstance(cursor, ast.Name) and cursor.id == "self" and parts:
+        return "self." + ".".join(reversed(parts))
+    return ""
+
+
+def _visible_self_dependency_attribute_surface(owner_tree: ast.AST | None, parent_class_name: str) -> dict[str, set[str]]:
+    """Return non-call attribute names already used on self dependency paths in visible class code."""
+    class_node = _class_node(owner_tree, parent_class_name)
+    if class_node is None:
+        return {}
+
+    called_attribute_ids = {
+        id(node.func)
+        for node in ast.walk(class_node)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    result: dict[str, set[str]] = {}
+    for node in ast.walk(class_node):
+        if not isinstance(node, ast.Attribute) or id(node) in called_attribute_ids:
+            continue
+        access_path = _self_attribute_access_path(node)
+        parts = access_path.split(".") if access_path else []
+        if len(parts) < 3 or parts[0] != "self":
+            continue
+        parent_path = ".".join(parts[:-1])
+        result.setdefault(parent_path, set()).add(parts[-1])
+    return result
+
+
+def _check_unknown_injected_dependency_attributes(
+    *,
+    owner_tree: ast.AST,
+    scan_tree: ast.AST | None,
+    related_symbols: list[Any] | None,
+    target_file: str,
+    target_qualname: str,
+    parent_qualname: str | None,
+) -> tuple[list[VerificationIssue], dict[str, Any]]:
+    """Block invented field/property reads on visible injected dependencies.
+
+    The check is structural: if a generated method reads self.<dependency>.<field>
+    and the dependency type is visible, the field must be visible either in the
+    related class surface or in existing class usage. Method calls are handled by
+    the dedicated dependency-method check and are skipped here.
+    """
+    if scan_tree is None:
+        return [], {"checked_attributes": [], "skipped_attributes": []}
+
+    parent_class_name = _class_name_from_qualname(parent_qualname or target_qualname.rsplit(".", 1)[0])
+    injected_types = _self_attribute_type_map(owner_tree, parent_class_name)
+    field_types_by_class = _related_class_field_type_map(related_symbols)
+    visible_attributes = _visible_self_dependency_attribute_surface(owner_tree, parent_class_name)
+    known_methods_by_type = _related_method_names_by_parent_type(related_symbols)
+
+    called_attribute_ids = {
+        id(node.func)
+        for node in ast.walk(scan_tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    issues: list[VerificationIssue] = []
+    checked: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, int | None]] = set()
+
+    for node in ast.walk(scan_tree):
+        if not isinstance(node, ast.Attribute) or id(node) in called_attribute_ids:
+            continue
+        access_path = _self_attribute_access_path(node)
+        parts = access_path.split(".") if access_path else []
+        if len(parts) != 3 or parts[0] != "self":
+            continue
+
+        dependency_attr = parts[1]
+        field_name = parts[2]
+        dependency_type = injected_types.get(dependency_attr, "")
+        if not dependency_type:
+            skipped.append(
+                {
+                    "attribute_path": access_path,
+                    "reason": "unknown_dependency_type",
+                    "line": getattr(node, "lineno", None),
+                }
+            )
+            continue
+
+        visible_field_names = set((field_types_by_class.get(dependency_type) or {}).keys())
+        visible_field_names.update(visible_attributes.get(f"self.{dependency_attr}", set()))
+        known_method_names = known_methods_by_type.get(dependency_type, set())
+        if not visible_field_names and not known_method_names:
+            skipped.append(
+                {
+                    "attribute_path": access_path,
+                    "reason": "no_visible_attribute_or_method_surface_for_dependency_type",
+                    "dependency_type": dependency_type,
+                    "line": getattr(node, "lineno", None),
+                }
+            )
+            continue
+
+        record = {
+            "attribute_path": access_path,
+            "dependency": f"self.{dependency_attr}",
+            "dependency_type": dependency_type,
+            "attribute": field_name,
+            "visible_fields": sorted(visible_field_names),
+            "known_methods": sorted(known_method_names),
+            "line": getattr(node, "lineno", None),
+        }
+        checked.append(record)
+        key = (access_path, dependency_type, getattr(node, "lineno", None))
+        if field_name not in visible_field_names and key not in seen:
+            seen.add(key)
+            issues.append(
+                VerificationIssue(
+                    code="unknown_injected_dependency_attribute",
+                    message=(
+                        f"В сгенерированном коде используется атрибут `{access_path}` у зависимости "
+                        f"self.{dependency_attr} типа {dependency_type}, но такой атрибут не найден "
+                        "в видимом проектном контексте. Для repair: используй только видимые поля "
+                        "или методы зависимости; не придумывай новые атрибуты объекта зависимости."
+                    ),
+                    severity="error",
+                    file_path=target_file,
+                    symbol=target_qualname,
+                )
+            )
+
+    return issues, {
+        "injected_attribute_types": injected_types,
+        "field_types_by_class": field_types_by_class,
+        "visible_attributes_by_path": {key: sorted(value) for key, value in visible_attributes.items()},
+        "known_methods_by_type": {key: sorted(value) for key, value in known_methods_by_type.items()},
+        "checked_attributes": checked,
+        "skipped_attributes": skipped,
+    }
+
+
 def _check_unknown_injected_dependency_methods(
     *,
     owner_tree: ast.AST,
@@ -1217,6 +1381,7 @@ def _check_unknown_injected_dependency_methods(
     injected_types = _self_attribute_type_map(owner_tree, parent_class_name)
     visible_path_types = _visible_self_call_path_types(owner_tree, related_symbols)
     known_methods_by_type = _related_method_names_by_parent_type(related_symbols)
+    visible_methods_by_path = _visible_self_dependency_method_surface(owner_tree, parent_class_name)
 
     issues: list[VerificationIssue] = []
     checked_calls: list[dict[str, Any]] = []
@@ -1270,12 +1435,14 @@ def _check_unknown_injected_dependency_methods(
                 )
             continue
 
-        known_methods = known_methods_by_type.get(attr_type, set())
-        if not known_methods:
+        known_methods = set(known_methods_by_type.get(attr_type, set()))
+        visible_methods = set(visible_methods_by_path.get(access_path, set()))
+        allowed_methods = known_methods | visible_methods
+        if not allowed_methods:
             skipped_calls.append(
                 {
                     "call": _call_display_name(node.func),
-                    "reason": "no_known_methods_for_injected_type",
+                    "reason": "no_known_methods_for_injected_type_or_visible_path",
                     "access_path": access_path,
                     "injected_type": attr_type,
                     "line": getattr(node, "lineno", None),
@@ -1291,10 +1458,12 @@ def _check_unknown_injected_dependency_methods(
             "injected_type": attr_type,
             "method": method_name,
             "known_methods": sorted(known_methods),
+            "visible_methods": sorted(visible_methods),
+            "allowed_methods": sorted(allowed_methods),
         }
         checked_calls.append(checked)
 
-        if method_name not in known_methods:
+        if method_name not in allowed_methods:
             issues.append(
                 VerificationIssue(
                     code="unknown_injected_dependency_method",
@@ -1315,6 +1484,7 @@ def _check_unknown_injected_dependency_methods(
         "injected_attribute_types": injected_types,
         "visible_path_types": visible_path_types,
         "known_methods_by_type": {key: sorted(value) for key, value in known_methods_by_type.items()},
+        "visible_methods_by_path": {key: sorted(value) for key, value in visible_methods_by_path.items()},
         "checked_calls": checked_calls,
         "skipped_calls": skipped_calls,
     }
@@ -2942,9 +3112,8 @@ def _check_import_changes_usage(
 
     import_changes are part of the generated artifact contract. If the model asks
     codecollector to add a file-level import, the generated symbol should use the
-    imported name. An unused add-import is usually a non-fatal apply-plan issue:
-    codecollector may ignore it during apply and report a warning instead of
-    sending the artifact to repair.
+    imported name. Otherwise the artifact is internally inconsistent and should
+    be repaired instead of leaving dead imports in the target file.
     """
     added_names = _import_change_added_names(import_changes)
     if scan_tree is None or not added_names:
@@ -2971,8 +3140,8 @@ def _check_import_changes_usage(
                     code="unused_import_change",
                     message=(
                         f"import_changes добавляет импорт `{name}`, но generated symbol не использует это имя. "
-                        "Такой add-import будет проигнорирован при применении; repair не требуется, "
-                        "если нет других ошибок import_changes или runtime-name."
+                        "Это advisory issue: лишний допустимый import_change не должен блокировать применение patch/repair, "
+                        "но его стоит убрать при следующей доработке artifact."
                     ),
                     severity="warning",
                     file_path=target_file,
@@ -3037,6 +3206,18 @@ def _is_stdlib_module(module_name: str) -> bool:
     return root in stdlib_names
 
 
+def _import_root_name(module_name: str) -> str:
+    return str(module_name or '').strip().split('.', 1)[0].strip()
+
+
+def _normalized_import_roots(import_roots: list[str] | tuple[str, ...] | set[str] | None) -> set[str]:
+    return {
+        root
+        for item in (import_roots or [])
+        if (root := _import_root_name(str(item)))
+    }
+
+
 def _stdlib_missing_from_import_names(module_name: str, names: list[str]) -> list[str]:
     if not names:
         return []
@@ -3094,10 +3275,12 @@ def _check_import_changes_resolvable(
     target_file: str,
     target_qualname: str,
     original_file_text: str = "",
+    project_import_roots: list[str] | tuple[str, ...] | set[str] | None = None,
 ) -> tuple[list[VerificationIssue], dict[str, Any]]:
     if project_root is None:
         return [], {'checked': [], 'unresolved': [], 'skipped': True, 'reason': 'project_root_not_provided'}
 
+    allowed_project_import_roots = _normalized_import_roots(project_import_roots)
     issues: list[VerificationIssue] = []
     checked: list[dict[str, Any]] = []
     unresolved: list[dict[str, Any]] = []
@@ -3139,12 +3322,29 @@ def _check_import_changes_resolvable(
             continue
         module_file = _module_file_for_import_change(project_root, module_name)
         is_stdlib = _is_stdlib_module(module_name)
+        import_root = _import_root_name(module_name)
+        allowed_external_root = bool(import_root and import_root in allowed_project_import_roots)
         record = {
             'action': action,
             'module': module_name,
             'module_file': str(module_file) if module_file else '',
             'is_stdlib': is_stdlib,
+            'import_root': import_root,
+            'allowed_external_root': allowed_external_root,
         }
+        if module_file is None and not is_stdlib and allowed_external_root:
+            record['reason'] = 'allowed_external_root_seen_in_project_index'
+            record['name_check_skipped'] = action == 'add_from_import'
+            if action == 'add_from_import':
+                record['requested_names'] = [
+                    str(name).split(' as ')[0].strip()
+                    for name in (change.get('names') or [])
+                    if str(name).strip()
+                ]
+                record['exported_names'] = []
+                record['missing_names'] = []
+            checked.append(record)
+            continue
         if module_file is None and not is_stdlib:
             record['reason'] = 'module_not_found'
             unresolved.append(record)
@@ -3153,9 +3353,10 @@ def _check_import_changes_resolvable(
                     code='unresolved_import_change_module',
                     message=(
                         f"import_changes добавляет импорт из модуля `{module_name}`, но такой проектный модуль "
-                        "не найден относительно project root и это не модуль стандартной библиотеки. Для repair: "
-                        "используй подтвержденный путь импорта из contract context, related symbols, full file source "
-                        "или модуль стандартной библиотеки."
+                        "не найден относительно project root, это не модуль стандартной библиотеки и root import "
+                        "не встречается в индексированных imports проекта. Для repair: используй подтвержденный "
+                        "путь импорта из contract context, related symbols, full file source, существующий import root "
+                        "проекта или модуль стандартной библиотеки."
                     ),
                     severity='error',
                     file_path=target_file,
@@ -3195,7 +3396,12 @@ def _check_import_changes_resolvable(
                 )
         checked.append(record)
 
-    return issues, {'checked': checked, 'unresolved': unresolved, 'skipped': False}
+    return issues, {
+        'checked': checked,
+        'unresolved': unresolved,
+        'skipped': False,
+        'project_import_roots': sorted(allowed_project_import_roots),
+    }
 
 
 def _contract_call_spec_matches_call(func: ast.expr, spec: dict[str, Any]) -> bool:
@@ -3426,6 +3632,41 @@ def _normalized_type_name(value: str) -> str:
     return aliases.get(value, value)
 
 
+def _call_return_type_spec(func: ast.expr, known_call_return_types: dict[str, Any] | None) -> dict[str, Any]:
+    """Return declarative return-type metadata for a call expression."""
+    if not known_call_return_types:
+        return {}
+    display = _call_display_name(func)
+    candidates = [display]
+    if isinstance(func, ast.Attribute):
+        candidates.append(func.attr)
+    elif isinstance(func, ast.Name):
+        candidates.append(func.id)
+    for candidate in candidates:
+        raw = known_call_return_types.get(candidate)
+        if raw is None:
+            continue
+        if isinstance(raw, str):
+            return {"return": raw}
+        if isinstance(raw, dict):
+            return dict(raw)
+    return {}
+
+
+def _call_return_type(func: ast.expr, known_call_return_types: dict[str, Any] | None) -> str:
+    spec = _call_return_type_spec(func, known_call_return_types)
+    value = spec.get("return") or spec.get("type")
+    return str(value or "").strip()
+
+
+def _call_tuple_item_types(func: ast.expr, known_call_return_types: dict[str, Any] | None) -> list[str]:
+    spec = _call_return_type_spec(func, known_call_return_types)
+    raw_items = spec.get("tuple_items") or spec.get("items") or []
+    if not isinstance(raw_items, list):
+        return []
+    return [str(item).strip() for item in raw_items]
+
+
 def _types_are_compatible(*, expected: str, actual: str) -> bool:
     expected_norm = _normalized_type_name(expected)
     actual_norm = _normalized_type_name(actual)
@@ -3464,6 +3705,7 @@ def _infer_expr_type_for_contract_call(
     local_types: dict[str, str],
     field_types_by_class: dict[str, dict[str, str]],
     self_attribute_types: dict[str, str],
+    known_call_return_types: dict[str, Any] | None = None,
 ) -> str:
     if isinstance(expr, ast.Constant):
         if expr.value is None:
@@ -3485,12 +3727,14 @@ def _infer_expr_type_for_contract_call(
             local_types=local_types,
             field_types_by_class=field_types_by_class,
             self_attribute_types=self_attribute_types,
+            known_call_return_types=known_call_return_types,
         )
         else_type = _infer_expr_type_for_contract_call(
             expr.orelse,
             local_types=local_types,
             field_types_by_class=field_types_by_class,
             self_attribute_types=self_attribute_types,
+            known_call_return_types=known_call_return_types,
         )
         if body_type and body_type != "None":
             return body_type
@@ -3500,6 +3744,9 @@ def _infer_expr_type_for_contract_call(
     if isinstance(expr, ast.Name):
         return local_types.get(expr.id, "")
     if isinstance(expr, ast.Call):
+        configured_return_type = _call_return_type(expr.func, known_call_return_types)
+        if configured_return_type:
+            return configured_return_type
         if isinstance(expr.func, ast.Attribute):
             if expr.func.attr == "strftime":
                 return "str"
@@ -3535,6 +3782,7 @@ def _infer_expr_type_for_contract_call(
                 local_types=local_types,
                 field_types_by_class=field_types_by_class,
                 self_attribute_types=self_attribute_types,
+                known_call_return_types=known_call_return_types,
             )
             if owner_type:
                 return (field_types_by_class.get(owner_type) or {}).get(expr.attr, "")
@@ -3547,6 +3795,7 @@ def _infer_function_local_value_types(
     related_symbols: list[Any] | None,
     self_attribute_types: dict[str, str],
     same_class_method_return_types: dict[str, str] | None = None,
+    known_call_return_types: dict[str, Any] | None = None,
 ) -> dict[str, str]:
     field_types_by_class = _related_class_field_type_map(related_symbols)
     local_types: dict[str, str] = {}
@@ -3566,16 +3815,26 @@ def _infer_function_local_value_types(
             local_types=local_types,
             field_types_by_class=field_types_by_class,
             self_attribute_types=self_attribute_types,
+            known_call_return_types=known_call_return_types,
         )
 
     for node in ast.walk(function_node):
         if isinstance(node, ast.Assign):
+            tuple_item_types: list[str] = []
+            if isinstance(node.value, ast.Call):
+                tuple_item_types = _call_tuple_item_types(node.value.func, known_call_return_types)
             value_type = infer(node.value)
-            if not value_type:
+            if not value_type and not tuple_item_types:
                 continue
             for target in node.targets:
-                if isinstance(target, ast.Name):
+                if isinstance(target, ast.Name) and value_type:
                     local_types[target.id] = value_type
+                elif isinstance(target, (ast.Tuple, ast.List)) and tuple_item_types:
+                    for index, element in enumerate(target.elts):
+                        if index >= len(tuple_item_types):
+                            break
+                        if isinstance(element, ast.Name) and tuple_item_types[index]:
+                            local_types[element.id] = tuple_item_types[index]
         elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
             type_name = _annotation_name(node.annotation).rsplit(".", 1)[-1] or infer(node.value) if node.value else ""
             if type_name:
@@ -3592,6 +3851,7 @@ def _check_contract_call_signatures(
     target_qualname: str,
     import_changes: list[dict[str, Any]] | None = None,
     change_request: ChangeRequest | None = None,
+    known_call_return_types: dict[str, Any] | None = None,
 ) -> tuple[list[VerificationIssue], dict[str, Any]]:
     available_names = _known_imported_names(tree, import_changes)
     specs_by_name = _contract_call_specs(related_symbols, available_names=available_names)
@@ -3624,6 +3884,7 @@ def _check_contract_call_signatures(
                 related_symbols=related_symbols,
                 self_attribute_types=self_attribute_types,
                 same_class_method_return_types=same_class_method_return_types,
+                known_call_return_types=known_call_return_types,
             )
             if isinstance(function_node, (ast.FunctionDef, ast.AsyncFunctionDef))
             else {}
@@ -3685,6 +3946,7 @@ def _check_contract_call_signatures(
                         local_types=local_types,
                         field_types_by_class=field_types_by_class,
                         self_attribute_types=self_attribute_types,
+                        known_call_return_types=known_call_return_types,
                     )
                     if expected_type and actual_type and not _types_are_compatible(expected=expected_type, actual=actual_type):
                         argument_type_mismatches.append(
@@ -5039,6 +5301,8 @@ def validate_patch_static_semantics(
     required_class_members: list[dict[str, Any]] | None = None,
     model_surfaces: list[dict[str, Any]] | None = None,
     project_root: Path | None = None,
+    project_import_roots: list[str] | tuple[str, ...] | set[str] | None = None,
+    known_call_return_types: dict[str, Any] | None = None,
 ) -> VerificationBlock:
     issues: list[VerificationIssue] = []
 
@@ -5311,6 +5575,7 @@ def validate_patch_static_semantics(
         target_file=target_file,
         target_qualname=target_qualname,
         original_file_text=original_file_text,
+        project_import_roots=project_import_roots,
     )
     issues.extend(import_change_resolve_issues)
 
@@ -5341,11 +5606,12 @@ def validate_patch_static_semantics(
         target_qualname=target_qualname,
         import_changes=import_changes,
         change_request=change_request,
+        known_call_return_types=known_call_return_types,
     )
     issues.extend(contract_issues)
 
     injected_method_issues, injected_method_details = _check_unknown_injected_dependency_methods(
-        owner_tree=after_tree,
+        owner_tree=before_tree,
         scan_tree=contract_scan_tree,
         related_symbols=related_symbols,
         target_file=target_file,
@@ -5354,8 +5620,18 @@ def validate_patch_static_semantics(
     )
     issues.extend(injected_method_issues)
 
+    injected_attribute_issues, injected_attribute_details = _check_unknown_injected_dependency_attributes(
+        owner_tree=before_tree,
+        scan_tree=contract_scan_tree,
+        related_symbols=related_symbols,
+        target_file=target_file,
+        target_qualname=target_qualname,
+        parent_qualname=parent_qualname,
+    )
+    issues.extend(injected_attribute_issues)
+
     self_attribute_issues, self_attribute_details = _check_unknown_self_attribute_usage(
-        owner_tree=after_tree,
+        owner_tree=before_tree,
         scan_tree=contract_scan_tree,
         target_file=target_file,
         target_qualname=target_qualname,
@@ -5462,12 +5738,12 @@ def validate_patch_static_semantics(
             )
         )
 
-    error_issues = [issue for issue in issues if issue.severity == "error"]
+    blocking_issues = [issue for issue in issues if issue.severity == "error"]
 
     return VerificationBlock(
         name="patch_static_semantics",
-        ok=not error_issues,
-        severity="error" if error_issues else ("warning" if issues else "info"),
+        ok=not blocking_issues,
+        severity="error" if blocking_issues else ("warning" if issues else "info"),
         issues=issues,
         details={
             "requested_operation": requested_operation,
@@ -5478,6 +5754,7 @@ def validate_patch_static_semantics(
             "new_symbols": new_symbols,
             "contract_call_signature_check": contract_details,
             "injected_dependency_method_check": injected_method_details,
+            "injected_dependency_attribute_check": injected_attribute_details,
             "self_attribute_usage_check": self_attribute_details,
             "self_method_call_signature_check": self_method_signature_details,
             "visible_type_operator_check": incompatible_operator_details,
@@ -6520,6 +6797,7 @@ def build_verification_report(
         "runtime_pytest_recommended",
         "runtime_pytest_full",
         "apply_generated_artifact",
+        "repair_candidate_gate",
     }
     generated_test_block_names = {
         "generated_test_static_semantics",

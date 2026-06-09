@@ -2730,3 +2730,75 @@ def test_generation_request_includes_guarded_imports_in_available_imports(tmp_pa
         and item['source'] == 'from optional_pkg.widgets import Widget'
         for item in available
     )
+
+
+def test_patch_static_semantics_allows_external_import_root_seen_in_project_index(tmp_path: Path) -> None:
+    original = 'class Window:\n    def open_note(self):\n        raise NotImplementedError()\n'
+    patched = (
+        'from PyQt5.QtWidgets import QFileDialog\n\n'
+        'class Window:\n'
+        '    def open_note(self):\n'
+        '        file_name, _ = QFileDialog.getOpenFileName(self, "Open", "", "Notes (*.note)")\n'
+        '        return file_name\n'
+    )
+
+    block = validate_patch_static_semantics(
+        requested_operation='replace_symbol',
+        change_request=ChangeRequest(title='Открыть заметку', description='Выбрать файл .note', project='demo'),
+        target_qualname='app.window.Window.open_note',
+        original_file_text=original,
+        patched_file_text=patched,
+        changed_files=['app/window.py'],
+        target_file='app/window.py',
+        parent_qualname='app.window.Window',
+        import_changes=[
+            {
+                'action': 'add_from_import',
+                'module': 'PyQt5.QtWidgets',
+                'names': ['QFileDialog'],
+            }
+        ],
+        project_root=tmp_path,
+        project_import_roots=['PyQt5'],
+    )
+
+    assert block.ok, [issue.code for issue in block.issues]
+    details = block.details['import_changes_resolvable_check']
+    checked = details['checked'][0]
+    assert checked['allowed_external_root'] is True
+    assert checked['reason'] == 'allowed_external_root_seen_in_project_index'
+    assert checked['name_check_skipped'] is True
+
+
+def test_patch_static_semantics_rejects_new_external_import_root_not_seen_in_project_index(tmp_path: Path) -> None:
+    original = 'class Window:\n    def open_note(self):\n        raise NotImplementedError()\n'
+    patched = (
+        'from PyQt5.QtWidgets import QFileDialog\n\n'
+        'class Window:\n'
+        '    def open_note(self):\n'
+        '        file_name, _ = QFileDialog.getOpenFileName(self, "Open", "", "Notes (*.note)")\n'
+        '        return file_name\n'
+    )
+
+    block = validate_patch_static_semantics(
+        requested_operation='replace_symbol',
+        change_request=ChangeRequest(title='Открыть заметку', description='Выбрать файл .note', project='demo'),
+        target_qualname='app.window.Window.open_note',
+        original_file_text=original,
+        patched_file_text=patched,
+        changed_files=['app/window.py'],
+        target_file='app/window.py',
+        parent_qualname='app.window.Window',
+        import_changes=[
+            {
+                'action': 'add_from_import',
+                'module': 'PyQt5.QtWidgets',
+                'names': ['QFileDialog'],
+            }
+        ],
+        project_root=tmp_path,
+        project_import_roots=[],
+    )
+
+    assert not block.ok
+    assert any(issue.code == 'unresolved_import_change_module' for issue in block.issues)
