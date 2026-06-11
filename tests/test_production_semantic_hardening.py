@@ -214,3 +214,43 @@ def test_patch_static_semantics_rejects_unknown_self_dependency_alias_read() -> 
     assert any(issue.code == 'unknown_self_attribute' for issue in block.issues)
     details = block.details['self_attribute_usage_check']
     assert any(item['attribute'] == 'repository_alias' for item in details['unknown_attributes'])
+
+
+def test_patch_static_semantics_rejects_unknown_self_attribute_assignment() -> None:
+    original = (
+        'class Window:\n'
+        '    def __init__(self) -> None:\n'
+        '        self.note = None\n'
+        '        self.is_modified = True\n'
+        '    def open_item(self):\n'
+        '        raise NotImplementedError()\n'
+    )
+    patched = original.replace(
+        '    def open_item(self):\n'
+        '        raise NotImplementedError()\n',
+        '    def open_item(self):\n'
+        '        self.current_note = object()\n'
+        '        self.changes_saved = True\n',
+    )
+
+    block = validate_patch_static_semantics(
+        requested_operation='replace_symbol',
+        change_request=_change_request(),
+        target_qualname='demo.window.Window.open_item',
+        original_file_text=original,
+        patched_file_text=patched,
+        changed_files=['demo/window.py'],
+        target_file='demo/window.py',
+        insert_scope='class_body',
+        parent_qualname='demo.window.Window',
+    )
+
+    assert not block.ok
+    assert any(issue.code == 'unknown_self_attribute_assignment' for issue in block.issues)
+    messages = '\n'.join(issue.message for issue in block.issues)
+    assert 'current_note' in messages
+    assert 'changes_saved' in messages
+    assert 'Generated production code uses' not in messages
+    details = block.details['self_attribute_usage_check']
+    unknown_writes = {item['attribute'] for item in details['unknown_writes']}
+    assert {'current_note', 'changes_saved'} <= unknown_writes

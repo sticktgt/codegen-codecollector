@@ -777,6 +777,7 @@ class PipelineService:
                         generated_test_review=generated_test_review,
                         apply_result=apply_result,
                         merge_plan=merge_plan,
+                        final_payload=final_payload,
                         steps=steps,
                         warnings=warnings,
                     )
@@ -1164,6 +1165,7 @@ class PipelineService:
                 generated_test_review=generated_test_review,
                 apply_result=apply_result,
                 merge_plan=merge_plan,
+                final_payload=final_payload,
                 steps=steps,
                 warnings=warnings,
             )
@@ -1691,6 +1693,7 @@ class PipelineService:
         generated_test_review: dict[str, Any] | None = None,
         apply_result: ApplyResult | None = None,
         merge_plan: MergePlan | None = None,
+        final_payload: dict[str, Any] | None = None,
         warnings: list[str] | None = None,
     ) -> PipelineRunResult:
         usage_summary = self._build_usage_summary(
@@ -1717,6 +1720,7 @@ class PipelineService:
             repair_generation=repair_generation,
             generated_test_review=generated_test_review,
             usage_summary=usage_summary,
+            final_payload=final_payload,
         )     
         return PipelineRunResult(
             run_id=run_id,
@@ -2493,9 +2497,23 @@ class PipelineService:
         repair_generation: ExternalGenerationCall | None,
         generated_test_review: dict[str, Any] | None,
         usage_summary: dict[str, Any] | None,
+        final_payload: dict[str, Any] | None = None,
     ) -> PipelineExecutionSummary:
         code_result_summary = (external_code_generation.result_summary if external_code_generation else {}) or {}
         code_artifact_summary = (code_result_summary.get('code_artifact_summary') or {}) if isinstance(code_result_summary, dict) else {}
+        final_code_artifact = (final_payload or {}).get('code_artifact') if isinstance(final_payload, dict) else None
+        if isinstance(final_code_artifact, dict) and final_code_artifact:
+            code_artifact_summary = {
+                'operation': final_code_artifact.get('operation'),
+                'target_qualname': final_code_artifact.get('target_qualname'),
+                'target_file': final_code_artifact.get('target_file'),
+                'insert_after': final_code_artifact.get('insert_after'),
+                'insert_scope': final_code_artifact.get('insert_scope'),
+                'expected_new_symbol_kind': final_code_artifact.get('expected_new_symbol_kind'),
+                'parent_qualname': final_code_artifact.get('parent_qualname'),
+                'import_changes_count': len(final_code_artifact.get('import_changes') or []),
+                'code_chars': len(str(final_code_artifact.get('code') or '')),
+            }
         final_operation = code_artifact_summary.get('operation') or requested_operation
 
         changed_files = []

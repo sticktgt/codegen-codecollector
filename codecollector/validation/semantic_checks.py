@@ -119,6 +119,144 @@ def _find_pytest_mock_usage(tree: ast.AST) -> list[dict[str, Any]]:
     return result
 
 
+
+_BUILTIN_PYTEST_FIXTURES: set[str] = {
+    "cache",
+    "capfd",
+    "capfdbinary",
+    "caplog",
+    "capsys",
+    "capsysbinary",
+    "capsysbinary",
+    "capteesys",
+    "doctest_namespace",
+    "monkeypatch",
+    "pytestconfig",
+    "record_property",
+    "record_testsuite_property",
+    "record_xml_attribute",
+    "recwarn",
+    "tmp_path",
+    "tmp_path_factory",
+    "tmpdir",
+    "tmpdir_factory",
+}
+
+
+def _generated_test_local_fixture_names(tree: ast.AST) -> set[str]:
+    result: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for decorator in node.decorator_list:
+            func = decorator.func if isinstance(decorator, ast.Call) else decorator
+            if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+                if func.value.id == "pytest" and func.attr == "fixture":
+                    result.add(node.name)
+            elif isinstance(func, ast.Name) and func.id == "fixture":
+                result.add(node.name)
+    return result
+
+
+def _check_generated_test_pytest_fixtures(
+    *,
+    tree: ast.AST,
+    test_file_path: Path,
+    allowed_external_pytest_fixtures: list[str] | tuple[str, ...] | set[str] | None = None,
+) -> tuple[list[VerificationIssue], dict[str, Any]]:
+    allowed = set(_BUILTIN_PYTEST_FIXTURES)
+    allowed.update(str(item) for item in (allowed_external_pytest_fixtures or []) if str(item or "").strip())
+    local_fixtures = _generated_test_local_fixture_names(tree)
+    allowed.update(local_fixtures)
+    issues: list[VerificationIssue] = []
+    checked: list[dict[str, Any]] = []
+
+    parent_by_node: dict[ast.AST, ast.AST] = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parent_by_node[child] = parent
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or not node.name.startswith("test_"):
+            continue
+        is_test_method = isinstance(parent_by_node.get(node), ast.ClassDef)
+        positional_args = [*node.args.posonlyargs, *node.args.args]
+        for arg_index, arg in enumerate([*positional_args, *node.args.kwonlyargs]):
+            name = arg.arg
+            ignored_reason = None
+            if is_test_method and arg_index == 0 and name in {"self", "cls"}:
+                ignored_reason = "pytest_test_method_receiver"
+            checked_item = {"test": node.name, "fixture": name, "line": getattr(arg, "lineno", None)}
+            if ignored_reason is not None:
+                checked_item["ignored_reason"] = ignored_reason
+            checked.append(checked_item)
+            if ignored_reason is not None or name in allowed:
+                continue
+            issues.append(
+                VerificationIssue(
+                    code="generated_test_uses_unapproved_external_pytest_fixture",
+                    message=(
+                        f"Generated test использует pytest fixture `{name}`, но она не является встроенной "
+                        "fixture pytest и не определена в тестовом файле. Для generated test используй "
+                        "обычные встроенные fixtures вроде monkeypatch/tmp_path или локальный fake/stub."
+                    ),
+                    file_path=str(test_file_path),
+                    symbol=name,
+                )
+            )
+    return issues, {
+        "allowed_fixtures": sorted(allowed),
+        "local_fixtures": sorted(local_fixtures),
+        "checked_fixtures": checked,
+    }
+
+
+def _check_generated_test_target_parent_instantiation(
+    *,
+    tree: ast.AST,
+    target_qualname: str,
+    requested_operation: str,
+    test_file_path: Path,
+    forbid_parent_instance_for_method_targets: bool = True,
+) -> tuple[list[VerificationIssue], dict[str, Any]]:
+    details: dict[str, Any] = {
+        "forbid_parent_instance_for_method_targets": forbid_parent_instance_for_method_targets,
+        "target_qualname": target_qualname,
+        "requested_operation": requested_operation,
+        "target_parent_class": "",
+        "instantiations": [],
+    }
+    if not forbid_parent_instance_for_method_targets or requested_operation != "replace_symbol":
+        return [], details
+    parts = [part for part in str(target_qualname or "").split(".") if part]
+    if len(parts) < 2:
+        return [], details
+    method_name = parts[-1]
+    parent_class = parts[-2]
+    if not method_name or method_name[:1].isupper() or not parent_class[:1].isupper():
+        return [], details
+    details["target_parent_class"] = parent_class
+    issues: list[VerificationIssue] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Name) and node.func.id == parent_class:
+            record = {"class_name": parent_class, "line": getattr(node, "lineno", None)}
+            details["instantiations"].append(record)
+            issues.append(
+                VerificationIssue(
+                    code="generated_test_instantiates_target_parent_class",
+                    message=(
+                        f"Generated test создает реальный экземпляр `{parent_class}()` для method-target. "
+                        "Для unit-level generated test используй локальный fake/stub self и unbound-вызов target method, "
+                        "если реальный конструктор явно не нужен и не подтвержден контекстом."
+                    ),
+                    file_path=str(test_file_path),
+                    symbol=parent_class,
+                )
+            )
+    return issues, details
+
 def find_duplicate_symbol_definitions(source: str, module_name: str, file_path: str) -> list[dict[str, Any]]:
     """Return duplicate top-level/class symbol definitions in a Python source file.
 
@@ -503,9 +641,9 @@ def _check_unresolved_annotation_names(
             VerificationIssue(
                 code="unknown_annotation_name",
                 message=(
-                    f"Generated production code uses `{name}` in annotation or class-level expression, "
-                    f"but this name is not imported or defined in target module. "
-                    "For repair: add the required import or use an already available built-in annotation."
+                    f"В annotation или class-level expression используется `{name}`, но это имя "
+                    "не импортировано и не определено в целевом модуле. "
+                    "Для repair: добавь нужный import или используй уже доступную built-in annotation."
                 ),
                 severity="error",
                 file_path=target_file,
@@ -746,8 +884,10 @@ def _check_unknown_self_attribute_usage(
     module_level_names = _module_level_names(owner_tree)
     checked: list[dict[str, Any]] = []
     checked_methods: list[dict[str, Any]] = []
+    checked_writes: list[dict[str, Any]] = []
     unknown: dict[tuple[str, int | None], ast.Attribute] = {}
     unknown_methods: dict[tuple[str, int | None], ast.Attribute] = {}
+    unknown_writes: dict[tuple[str, int | None], ast.Attribute] = {}
 
     def _name_tokens(name: str) -> set[str]:
         cleaned = name.strip("_").replace("-", "_")
@@ -790,11 +930,18 @@ def _check_unknown_self_attribute_usage(
             and node.value.id == "self"
         ):
             continue
-        if isinstance(node.ctx, ast.Store):
-            continue
         attr = str(node.attr or "")
         if not attr:
             continue
+
+        if isinstance(node.ctx, ast.Store):
+            checked_writes.append({"attribute": attr, "line": getattr(node, "lineno", None)})
+            if target_qualname.endswith(".__init__"):
+                continue
+            if attr not in known_attributes:
+                unknown_writes[(attr, getattr(node, "lineno", None))] = node
+            continue
+
         checked.append({"attribute": attr, "line": getattr(node, "lineno", None)})
         if attr in known_attributes or attr in known_methods:
             continue
@@ -833,25 +980,23 @@ def _check_unknown_self_attribute_usage(
         if is_module_level_name:
             suggestion_text = f" Возможная замена: `{attr}` без `self`."
             repair_hint = (
-                "For repair: remove `self.` before this name and use the visible module-level name directly, "
-                "or use another visible instance attribute or method from the class context."
+                "Для repair: убери `self.` перед этим именем и используй видимое имя уровня модуля напрямую "
+                "или другой видимый атрибут/метод экземпляра из контекста класса."
             )
         else:
             suggestion_text = f" Возможная замена: self.{suggestions[0]}." if suggestions else ""
             repair_hint = (
-                "For repair: remove every usage of this unknown self-attribute and use only visible instance "
-                "attributes or methods from the class context. Do not create a new alias/underscore field unless "
-                "the target is the initializer and the user explicitly requested a state change."
+                "Для repair: полностью убери использование этого неизвестного self-атрибута и используй "
+                "только видимые атрибуты или методы экземпляра из контекста класса. Не создавай новый alias, "
+                "underscore-field или приватный helper, если target не является `__init__` и пользователь явно "
+                "не запросил новое состояние."
             )
         issues.append(
             VerificationIssue(
                 code="unknown_self_attribute",
                 message=(
-                    f"Generated production code uses `self.{attr}`, but this attribute is not visible "
-                    f"as an existing attribute or method of {parent_class_name}."
-                    f" Visible attributes: {', '.join(sorted(known_attributes)) or '<none>'}."
-                    f" Visible methods: {', '.join(sorted(known_methods)) or '<none>'}."
-                    f" Module-level names: {', '.join(sorted(module_level_names)) or '<none>'}."
+                    f"Неизвестный self-атрибут в production-коде: `self.{attr}`. "
+                    f"Класс: {parent_class_name}."
                     f"{suggestion_text} "
                     f"{repair_hint}"
                 ),
@@ -866,6 +1011,28 @@ def _check_unknown_self_attribute_usage(
             detail["suggested_expression"] = attr
         unknown_details.append(detail)
 
+    unknown_write_details: list[dict[str, Any]] = []
+    for (attr, line), _node in sorted(unknown_writes.items(), key=lambda item: (item[0][0], item[0][1] or 0)):
+        suggestions = suggested_replacements(attr, candidates=known_attributes)
+        suggestion_text = f" Возможная замена: self.{suggestions[0]}." if suggestions else ""
+        issues.append(
+            VerificationIssue(
+                code="unknown_self_attribute_assignment",
+                message=(
+                    f"Запись в неизвестный self-атрибут в production-коде: `self.{attr}`. "
+                    f"Класс: {parent_class_name}."
+                    f"{suggestion_text} "
+                    "Для repair: не добавляй новое состояние в replace-symbol методе; используй только "
+                    "уже видимые атрибуты экземпляра. Новые self-атрибуты допустимы только в `__init__` или "
+                    "когда пользователь явно попросил добавить новое состояние."
+                ),
+                severity="error",
+                file_path=target_file,
+                symbol=target_qualname,
+            )
+        )
+        unknown_write_details.append({"attribute": attr, "line": line, "suggested_replacements": suggestions})
+
     unknown_method_details: list[dict[str, Any]] = []
     for (method, line), _node in sorted(unknown_methods.items(), key=lambda item: (item[0][0], item[0][1] or 0)):
         suggestions = suggested_replacements(method, candidates=known_methods)
@@ -874,14 +1041,12 @@ def _check_unknown_self_attribute_usage(
             VerificationIssue(
                 code="unknown_self_method",
                 message=(
-                    f"Generated production code calls `self.{method}(...)`, but this method is not visible "
-                    f"as an existing method of {parent_class_name}."
-                    f" Visible methods: {', '.join(sorted(known_methods)) or '<none>'}."
-                    f" Visible attributes: {', '.join(sorted(known_attributes)) or '<none>'}."
+                    f"Неизвестный self-метод в production-коде: `self.{method}(...)`. "
+                    f"Класс: {parent_class_name}."
                     f"{suggestion_text} "
-                    "For repair: remove every call of this unknown self-method and use only visible methods from "
-                    "the class context. Do not invent a private helper method inside another method; add a new "
-                    "method only when the requested operation is insert_after_symbol for that method."
+                    "Для repair: убери каждый вызов этого неизвестного self-метода и используй только "
+                    "видимые методы из контекста класса. Не придумывай приватный helper внутри другого метода; "
+                    "добавляй новый метод только когда requested operation — insert_after_symbol для этого метода."
                 ),
                 severity="error",
                 file_path=target_file,
@@ -901,6 +1066,8 @@ def _check_unknown_self_attribute_usage(
         "module_level_names": sorted(module_level_names),
         "checked_attributes": checked,
         "unknown_attributes": unknown_details,
+        "checked_writes": checked_writes,
+        "unknown_writes": unknown_write_details,
         "checked_methods": checked_methods,
         "unknown_methods": unknown_method_details,
         "skipped": False,
@@ -2154,6 +2321,115 @@ def _project_imported_name_exists(project_root: Path, module_name: str, imported
     return imported_name in _module_defined_names(project_root, module_name)
 
 
+
+
+def _extract_string_patch_targets(tree: ast.AST) -> list[dict[str, Any]]:
+    """Collect dotted string targets passed to patch/monkeypatch helpers."""
+    targets: list[dict[str, Any]] = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not node.args:
+            continue
+
+        func = node.func
+        is_patch_call = False
+        if isinstance(func, ast.Name) and func.id == "patch":
+            is_patch_call = True
+        elif isinstance(func, ast.Attribute) and func.attr == "patch":
+            is_patch_call = True
+        elif isinstance(func, ast.Attribute) and func.attr == "setattr":
+            # monkeypatch.setattr("pkg.module.name", value)
+            is_patch_call = True
+
+        if not is_patch_call:
+            continue
+
+        first_arg = node.args[0]
+        if not (isinstance(first_arg, ast.Constant) and isinstance(first_arg.value, str)):
+            continue
+
+        target = first_arg.value.strip()
+        if not target or "." not in target:
+            continue
+        targets.append(
+            {
+                "target": target,
+                "line": getattr(first_arg, "lineno", getattr(node, "lineno", None)),
+                "helper": _call_name(func),
+            }
+        )
+
+    return targets
+
+
+def _resolve_project_patch_target(project_root: Path, dotted_target: str) -> dict[str, Any] | None:
+    parts = [part for part in str(dotted_target or "").split(".") if part]
+    if len(parts) < 2:
+        return None
+
+    for idx in range(len(parts), 0, -1):
+        module_name = ".".join(parts[:idx])
+        if not _looks_like_project_module(project_root, module_name):
+            continue
+        if not _project_module_exists(project_root, module_name):
+            continue
+        attrs = parts[idx:]
+        if not attrs:
+            return {
+                "target": dotted_target,
+                "module": module_name,
+                "attribute_path": "",
+                "module_exists": True,
+                "first_attribute_exists": True,
+                "available_names": sorted(_module_defined_names(project_root, module_name)),
+            }
+        available_names = _module_defined_names(project_root, module_name)
+        return {
+            "target": dotted_target,
+            "module": module_name,
+            "attribute_path": ".".join(attrs),
+            "module_exists": True,
+            "first_attribute_exists": attrs[0] in available_names,
+            "missing_first_attribute": "" if attrs[0] in available_names else attrs[0],
+            "available_names": sorted(available_names),
+        }
+
+    return None
+
+
+def _check_generated_test_patch_targets(
+    *,
+    tree: ast.AST,
+    project_root: Path,
+    test_file_path: Path,
+) -> tuple[list[VerificationIssue], dict[str, Any]]:
+    issues: list[VerificationIssue] = []
+    checked: list[dict[str, Any]] = []
+
+    for item in _extract_string_patch_targets(tree):
+        target = str(item.get("target") or "")
+        resolved = _resolve_project_patch_target(project_root, target)
+        if resolved is None:
+            continue
+        detail = {**item, **resolved}
+        checked.append(detail)
+        if resolved.get("attribute_path") and not resolved.get("first_attribute_exists"):
+            issues.append(
+                VerificationIssue(
+                    code="generated_test_patch_target_missing_project_attribute",
+                    message=(
+                        "Generated test патчит project dotted target, но первый атрибут после "
+                        f"модуля не определен на уровне этого модуля: {target}. "
+                        "Если production-код импортирует зависимость локально внутри target symbol, "
+                        "тест должен патчить исходный provider/import path или заменить зависимость "
+                        "через fake/stub, а не несуществующий атрибут target-модуля."
+                    ),
+                    file_path=str(test_file_path),
+                    symbol=target,
+                )
+            )
+
+    return issues, {"checked_patch_targets": checked}
 def _check_generated_test_project_imports(
     *,
     tree: ast.AST,
@@ -3155,10 +3431,10 @@ def _check_import_changes_usage(
                     code="duplicated_import_change_with_local_import",
                     message=(
                         f"Имя `{name}` добавлено через import_changes и одновременно импортируется внутри generated symbol. "
-                        "Для repair: оставь один способ импорта; обычно импорт должен быть возвращен через import_changes, "
-                        "а import-строки внутри поля code нужно убрать."
+                        "Это advisory issue: дублирование import_changes и локального import не должно блокировать "
+                        "применение patch/repair, но локальный import стоит убрать при следующей чистке artifact."
                     ),
-                    severity="error",
+                    severity="warning",
                     file_path=target_file,
                     symbol=target_qualname,
                 )
@@ -3922,6 +4198,27 @@ def _check_contract_call_signatures(
                     continue
 
             call_name = _call_display_name(node.func)
+            if (
+                spec.get("kind") == "method"
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == str(spec.get("parent_qualname") or "").rsplit(".", 1)[-1]
+            ):
+                issues.append(
+                    VerificationIssue(
+                        code="contract_method_called_on_class_instead_of_instance",
+                        message=(
+                            "В сгенерированном коде project method "
+                            f"{spec['qualname']} вызывается как `{call_name}` на class/type name, "
+                            "а не через видимый instance/access path. Для repair: используй видимый receiver "
+                            "из контекста, например dependency field или локальный instance, если он явно доступен."
+                        ),
+                        severity="error",
+                        file_path=target_file,
+                        symbol=target_qualname,
+                    )
+                )
+
             if any(isinstance(arg, ast.Starred) for arg in node.args):
                 skipped_calls.append({"call": call_name, "reason": "star_args", "line": getattr(node, "lineno", None)})
                 continue
@@ -6028,6 +6325,7 @@ def _check_generated_test_project_method_calls(
     project_root: Path,
     imported_names: dict[str, str],
     test_file_path: Path,
+    target_qualname: str = "",
     allowed_new_method_names: set[str] | None = None,
 ) -> tuple[list[VerificationIssue], dict[str, Any]]:
     class_methods = _project_class_methods(project_root, imported_names)
@@ -6036,6 +6334,9 @@ def _check_generated_test_project_method_calls(
     issues: list[VerificationIssue] = []
     checked_calls: list[dict[str, Any]] = []
     allowed_new_methods = set(allowed_new_method_names or set())
+    target_parts = [part for part in str(target_qualname or "").split(".") if part]
+    target_method_name = target_parts[-1] if target_parts else ""
+    target_owner_name = target_parts[-2] if len(target_parts) >= 2 else ""
 
     if not class_methods:
         return issues, {"class_methods": {}, "variable_types": {}, "checked_calls": []}
@@ -6050,6 +6351,8 @@ def _check_generated_test_project_method_calls(
         if isinstance(func.value, ast.Name):
             owner_name = func.value.id
             owner_type = variable_types.get(owner_name, "")
+            if not owner_type and owner_name in imported_class_names:
+                owner_type = owner_name
         elif (
             isinstance(func.value, ast.Attribute)
             and func.value.attr == "__new__"
@@ -6071,6 +6374,32 @@ def _check_generated_test_project_method_calls(
                 "visible_methods": sorted(visible_methods),
             }
         )
+
+        is_exact_target_unbound_call = (
+            owner_name == owner_type
+            and owner_type == target_owner_name
+            and method_name == target_method_name
+        )
+
+        if (
+            owner_name == owner_type
+            and method_name in visible_methods
+            and method_name not in {"__new__"}
+            and not is_exact_target_unbound_call
+        ):
+            issues.append(
+                VerificationIssue(
+                    code="generated_test_calls_project_instance_method_on_class",
+                    message=(
+                        f"Generated test вызывает `{owner_type}.{method_name}()` на project class напрямую. "
+                        "Такой unbound-вызов разрешён только для exact target method. Для других instance methods "
+                        "используй локальный fake/stub или видимый instance; не вызывай project instance method как class-level helper."
+                    ),
+                    file_path=str(test_file_path),
+                    symbol=f"{owner_type}.{method_name}",
+                )
+            )
+            continue
 
         if method_name in visible_methods or method_name in allowed_new_methods:
             continue
@@ -6388,6 +6717,9 @@ def validate_generated_test_static_semantics(
     target_qualname: str,
     requested_operation: str = "replace_symbol",
     generated_symbol_names: list[str] | None = None,
+    test_plan: dict[str, Any] | None = None,
+    allowed_external_pytest_fixtures: list[str] | tuple[str, ...] | set[str] | None = None,
+    forbid_parent_instance_for_method_targets: bool = True,
 ) -> VerificationBlock:
     issues: list[VerificationIssue] = []
 
@@ -6473,6 +6805,22 @@ def validate_generated_test_static_semantics(
             )
         )
 
+    pytest_fixture_issues, pytest_fixture_details = _check_generated_test_pytest_fixtures(
+        tree=tree,
+        test_file_path=test_file_path,
+        allowed_external_pytest_fixtures=allowed_external_pytest_fixtures,
+    )
+    issues.extend(pytest_fixture_issues)
+
+    parent_instance_issues, parent_instance_details = _check_generated_test_target_parent_instantiation(
+        tree=tree,
+        target_qualname=target_qualname,
+        requested_operation=requested_operation,
+        test_file_path=test_file_path,
+        forbid_parent_instance_for_method_targets=forbid_parent_instance_for_method_targets,
+    )
+    issues.extend(parent_instance_issues)
+
     if has_assert and not _has_nontrivial_assert(tree):
         issues.append(
             VerificationIssue(
@@ -6517,6 +6865,13 @@ def validate_generated_test_static_semantics(
     )
     issues.extend(project_import_issues)
 
+    patch_target_issues, patch_target_details = _check_generated_test_patch_targets(
+        tree=tree,
+        project_root=project_root,
+        test_file_path=test_file_path,
+    )
+    issues.extend(patch_target_issues)
+
     imported_names = _collect_project_imported_names(tree, project_root)
     unsafe_new_issues, unsafe_new_details = _check_generated_test_unsafe_new_usage(
         tree=tree,
@@ -6553,6 +6908,7 @@ def validate_generated_test_static_semantics(
         project_root=project_root,
         imported_names=imported_names,
         test_file_path=test_file_path,
+        target_qualname=target_qualname,
         allowed_new_method_names=allowed_generated_method_names,
     )
     issues.extend(project_method_issues)
@@ -6665,6 +7021,9 @@ def validate_generated_test_static_semantics(
             "has_assert": has_assert,
             "has_pytest_raises": has_pytest_raises,
             "pytest_mock_usage": pytest_mock_usage,
+            "pytest_fixture_check": pytest_fixture_details,
+            "target_parent_instance_check": parent_instance_details,
+            "test_plan": test_plan or {},
             "imported_project_names": imported_names,
             "unresolved_names": unresolved_names,
             "called_names": sorted(called_names),
@@ -6673,6 +7032,7 @@ def validate_generated_test_static_semantics(
             "used_names": sorted(used_names),
             "target_reference_names": sorted(target_reference_names),
             "project_import_check": project_import_details,
+            "patch_target_check": patch_target_details,
             "unsafe_project_new_usage_check": unsafe_new_details,
             "selfless_parent_instance_check": selfless_parent_details,
             "constructor_keyword_check": constructor_keyword_details,

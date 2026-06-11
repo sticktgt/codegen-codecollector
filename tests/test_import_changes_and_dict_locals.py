@@ -201,3 +201,32 @@ def test_remove_import_change_missing_import_is_reported(tmp_path) -> None:
     )
 
     assert any(issue.code == 'unresolved_remove_import_change' for issue in block.issues)
+
+
+def test_import_changes_duplicate_with_local_import_is_advisory_warning() -> None:
+    original = 'class Helper:\n    pass\n'
+    patched = original + (
+        '\n'
+        'def build(value: str) -> str:\n'
+        '    from pathlib import Path\n'
+        '    return str(Path(value))\n'
+    )
+
+    block = validate_patch_static_semantics(
+        requested_operation='insert_after_symbol',
+        change_request=ChangeRequest(title='Добавить helper', description='Сформировать путь.', project='demo'),
+        target_qualname='demo.Helper',
+        original_file_text=original,
+        patched_file_text=patched,
+        changed_files=['demo.py'],
+        target_file='demo.py',
+        insert_scope='module_body',
+        import_changes=[{'action': 'add_from_import', 'module': 'pathlib', 'names': ['Path']}],
+    )
+
+    duplicate_issues = [issue for issue in block.issues if issue.code == 'duplicated_import_change_with_local_import']
+    assert duplicate_issues
+    assert duplicate_issues[0].severity == 'warning'
+    assert block.ok is True
+    assert block.severity == 'warning'
+    assert 'Path' in block.details['import_changes_usage_check']['duplicated_local_imports']

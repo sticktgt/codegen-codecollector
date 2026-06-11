@@ -2802,3 +2802,75 @@ def test_patch_static_semantics_rejects_new_external_import_root_not_seen_in_pro
 
     assert not block.ok
     assert any(issue.code == 'unresolved_import_change_module' for issue in block.issues)
+
+from codecollector.external_codegen.adapter import patch_artifact_from_result
+
+
+def test_repair_request_for_replace_method_carries_authoritative_coordinates() -> None:
+    target = _symbol(
+        qualname='editor.editor_window.EditorWindow.open_note',
+        name='open_note',
+        kind='method',
+        parent='editor.editor_window.EditorWindow',
+        source='    def open_note(self):\n        raise NotImplementedError\n',
+        file_path='editor/editor_window.py',
+    )
+    module = _symbol(
+        qualname='editor.editor_window',
+        name='editor_window',
+        kind='module',
+        source='class EditorWindow:\n    def open_note(self):\n        raise NotImplementedError\n',
+        file_path='editor/editor_window.py',
+    )
+    context_pack = ContextPack(target=target, neighbors=[module], inbound_relations=[], outbound_relations=[], related_tests=[])
+
+    request = build_repair_request(
+        ChangeRequest(title='Открыть заметку', description='Реализовать open_note.', project='demo'),
+        target.qualname,
+        {
+            'request_id': 'generate-open_note',
+            'code_artifact': {
+                'operation': 'replace_symbol',
+                'target_qualname': target.qualname,
+                'target_file': target.file_path,
+                'insert_after': target.qualname,
+                'insert_scope': 'module_body',
+                'code': 'def open_note(self):\n    pass\n',
+            },
+        },
+        context_pack,
+        {'failure_summary': {'stage': 'verification', 'failed_blocks': []}},
+        requested_operation='replace_symbol',
+    )
+
+    assert request['target']['insert_scope'] == 'class_body'
+    assert request['target']['expected_new_symbol_kind'] == 'method'
+    assert request['target']['parent_qualname'] == 'editor.editor_window.EditorWindow'
+    assert request['previous_artifact']['insert_after'] is None
+    assert request['previous_artifact']['insert_scope'] == 'class_body'
+    assert request['previous_artifact']['expected_new_symbol_kind'] == 'method'
+    assert request['previous_artifact']['parent_qualname'] == 'editor.editor_window.EditorWindow'
+
+
+def test_patch_artifact_normalizes_short_name_import_changes() -> None:
+    artifact = patch_artifact_from_result(
+        {
+            'status': 'ok',
+            'code_artifact': {
+                'operation': 'replace_symbol',
+                'target_qualname': 'editor.editor_window.EditorWindow.open_note',
+                'target_file': 'editor/editor_window.py',
+                'code': 'def open_note(self):\n    p = Path(file_name)\n    QFileDialog.getOpenFileName(self)\n',
+                'import_changes': [
+                    {'action': 'add_import', 'module': 'pathlib'},
+                    {'action': 'add_import', 'module': 'PyQt5.QtWidgets', 'alias': 'QFileDialog'},
+                ],
+            },
+        },
+        'editor.editor_window.EditorWindow.open_note',
+    )
+
+    assert artifact.import_changes == [
+        {'action': 'add_from_import', 'module': 'pathlib', 'names': ['Path']},
+        {'action': 'add_from_import', 'module': 'PyQt5.QtWidgets', 'names': ['QFileDialog']},
+    ]

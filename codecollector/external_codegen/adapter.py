@@ -705,6 +705,16 @@ def _normalize_insert_target_metadata(
     expected_new_symbol_kind = ''
 
     if operation != 'insert_after_symbol':
+        if target.kind == 'method':
+            normalized_insert_scope = normalized_insert_scope or 'class_body'
+            parent_qualname = str(target.parent_qualname or '')
+            expected_new_symbol_kind = 'method'
+        elif target.kind == 'class':
+            normalized_insert_scope = normalized_insert_scope or 'module_body'
+            expected_new_symbol_kind = 'class'
+        elif target.kind == 'function':
+            normalized_insert_scope = normalized_insert_scope or 'module_body'
+            expected_new_symbol_kind = 'function'
         return normalized_insert_scope, parent_qualname, expected_new_symbol_kind
 
     request_wants_new_class = _request_indicates_new_dataclass_or_class(change_request)
@@ -2650,17 +2660,17 @@ def build_repair_request(
 
     previous_artifact = dict(previous_result_payload.get('code_artifact') or {})
     previous_artifact['operation'] = normalized_operation
-    previous_artifact.setdefault('target_qualname', target_qualname)
-    previous_artifact.setdefault('target_file', target.file_path)
+    previous_artifact['target_qualname'] = target_qualname
+    previous_artifact['target_file'] = target.file_path
+    previous_artifact['insert_scope'] = normalized_insert_scope
+    if expected_new_symbol_kind:
+        previous_artifact['expected_new_symbol_kind'] = expected_new_symbol_kind
+    if parent_qualname:
+        previous_artifact['parent_qualname'] = parent_qualname
     if normalized_operation == 'insert_after_symbol':
         previous_artifact['insert_after'] = previous_artifact.get('insert_after') or target_qualname
-        previous_artifact['insert_scope'] = normalized_insert_scope
-        if expected_new_symbol_kind:
-            previous_artifact['expected_new_symbol_kind'] = expected_new_symbol_kind
-        if parent_qualname:
-            previous_artifact['parent_qualname'] = parent_qualname
     else:
-        previous_artifact['insert_scope'] = previous_artifact.get('insert_scope') or normalized_insert_scope
+        previous_artifact['insert_after'] = None
 
     LOGGER.info(
         'Prepared repair request: target=%s requested_operation=%s stage=%s related_tests=%s related_symbols=%s reference_artifacts=%s previous_artifact_has_code=%s full_file_chars=%s full_file_truncated=%s allowed_surface_source=%s dependencies=%s free_functions=%s',
@@ -2851,6 +2861,66 @@ def _normalize_replace_symbol_replacement_code(
             return candidate
     return code
 
+
+def _import_code_uses_name(code: str | None, name: str) -> bool:
+    if not code or not name:
+        return False
+    return re.search(rf"\b{re.escape(name)}\b", code) is not None
+
+
+def _normalize_artifact_import_changes(import_changes: list[Any], code: str | None = None) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for raw in import_changes or []:
+        if not isinstance(raw, dict):
+            continue
+        item = dict(raw)
+        action = str(item.get('action') or '').strip()
+        module = str(item.get('module') or '').strip()
+        if not action or not module:
+            continue
+        names = item.get('names')
+        if isinstance(names, str):
+            names = [part.strip() for part in names.split(',') if part.strip()]
+        elif isinstance(names, list):
+            names = [str(name).strip() for name in names if str(name).strip()]
+        else:
+            names = []
+
+        if names and action == 'add_import':
+            item = {'action': 'add_from_import', 'module': module, 'names': names}
+        elif names and action == 'remove_import':
+            item = {'action': 'remove_from_import', 'module': module, 'names': names}
+        elif action in {'add_import', 'remove_import'}:
+            alias = str(item.get('alias') or item.get('asname') or '').strip()
+            if alias and alias[:1].isupper() and _import_code_uses_name(code, alias):
+                item = {
+                    'action': 'add_from_import' if action == 'add_import' else 'remove_from_import',
+                    'module': module,
+                    'names': [alias],
+                }
+            elif module == 'pathlib' and not _import_code_uses_name(code, 'pathlib'):
+                pathlib_names = [name for name in ('Path', 'PurePath', 'PurePosixPath', 'PureWindowsPath') if _import_code_uses_name(code, name)]
+                if pathlib_names:
+                    item = {
+                        'action': 'add_from_import' if action == 'add_import' else 'remove_from_import',
+                        'module': module,
+                        'names': pathlib_names,
+                    }
+                else:
+                    item = {'action': action, 'module': module, **({'alias': alias} if alias else {})}
+            else:
+                item = {'action': action, 'module': module, **({'alias': alias} if alias else {})}
+        else:
+            item = {'action': action, 'module': module, 'names': names}
+
+        key = (item.get('action'), item.get('module'), tuple(item.get('names') or []), item.get('alias'))
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(item)
+    return normalized
+
 def patch_artifact_from_result(result_payload: dict[str, Any], fallback_target_qualname: str) -> PatchArtifact:
     status = result_payload.get('status')
     if status != 'ok':
@@ -2878,6 +2948,10 @@ def patch_artifact_from_result(result_payload: dict[str, Any], fallback_target_q
         target_qualname=target_qualname,
     )
     artifact['code'] = code
+    artifact['import_changes'] = _normalize_artifact_import_changes(
+        list(artifact.get('import_changes') or []),
+        code=str(code),
+    )
     return PatchArtifact(
         target_qualname=target_qualname,
         replacement_code=str(code),
