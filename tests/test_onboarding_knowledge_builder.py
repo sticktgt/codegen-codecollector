@@ -600,3 +600,26 @@ def test_knowledge_enrichment_reports_similar_flow_reference_when_exact_missing(
     assert unmatched[0]['name'] == 'SearchEngine.search_notes'
     assert unmatched[0]['reason'] == 'reference_not_found_exactly_but_similar_symbols_exist'
     assert 'search.search_engine.search_notes' in unmatched[0]['suggested_matches']
+
+
+def test_knowledge_builder_preserves_traceability_fields_on_rebuild(tmp_path: Path) -> None:
+    config = load_config()
+    project_root = tmp_path / 'src'
+    project_root.mkdir()
+
+    first_report = KnowledgeBuilder(project_root, config).rebuild(_symbols())
+    knowledge_path = Path(first_report['knowledge_path'])
+    payload = yaml.safe_load(knowledge_path.read_text(encoding='utf-8'))
+    payload['modules']['game.board']['requirements'] = ['REQ-MODULE']
+    payload['modules']['game.board']['change_requests'] = [{'id': 'CR-MODULE', 'applied_at': '2026-06-10T18:47:05'}]
+    payload['symbols']['game.board.Board']['requirements'] = ['REQ-SYMBOL']
+    payload['symbols']['game.board.Board']['change_requests'] = [{'id': 'CR-SYMBOL', 'applied_at': '2026-06-10T18:48:05'}]
+    knowledge_path.write_text(yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding='utf-8')
+
+    second_report = KnowledgeBuilder(project_root, config).rebuild(_symbols())
+    rebuilt = yaml.safe_load(Path(second_report['knowledge_path']).read_text(encoding='utf-8'))
+
+    assert rebuilt['modules']['game.board']['requirements'] == ['REQ-MODULE']
+    assert rebuilt['modules']['game.board']['change_requests'] == [{'id': 'CR-MODULE', 'applied_at': '2026-06-10T18:47:05'}]
+    assert rebuilt['symbols']['game.board.Board']['requirements'] == ['REQ-SYMBOL']
+    assert rebuilt['symbols']['game.board.Board']['change_requests'] == [{'id': 'CR-SYMBOL', 'applied_at': '2026-06-10T18:48:05'}]

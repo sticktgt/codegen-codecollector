@@ -169,12 +169,24 @@ class OverlayService:
                 relations.append(relation)
 
         for module_name, module_entry in self.load_knowledge().get('modules', {}).items():
+            if not isinstance(module_entry, dict):
+                continue
             layer = str(module_entry.get('layer', '')).strip()
             if layer:
                 append_unique(RelationRecord(
                     source_qualname=str(module_name),
                     relation_kind='belongs_to_layer',
                     target_ref=layer,
+                    target_qualname=None,
+                    file_path='',
+                    relation_source='knowledge',
+                    relation_confidence='high',
+                ))
+            for requirement_id in module_entry.get('requirements', []) or []:
+                append_unique(RelationRecord(
+                    source_qualname=str(module_name),
+                    relation_kind='implements_requirement',
+                    target_ref=str(requirement_id),
                     target_qualname=None,
                     file_path='',
                     relation_source='knowledge',

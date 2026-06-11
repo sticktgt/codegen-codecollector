@@ -8,8 +8,11 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from codecollector.config import AppConfig
 from codecollector.logger import get_logger
+from codecollector.onboarding.knowledge_traceability import KnowledgeTraceabilityService
 from codecollector.onboarding.onboarding_service import OnboardingService
 from codecollector.projects.project_service import ProjectService
 from codecollector.sessions.session_service import SessionService
@@ -406,7 +409,239 @@ class WorkspaceService:
             'unified_diff': ''.join(unified_parts),
         }
 
-    def apply_workspace(self, workspace_id: str) -> dict[str, Any]:
+    def _normalize_string_list(self, values: list[Any] | tuple[Any, ...] | None) -> list[str]:
+        result: list[str] = []
+        for item in values or []:
+            text = str(item).strip()
+            if text and text not in result:
+                result.append(text)
+        return result
+
+    def _extract_traceability_symbols_from_bundle(self, bundle: dict[str, Any] | None) -> list[str]:
+        return self._extract_traceability_targets_from_bundle(bundle, project_root=None)['symbols']
+
+    def _extract_traceability_targets_from_bundle(
+        self,
+        bundle: dict[str, Any] | None,
+        *,
+        project_root: Path | None,
+    ) -> dict[str, list[str]]:
+        if not bundle:
+            return {'symbols': [], 'modules': []}
+
+        apply_result = bundle.get('apply_result') if isinstance(bundle.get('apply_result'), dict) else {}
+        artifact = apply_result.get('artifact') if isinstance(apply_result.get('artifact'), dict) else {}
+        impact = apply_result.get('impact') if isinstance(apply_result.get('impact'), dict) else {}
+        execution_summary = bundle.get('execution_summary') if isinstance(bundle.get('execution_summary'), dict) else {}
+
+        operation = str(artifact.get('operation') or execution_summary.get('operation') or '').strip()
+        if operation == 'insert_after_symbol':
+            created_symbols = self._extract_inserted_traceability_symbols(artifact, impact, execution_summary)
+            if project_root is not None:
+                resolved = self._resolve_inserted_traceability_targets_against_knowledge(
+                    project_root=project_root,
+                    created_symbols=created_symbols,
+                    artifact=artifact,
+                    execution_summary=execution_summary,
+                )
+                if resolved['symbols'] or resolved['modules']:
+                    return resolved
+            elif created_symbols:
+                return {'symbols': created_symbols, 'modules': []}
+
+            LOGGER.warning(
+                'Traceability target skipped for insert_after_symbol: created symbol was not resolved target=%s parent=%s',
+                artifact.get('target_qualname') or execution_summary.get('selected_target'),
+                artifact.get('parent_qualname') or execution_summary.get('parent_qualname'),
+            )
+            return {'symbols': [], 'modules': []}
+
+        symbols: list[str] = []
+        self._append_traceability_qualname(symbols, artifact.get('target_qualname'))
+        self._append_traceability_qualname(symbols, impact.get('target_qualname'))
+        self._append_traceability_qualname(symbols, execution_summary.get('selected_target'))
+        if not symbols:
+            for item in self._bundle_changed_symbols(impact, execution_summary):
+                self._append_traceability_qualname(symbols, item)
+        return {'symbols': symbols, 'modules': []}
+
+    def _resolve_inserted_traceability_targets_against_knowledge(
+        self,
+        *,
+        project_root: Path,
+        created_symbols: list[str],
+        artifact: dict[str, Any],
+        execution_summary: dict[str, Any],
+    ) -> dict[str, list[str]]:
+        knowledge_symbols, knowledge_modules = self._knowledge_symbol_and_module_names(project_root)
+
+        existing_symbols = [qualname for qualname in created_symbols if qualname in knowledge_symbols]
+        if existing_symbols:
+            return {'symbols': existing_symbols, 'modules': []}
+
+        fallback_modules: list[str] = []
+        parent_qualname = str(artifact.get('parent_qualname') or execution_summary.get('parent_qualname') or '').strip()
+        if parent_qualname in knowledge_modules:
+            self._append_traceability_qualname(fallback_modules, parent_qualname)
+
+        for qualname in created_symbols:
+            module_name = self._nearest_known_module_for_qualname(qualname, knowledge_modules)
+            self._append_traceability_qualname(fallback_modules, module_name)
+
+        if fallback_modules:
+            return {'symbols': [], 'modules': fallback_modules}
+        return {'symbols': [], 'modules': []}
+
+    def _knowledge_symbol_and_module_names(self, project_root: Path) -> tuple[set[str], set[str]]:
+        knowledge_path = project_root / self.config.overlay_dirname / 'knowledge.yaml'
+        if not knowledge_path.exists():
+            return set(), set()
+        try:
+            payload = yaml.safe_load(knowledge_path.read_text(encoding='utf-8')) or {}
+        except Exception as exc:  # noqa: BLE001 - traceability update can still skip safely.
+            LOGGER.warning('Could not read knowledge.yaml to resolve traceability targets: path=%s error=%s', knowledge_path, exc)
+            return set(), set()
+        if not isinstance(payload, dict):
+            return set(), set()
+        symbols = payload.get('symbols')
+        modules = payload.get('modules')
+        symbol_names = set(symbols.keys()) if isinstance(symbols, dict) else set()
+        module_names = set(modules.keys()) if isinstance(modules, dict) else set()
+        return symbol_names, module_names
+
+    def _nearest_known_module_for_qualname(self, qualname: str, knowledge_modules: set[str]) -> str:
+        current = str(qualname or '').strip()
+        while '.' in current:
+            current = current.rsplit('.', 1)[0]
+            if current in knowledge_modules:
+                return current
+        return ''
+
+    def _extract_inserted_traceability_symbols(
+        self,
+        artifact: dict[str, Any],
+        impact: dict[str, Any],
+        execution_summary: dict[str, Any],
+    ) -> list[str]:
+        parent_qualname = str(artifact.get('parent_qualname') or execution_summary.get('parent_qualname') or '').strip()
+        expected_kind = str(artifact.get('expected_new_symbol_kind') or execution_summary.get('expected_new_symbol_kind') or '').strip()
+        insert_scope = str(artifact.get('insert_scope') or execution_summary.get('insert_scope') or '').strip()
+
+        if not parent_qualname:
+            parent_qualname = self._insert_parent_from_target(artifact, execution_summary)
+
+        candidates: list[str] = []
+        for item in self._bundle_changed_symbols(impact, execution_summary):
+            self._append_traceability_qualname(candidates, item)
+
+        generated_from_checks = self._collect_generated_symbol_names(bundle_fragment=execution_summary)
+        for item in generated_from_checks:
+            self._append_traceability_qualname(candidates, item)
+
+        if parent_qualname:
+            direct_children = [
+                qualname for qualname in candidates
+                if self._is_direct_child_symbol(qualname, parent_qualname)
+            ]
+            if expected_kind in {'method', 'function', 'class'}:
+                filtered = self._filter_inserted_symbols_by_kind_suffix(direct_children, expected_kind)
+                if filtered:
+                    return filtered
+            if direct_children:
+                return direct_children
+
+        replacement_name = self._top_level_symbol_name_from_code(str(artifact.get('replacement_code') or artifact.get('source_code') or ''))
+        if replacement_name:
+            if insert_scope == 'class_body' and parent_qualname:
+                fallback = f'{parent_qualname}.{replacement_name}'
+            else:
+                module_prefix = parent_qualname or self._module_prefix_from_target(artifact, execution_summary)
+                fallback = f'{module_prefix}.{replacement_name}' if module_prefix else replacement_name
+            result: list[str] = []
+            self._append_traceability_qualname(result, fallback)
+            return result
+
+        return []
+
+    def _bundle_changed_symbols(self, impact: dict[str, Any], execution_summary: dict[str, Any]) -> list[Any]:
+        symbols = impact.get('symbols_in_changed_files')
+        if isinstance(symbols, list) and symbols:
+            return symbols
+        summary_symbols = execution_summary.get('symbols_in_changed_files')
+        return summary_symbols if isinstance(summary_symbols, list) else []
+
+    def _append_traceability_qualname(self, result: list[str], value: Any) -> None:
+        qualname = str(value or '').strip()
+        if not qualname or qualname.startswith('tests.'):
+            return
+        if qualname not in result:
+            result.append(qualname)
+
+    def _is_direct_child_symbol(self, qualname: str, parent_qualname: str) -> bool:
+        if qualname == parent_qualname or not qualname.startswith(f'{parent_qualname}.'):
+            return False
+        remainder = qualname[len(parent_qualname) + 1:]
+        return bool(remainder) and '.' not in remainder
+
+    def _filter_inserted_symbols_by_kind_suffix(self, qualnames: list[str], expected_kind: str) -> list[str]:
+        if expected_kind != 'method':
+            return qualnames
+        return [qualname for qualname in qualnames if qualname.rsplit('.', 1)[-1] != '__init__']
+
+    def _insert_parent_from_target(self, artifact: dict[str, Any], execution_summary: dict[str, Any]) -> str:
+        target = str(artifact.get('target_qualname') or execution_summary.get('selected_target') or '').strip()
+        insert_scope = str(artifact.get('insert_scope') or execution_summary.get('insert_scope') or '').strip()
+        if insert_scope == 'class_body':
+            return target
+        if '.' in target:
+            return target.rsplit('.', 1)[0]
+        return ''
+
+    def _module_prefix_from_target(self, artifact: dict[str, Any], execution_summary: dict[str, Any]) -> str:
+        target_file = str(artifact.get('target_file') or execution_summary.get('target_file') or '').strip()
+        if target_file.endswith('.py'):
+            return target_file[:-3].replace('/', '.').replace('\\', '.')
+        target = str(artifact.get('target_qualname') or execution_summary.get('selected_target') or '').strip()
+        return target.rsplit('.', 1)[0] if '.' in target else ''
+
+    def _top_level_symbol_name_from_code(self, source_code: str) -> str:
+        import ast
+        import textwrap
+
+        try:
+            tree = ast.parse(textwrap.dedent(source_code))
+        except SyntaxError:
+            return ''
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                return str(node.name)
+        return ''
+
+    def _collect_generated_symbol_names(self, *, bundle_fragment: dict[str, Any]) -> list[str]:
+        result: list[str] = []
+
+        def visit(value: Any) -> None:
+            if isinstance(value, dict):
+                generated = value.get('generated_symbol_names')
+                if isinstance(generated, list):
+                    for item in generated:
+                        self._append_traceability_qualname(result, item)
+                for child in value.values():
+                    visit(child)
+            elif isinstance(value, list):
+                for child in value:
+                    visit(child)
+
+        visit(bundle_fragment)
+        return result
+
+    def apply_workspace(
+        self,
+        workspace_id: str,
+        *,
+        change_request_id: str | None = None,
+        requirement_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
         total_started = time.perf_counter()
         timings: dict[str, int] = {}
         counts: dict[str, int] = {}
@@ -481,6 +716,63 @@ class WorkspaceService:
         embedding_usage = snapshot_embedding_usage()
 
         onboarding_payload = asdict(onboarding_result)
+
+        stage_started = time.perf_counter()
+        traceability_update: dict[str, Any] = {
+            'updated': False,
+            'skipped_reason': 'missing_traceability_ids',
+            'symbols': [],
+            'modules': [],
+            'requirements': self._normalize_string_list(requirement_ids),
+            'change_request_id': str(change_request_id or '').strip(),
+            'knowledge_path': str(Path(onboarding_payload.get('knowledge_path') or resolved.project_root / self.config.overlay_dirname / 'knowledge.yaml')),
+        }
+        trace_requirement_ids = self._normalize_string_list(requirement_ids)
+        trace_change_request_id = str(change_request_id or '').strip()
+        if trace_change_request_id or trace_requirement_ids:
+            try:
+                traceability_targets = self._extract_traceability_targets_from_bundle(
+                    bundle,
+                    project_root=resolved.project_root,
+                )
+                traceability_update = KnowledgeTraceabilityService(resolved.project_root, self.config).update_for_applied_workspace(
+                    symbol_qualnames=traceability_targets['symbols'],
+                    module_names=traceability_targets['modules'],
+                    change_request_id=trace_change_request_id,
+                    requirement_ids=trace_requirement_ids,
+                    applied_at=_utc_now(),
+                )
+                if traceability_update.get('updated'):
+                    try:
+                        from codecollector.indexing.storage_factory import create_index_store
+                        from codecollector.overlays.service import OverlayService
+
+                        overlays = OverlayService(resolved.project_root, overlay_dirname=self.config.overlay_dirname)
+                        store = create_index_store(resolved.project_root, self.config)
+                        store.replace_knowledge_relations(str(resolved.project_root), overlays.knowledge_relations())
+                        traceability_update['knowledge_relations_refreshed'] = True
+                    except Exception as relation_exc:  # noqa: BLE001 - YAML update is the source of truth; relation refresh can retry on next reindex.
+                        LOGGER.warning(
+                            'Knowledge relation refresh after traceability update failed for workspace_id=%s: %s',
+                            workspace_id,
+                            relation_exc,
+                        )
+                        traceability_update['knowledge_relations_refreshed'] = False
+                        traceability_update['knowledge_relations_refresh_error'] = str(relation_exc)
+            except Exception as exc:  # noqa: BLE001 - apply itself has already succeeded; report traceability failure separately.
+                LOGGER.warning('Knowledge traceability update failed for workspace_id=%s: %s', workspace_id, exc)
+                traceability_update = {
+                    'updated': False,
+                    'skipped_reason': 'error',
+                    'error': str(exc),
+                    'symbols': [],
+                    'modules': [],
+                    'requirements': trace_requirement_ids,
+                    'change_request_id': trace_change_request_id,
+                    'knowledge_path': str(Path(onboarding_payload.get('knowledge_path') or resolved.project_root / self.config.overlay_dirname / 'knowledge.yaml')),
+                }
+        timings['traceability_update_ms'] = int((time.perf_counter() - stage_started) * 1000)
+
         index_refresh = {
             'indexed_files': onboarding_payload.get('indexed_files', 0),
             'unchanged_files': onboarding_payload.get('unchanged_files', 0),
@@ -528,6 +820,7 @@ class WorkspaceService:
             'index_refresh': index_refresh,
             'applied': True,
             'onboarding': onboarding_payload,
+            'traceability_update': traceability_update,
         }
 
     def delete_workspace(self, workspace_id: str) -> dict[str, Any]:

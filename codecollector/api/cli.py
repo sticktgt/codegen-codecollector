@@ -125,6 +125,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     workspace_apply = workspaces_sub.add_parser('apply')
     workspace_apply.add_argument('--workspace-id', required=True)
+    workspace_apply.add_argument('--change-request-id')
+    workspace_apply.add_argument('--requirement-id', action='append', default=[])
+    workspace_apply.add_argument('--requirement-ids', help='Список ids требований через запятую')
 
     search_parser = subparsers.add_parser('search')
     search_parser.add_argument('--project', required=True)
@@ -339,7 +342,15 @@ def main() -> None:
             return
 
         if args.command == 'workspaces' and args.workspaces_command == 'apply':
-            print(json.dumps(workspace_service.apply_workspace(args.workspace_id), ensure_ascii=False, indent=2))
+            print(json.dumps(
+                workspace_service.apply_workspace(
+                    args.workspace_id,
+                    change_request_id=args.change_request_id,
+                    requirement_ids=_parse_requirement_ids(args.requirement_id, args.requirement_ids),
+                ),
+                ensure_ascii=False,
+                indent=2,
+            ))
             return
 
         if args.command == 'ui':
@@ -432,6 +443,19 @@ def main() -> None:
         LOGGER.error('CLI command failed: %s', exc)
         print(json.dumps(_error_payload(exc, args), ensure_ascii=False, indent=2))
         raise SystemExit(1)
+
+
+def _parse_requirement_ids(requirement_id_values: list[str] | None, requirement_ids_csv: str | None) -> list[str]:
+    result: list[str] = []
+    for item in requirement_id_values or []:
+        text = str(item).strip()
+        if text and text not in result:
+            result.append(text)
+    for item in str(requirement_ids_csv or '').split(','):
+        text = item.strip()
+        if text and text not in result:
+            result.append(text)
+    return result
 
 
 def _error_payload(exc: Exception, args: argparse.Namespace) -> dict[str, Any]:

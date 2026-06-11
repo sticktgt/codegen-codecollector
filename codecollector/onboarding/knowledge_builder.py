@@ -162,6 +162,34 @@ class KnowledgeBuilder:
             return []
         return [item for item in value if isinstance(item, dict)]
 
+    def _change_request_list(self, value: Any) -> list[Any]:
+        if not isinstance(value, list):
+            return []
+        result: list[Any] = []
+        seen: set[str] = set()
+        for item in value:
+            item_id = ''
+            if isinstance(item, str):
+                item_id = item.strip()
+                normalized: Any = item_id
+            elif isinstance(item, dict):
+                item_id = str(item.get('id') or '').strip()
+                normalized = {str(key): val for key, val in item.items()}
+            else:
+                continue
+            if item_id and item_id not in seen:
+                seen.add(item_id)
+                result.append(normalized)
+        return result
+
+    def _copy_traceability_fields(self, entry: dict[str, Any], current: dict[str, Any]) -> None:
+        requirements = self._string_list(current.get('requirements'))
+        if requirements:
+            entry['requirements'] = requirements
+        change_requests = self._change_request_list(current.get('change_requests'))
+        if change_requests:
+            entry['change_requests'] = change_requests
+
     def _load_existing(self) -> dict[str, Any]:
         if not self.overlays.knowledge_path.exists():
             return {}
@@ -183,11 +211,13 @@ class KnowledgeBuilder:
         modules: dict[str, Any] = {}
         for symbol in sorted((item for item in symbols if item.kind == 'module'), key=lambda item: item.qualname):
             current = existing_modules.get(symbol.qualname, {}) if isinstance(existing_modules.get(symbol.qualname, {}), dict) else {}
-            modules[symbol.qualname] = {
+            entry: dict[str, Any] = {
                 'title': str(current.get('title') or self._module_title(symbol)),
                 'description': str(current.get('description') or self._normalize_docstring(symbol.docstring) or f'Модуль {symbol.module_name}.'),
                 'layer': str(current.get('layer') or self._infer_layer(symbol.module_name) or ''),
             }
+            self._copy_traceability_fields(entry, current)
+            modules[symbol.qualname] = entry
         return modules
 
     def _build_symbols(self, symbols: list[SymbolRecord], existing: dict[str, Any]) -> dict[str, Any]:
@@ -204,9 +234,7 @@ class KnowledgeBuilder:
                 entry['keywords'] = [str(item) for item in keywords]
             else:
                 entry['keywords'] = self._default_keywords(symbol)
-            requirements = current.get('requirements')
-            if isinstance(requirements, list) and requirements:
-                entry['requirements'] = [str(item) for item in requirements]
+            self._copy_traceability_fields(entry, current)
             items[symbol.qualname] = entry
         return items
 
