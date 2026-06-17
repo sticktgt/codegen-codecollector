@@ -777,7 +777,6 @@ class PipelineService:
                         generated_test_review=generated_test_review,
                         apply_result=apply_result,
                         merge_plan=merge_plan,
-                        final_payload=final_payload,
                         steps=steps,
                         warnings=warnings,
                     )
@@ -984,87 +983,55 @@ class PipelineService:
                         ),
                     )
                     if not self._has_code_artifact(repair_result_payload):
-                        raise RuntimeError(
-                            repair_result_payload.get('message')
-                            or 'codegenerator repair did not return code_artifact'
-                        )
-
-                    self._run_step(
-                        steps,
-                        'external_repair_static_semantics_after_verification',
-                        'Проверить code artifact после repair статическими правилами',
-                        lambda: self._ensure_code_artifact_static_semantics(
-                            result_payload=repair_result_payload,
-                            step_name='external_repair',
-                            expected_operation=requested_operation,
-                            expected_target_qualname=selected_target,
-                        ),
-                    )
-
-                    repair_candidate_apply_payload = self._run_step(
-                        steps,
-                        'apply_repair_candidate_staging',
-                        'Применить repair artifact в отдельный candidate workspace',
-                        lambda: self._try_apply_repair_candidate(
-                            repair_result_payload=repair_result_payload,
-                            selected_target=selected_target,
-                            generated_tests=generated_tests if generated_test_apply and generated_test_apply.get('applied_tests') else [],
-                        ),
-                    )
-                    repair_candidate_apply = repair_candidate_apply_payload.get('apply_result')
-                    if repair_candidate_apply is None:
-                        repair_candidate_gate_block = self._run_step(
+                        repair_not_applied_block = self._run_step(
                             steps,
-                            'repair_candidate_gate_after_verification',
-                            'Отклонить repair candidate после неуспешного apply',
-                            lambda: self._build_repair_candidate_gate_block(
-                                stage='apply',
-                                original_blocks=list(verification_report.blocks),
-                                candidate_blocks=[self._repair_candidate_apply_failure_block(repair_candidate_apply_payload)],
-                            ),
+                            'external_repair_not_applied_after_verification',
+                            'Зафиксировать контролируемый отказ repair после неуспешной проверки',
+                            lambda: self._repair_not_applied_block(repair_result_payload),
                         )
-                        repair_gate_blocks.append(repair_candidate_gate_block)
-                        warning_message = self._repair_candidate_rejection_warning(repair_candidate_gate_block)
+                        warning_message = self._repair_not_applied_warning(repair_result_payload)
                         if warning_message not in warnings:
                             warnings.append(warning_message)
                         LOGGER.warning(warning_message)
                         verification_report = build_verification_report(
-                            blocks=[*verification_report.blocks, repair_candidate_gate_block],
+                            blocks=[*verification_report.blocks, repair_not_applied_block],
                         )
                     else:
-                        repair_candidate_runtime_blocks = self._run_step(
+                        self._run_step(
                             steps,
-                            'verification_repair_candidate',
-                            'Запустить runtime-проверки repair candidate до принятия',
-                            lambda: self._run_runtime_verification_blocks(
-                                repair_candidate_apply,
-                                generated_test_apply,
-                            ),
-                        )
-                        repair_candidate_report = build_verification_report(
-                            blocks=[patch_static_block, *generated_test_blocks, *repair_candidate_runtime_blocks],
-                        )
-                        repair_candidate_gate_block = self._run_step(
-                            steps,
-                            'repair_candidate_gate_after_verification',
-                            'Решить, можно ли принимать repair candidate после runtime verification',
-                            lambda: self._build_repair_candidate_gate_block(
-                                stage='verification',
-                                original_blocks=list(verification_report.blocks),
-                                candidate_blocks=list(repair_candidate_report.blocks),
+                            'external_repair_static_semantics_after_verification',
+                            'Проверить code artifact после repair статическими правилами',
+                            lambda: self._ensure_code_artifact_static_semantics(
+                                result_payload=repair_result_payload,
+                                step_name='external_repair',
+                                expected_operation=requested_operation,
+                                expected_target_qualname=selected_target,
                             ),
                         )
 
-                        if repair_candidate_gate_block.ok:
-                            final_payload = repair_result_payload
-                            apply_result = self._replace_active_apply_result(
-                                apply_result,
-                                repair_candidate_apply,
+                        repair_candidate_apply_payload = self._run_step(
+                            steps,
+                            'apply_repair_candidate_staging',
+                            'Применить repair artifact в отдельный candidate workspace',
+                            lambda: self._try_apply_repair_candidate(
+                                repair_result_payload=repair_result_payload,
+                                selected_target=selected_target,
+                                generated_tests=generated_tests if generated_test_apply and generated_test_apply.get('applied_tests') else [],
+                            ),
+                        )
+                        repair_candidate_apply = repair_candidate_apply_payload.get('apply_result')
+                        if repair_candidate_apply is None:
+                            repair_candidate_gate_block = self._run_step(
+                                steps,
+                                'repair_candidate_gate_after_verification',
+                                'Отклонить repair candidate после неуспешного apply',
+                                lambda: self._build_repair_candidate_gate_block(
+                                    stage='apply',
+                                    original_blocks=list(verification_report.blocks),
+                                    candidate_blocks=[self._repair_candidate_apply_failure_block(repair_candidate_apply_payload)],
+                                ),
                             )
-                            verification_report = repair_candidate_report
-                        else:
                             repair_gate_blocks.append(repair_candidate_gate_block)
-                            self._delete_apply_workspace(repair_candidate_apply)
                             warning_message = self._repair_candidate_rejection_warning(repair_candidate_gate_block)
                             if warning_message not in warnings:
                                 warnings.append(warning_message)
@@ -1072,6 +1039,47 @@ class PipelineService:
                             verification_report = build_verification_report(
                                 blocks=[*verification_report.blocks, repair_candidate_gate_block],
                             )
+                        else:
+                            repair_candidate_runtime_blocks = self._run_step(
+                                steps,
+                                'verification_repair_candidate',
+                                'Запустить runtime-проверки repair candidate до принятия',
+                                lambda: self._run_runtime_verification_blocks(
+                                    repair_candidate_apply,
+                                    generated_test_apply,
+                                ),
+                            )
+                            repair_candidate_report = build_verification_report(
+                                blocks=[patch_static_block, *generated_test_blocks, *repair_candidate_runtime_blocks],
+                            )
+                            repair_candidate_gate_block = self._run_step(
+                            steps,
+                                'repair_candidate_gate_after_verification',
+                                'Решить, можно ли принимать repair candidate после runtime verification',
+                                lambda: self._build_repair_candidate_gate_block(
+                                    stage='verification',
+                                    original_blocks=list(verification_report.blocks),
+                                    candidate_blocks=list(repair_candidate_report.blocks),
+                                ),
+                            )
+
+                            if repair_candidate_gate_block.ok:
+                                final_payload = repair_result_payload
+                                apply_result = self._replace_active_apply_result(
+                                    apply_result,
+                                    repair_candidate_apply,
+                                )
+                                verification_report = repair_candidate_report
+                            else:
+                                repair_gate_blocks.append(repair_candidate_gate_block)
+                                self._delete_apply_workspace(repair_candidate_apply)
+                                warning_message = self._repair_candidate_rejection_warning(repair_candidate_gate_block)
+                                if warning_message not in warnings:
+                                    warnings.append(warning_message)
+                                LOGGER.warning(warning_message)
+                                verification_report = build_verification_report(
+                                    blocks=[*verification_report.blocks, repair_candidate_gate_block],
+                                )
 
             verification_report = self._reclassify_generated_test_failure_only(
                 verification_report,
@@ -1165,7 +1173,6 @@ class PipelineService:
                 generated_test_review=generated_test_review,
                 apply_result=apply_result,
                 merge_plan=merge_plan,
-                final_payload=final_payload,
                 steps=steps,
                 warnings=warnings,
             )
@@ -1293,6 +1300,32 @@ class PipelineService:
                 'message': message,
             },
         )
+
+    def _repair_not_applied_block(self, payload: dict[str, Any]) -> VerificationBlock:
+        error_type = str(payload.get('error_type') or '').strip() or 'repair_failed'
+        message = str(payload.get('message') or '').strip() or 'codegenerator repair did not return code_artifact'
+        return VerificationBlock(
+            name='external_repair_not_applied',
+            ok=False,
+            severity='error',
+            issues=[
+                VerificationIssue(
+                    code='repair_not_applied',
+                    message=message,
+                )
+            ],
+            details={
+                'status': payload.get('status'),
+                'error_type': error_type,
+                'message': message,
+                'trace_path': payload.get('trace_path'),
+            },
+        )
+
+    def _repair_not_applied_warning(self, payload: dict[str, Any]) -> str:
+        error_type = str(payload.get('error_type') or '').strip() or 'repair_failed'
+        message = str(payload.get('message') or '').strip() or 'codegenerator repair did not return code_artifact'
+        return f'Repair не применён: {error_type}: {message}'
 
     def _build_repair_candidate_gate_block(
         self,
@@ -1693,7 +1726,6 @@ class PipelineService:
         generated_test_review: dict[str, Any] | None = None,
         apply_result: ApplyResult | None = None,
         merge_plan: MergePlan | None = None,
-        final_payload: dict[str, Any] | None = None,
         warnings: list[str] | None = None,
     ) -> PipelineRunResult:
         usage_summary = self._build_usage_summary(
@@ -1720,7 +1752,6 @@ class PipelineService:
             repair_generation=repair_generation,
             generated_test_review=generated_test_review,
             usage_summary=usage_summary,
-            final_payload=final_payload,
         )     
         return PipelineRunResult(
             run_id=run_id,
@@ -2497,23 +2528,9 @@ class PipelineService:
         repair_generation: ExternalGenerationCall | None,
         generated_test_review: dict[str, Any] | None,
         usage_summary: dict[str, Any] | None,
-        final_payload: dict[str, Any] | None = None,
     ) -> PipelineExecutionSummary:
         code_result_summary = (external_code_generation.result_summary if external_code_generation else {}) or {}
         code_artifact_summary = (code_result_summary.get('code_artifact_summary') or {}) if isinstance(code_result_summary, dict) else {}
-        final_code_artifact = (final_payload or {}).get('code_artifact') if isinstance(final_payload, dict) else None
-        if isinstance(final_code_artifact, dict) and final_code_artifact:
-            code_artifact_summary = {
-                'operation': final_code_artifact.get('operation'),
-                'target_qualname': final_code_artifact.get('target_qualname'),
-                'target_file': final_code_artifact.get('target_file'),
-                'insert_after': final_code_artifact.get('insert_after'),
-                'insert_scope': final_code_artifact.get('insert_scope'),
-                'expected_new_symbol_kind': final_code_artifact.get('expected_new_symbol_kind'),
-                'parent_qualname': final_code_artifact.get('parent_qualname'),
-                'import_changes_count': len(final_code_artifact.get('import_changes') or []),
-                'code_chars': len(str(final_code_artifact.get('code') or '')),
-            }
         final_operation = code_artifact_summary.get('operation') or requested_operation
 
         changed_files = []

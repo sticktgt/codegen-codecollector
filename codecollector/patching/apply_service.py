@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import ast
+import hashlib
+import json
 import textwrap
+from datetime import UTC, datetime
 from pathlib import Path
 
 from codecollector.config import AppConfig, load_config
@@ -16,6 +19,8 @@ from codecollector.workspace.diff_service import DiffService
 from codecollector.workspace.staging_manager import StagingManager
 
 LOGGER = get_logger(__name__)
+
+WORKSPACE_BASELINE_FILENAME = '.codecollector_workspace_baseline.json'
 
 
 class ApplyService:
@@ -43,6 +48,11 @@ class ApplyService:
 
             target_path = workspace / symbol.file_path
             before_path = source_project / symbol.file_path
+            baseline_rel_paths = [symbol.file_path]
+            for test_artifact in generated_tests or []:
+                baseline_rel_paths.append(str(test_artifact['file_path']))
+            self._write_workspace_baseline(workspace, source_project, baseline_rel_paths)
+
             self._apply_operation_to_file(target_path, symbol, artifact)
             changed_files = [target_path]
             for test_artifact in generated_tests or []:
@@ -81,6 +91,55 @@ class ApplyService:
             except Exception:
                 LOGGER.exception('Failed to delete staging workspace after apply failure: %s', workspace)
             raise
+
+
+    def _write_workspace_baseline(self, workspace: Path, source_project: Path, rel_paths: list[str]) -> Path:
+        """Store base hashes for files that this workspace is expected to change.
+
+        The baseline is written inside the workspace but is explicitly ignored by
+        workspace apply. It is used later to prevent applying an old workspace
+        over project files that were changed by another CR after the workspace was
+        created.
+        """
+        files: dict[str, dict[str, object]] = {}
+        for raw_rel in rel_paths:
+            rel = str(raw_rel or '').strip().replace('\\', '/')
+            while rel.startswith('./'):
+                rel = rel[2:]
+            if not rel or rel in files:
+                continue
+            files[rel] = self._baseline_entry(source_project / rel)
+
+        payload = {
+            'version': 1,
+            'created_at': datetime.now(tz=UTC).isoformat(),
+            'source_project': str(source_project),
+            'files': files,
+        }
+        path = workspace / WORKSPACE_BASELINE_FILENAME
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+        LOGGER.info('Wrote workspace baseline metadata: %s files=%s', path, len(files))
+        return path
+
+    def _baseline_entry(self, path: Path) -> dict[str, object]:
+        if not path.exists():
+            return {'exists': False, 'sha256': None, 'size': None, 'mtime_ns': None}
+        if not path.is_file():
+            return {'exists': False, 'sha256': None, 'size': None, 'mtime_ns': None}
+        stat = path.stat()
+        return {
+            'exists': True,
+            'sha256': self._sha256_file(path),
+            'size': int(stat.st_size),
+            'mtime_ns': int(stat.st_mtime_ns),
+        }
+
+    def _sha256_file(self, path: Path) -> str:
+        hasher = hashlib.sha256()
+        with path.open('rb') as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b''):
+                hasher.update(chunk)
+        return hasher.hexdigest()
 
     def _apply_operation_to_file(self, target_path: Path, symbol: SymbolRecord, artifact: PatchArtifact) -> None:
         LOGGER.info('Applying %s for %s in %s', artifact.operation, symbol.qualname, target_path)

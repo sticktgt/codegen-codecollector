@@ -74,6 +74,7 @@ class AnalysisLlmAssistService:
         search_plan: dict[str, Any] | None = None,
         candidates: list[SearchCandidate],
         services: ProjectServices,
+        mentioned_symbols: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         candidate_cards = self._candidate_cards(candidates, services)
         LOGGER.info(
@@ -91,6 +92,7 @@ class AnalysisLlmAssistService:
             'effective_insert_scope': insert_scope,
             'search_plan': self._compact_search_plan(search_plan or {}),
             'operation_definitions': self._operation_definitions(),
+            'mentioned_symbols': mentioned_symbols or [],
             'candidate_cards': candidate_cards
         }
         user_prompt, prompt_budget = self._build_limited_rerank_prompt(payload)
@@ -101,20 +103,33 @@ class AnalysisLlmAssistService:
             max_prompt_chars=int(prompt_budget.get('max_prompt_chars') or self.config.analysis_llm_rerank_max_prompt_chars),
         )
         parse_recovered = False
+        parse_repair_applied = False
+        parse_mode = 'strict_json'
         parse_error_message: str | None = None
         try:
             parsed = self._parse_json_object(call.content)
             if self._rerank_parse_lost_selection_fields(call.content, parsed):
                 raise json.JSONDecodeError(
-                    'Rerank JSON was parsed only partially; selection fields are present in raw response but missing from parsed object',
+                    'Rerank JSON was parsed only partially: the raw response contains selection fields, '
+                    'but the parsed top-level object ended before those fields',
                     str(call.content or ''),
                     0,
                 )
         except json.JSONDecodeError as exc:
-            parse_recovered = True
             parse_error_message = str(exc)
-            parsed = self._fallback_parse_rerank_response(call.content, candidate_cards, exc)
-        if parse_recovered:
+            repaired = self._try_parse_repaired_rerank_response(call.content)
+            if repaired is not None:
+                parsed = repaired
+                parse_recovered = True
+                parse_repair_applied = True
+                parse_mode = 'json_repaired'
+            else:
+                parse_recovered = True
+                parse_mode = 'fallback_extraction'
+                parsed = self._fallback_parse_rerank_response(call.content, candidate_cards, exc)
+        if parse_repair_applied:
+            parsed = self._ensure_rerank_json_repaired_warning(parsed, parse_error_message)
+        elif parse_recovered:
             parsed = self._ensure_invalid_json_contract_warning(parsed, parse_error_message)
         parsed.setdefault('llm_usage', call.usage_dict())
         parsed.setdefault('prompt_budget', prompt_budget)
@@ -123,6 +138,8 @@ class AnalysisLlmAssistService:
             parsed=parsed,
             candidate_cards=candidate_cards,
             parse_recovered=parse_recovered,
+            parse_repair_applied=parse_repair_applied,
+            parse_mode=parse_mode,
             parse_error_message=parse_error_message,
         )
         parsed['_diagnostics'] = {
@@ -160,9 +177,13 @@ class AnalysisLlmAssistService:
 
     def _build_limited_rerank_prompt(self, payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         mutable_payload = deepcopy(payload)
+        original_candidate_cards = deepcopy(mutable_payload.get('candidate_cards') or [])
+        priority_report = self._prioritize_candidate_cards_for_rerank(mutable_payload)
         limit = self.config.analysis_llm_rerank_max_prompt_chars or self.config.analysis_llm_max_prompt_chars
         soft_limit = int(limit * max(1.0, self.config.analysis_llm_rerank_soft_overflow_ratio))
         trim_steps: list[str] = []
+        if priority_report.get('reordered'):
+            trim_steps.append('candidate_cards:priority_reorder')
         while True:
             user_prompt = self._render(
                 self.rerank_template,
@@ -171,7 +192,16 @@ class AnalysisLlmAssistService:
             prompt_chars = len(self.system_prompt) + len(user_prompt)
             if prompt_chars <= limit:
                 self._log_prompt_budget('analyze_candidate_rerank', prompt_chars, limit, trim_steps)
-                return user_prompt, {'max_prompt_chars': limit, 'prompt_chars': prompt_chars, 'trim_steps': trim_steps}
+                return user_prompt, {
+                    'max_prompt_chars': limit,
+                    'prompt_chars': prompt_chars,
+                    'trim_steps': trim_steps,
+                    'candidate_prompt': self._candidate_prompt_diagnostics(
+                        original_candidate_cards,
+                        mutable_payload.get('candidate_cards') or [],
+                        priority_report,
+                    ),
+                }
 
             if self._shrink_candidate_cards(mutable_payload, trim_steps):
                 continue
@@ -186,6 +216,11 @@ class AnalysisLlmAssistService:
                     'max_prompt_chars': soft_limit,
                     'prompt_chars': prompt_chars,
                     'trim_steps': trim_steps,
+                    'candidate_prompt': self._candidate_prompt_diagnostics(
+                        original_candidate_cards,
+                        mutable_payload.get('candidate_cards') or [],
+                        priority_report,
+                    ),
                 }
 
             self._log_prompt_budget('analyze_candidate_rerank_too_large', prompt_chars, soft_limit, trim_steps)
@@ -228,6 +263,210 @@ class AnalysisLlmAssistService:
         if removed_docstrings:
             trim_steps.append('project_map_docstrings:removed')
         return removed_docstrings
+
+    def _prioritize_candidate_cards_for_rerank(self, payload: dict[str, Any]) -> dict[str, Any]:
+        cards = payload.get('candidate_cards') or []
+        if not isinstance(cards, list) or len(cards) <= 1:
+            return {'reordered': False, 'scores': {}}
+
+        request_text = self._rerank_request_text(payload)
+        search_queries = self._rerank_search_queries(payload)
+        preferred_qualnames = set(self._rerank_preferred_qualnames(payload))
+        ui_request = self._looks_like_ui_action_request(request_text)
+
+        scored: list[tuple[int, int, dict[str, Any], list[str]]] = []
+        for index, card in enumerate(cards):
+            score, reasons = self._rerank_card_priority_score(
+                card,
+                request_text=request_text,
+                search_queries=search_queries,
+                preferred_qualnames=preferred_qualnames,
+                ui_request=ui_request,
+            )
+            scored.append((score, index, card, reasons))
+
+        if not any(score > 0 for score, _, _, _ in scored):
+            return {'reordered': False, 'scores': {}}
+
+        reordered = sorted(scored, key=lambda item: (-item[0], item[1]))
+        payload['candidate_cards'] = [card for _, _, card, _ in reordered]
+        scores = {
+            str(card.get('candidate_id') or ''): {
+                'priority_score': score,
+                'priority_reasons': reasons,
+            }
+            for score, _, card, reasons in scored
+        }
+        return {
+            'reordered': [str(card.get('candidate_id') or '') for _, _, card, _ in reordered]
+            != [str(card.get('candidate_id') or '') for _, _, card, _ in scored],
+            'scores': scores,
+            'priority_inputs': {
+                'search_queries': search_queries,
+                'preferred_qualnames': sorted(preferred_qualnames),
+                'ui_action_request': ui_request,
+            },
+        }
+
+    def _rerank_request_text(self, payload: dict[str, Any]) -> str:
+        request = payload.get('request') or {}
+        parts: list[str] = []
+        if isinstance(request, dict):
+            for key in ('titles', 'descriptions', 'constraints'):
+                value = request.get(key) or []
+                if isinstance(value, list):
+                    parts.extend(str(item) for item in value if str(item))
+                elif value:
+                    parts.append(str(value))
+        return '\n'.join(parts).casefold()
+
+    def _rerank_search_queries(self, payload: dict[str, Any]) -> list[str]:
+        plan = ((payload.get('search_plan') or {}).get('search_plan') or {}) if isinstance(payload.get('search_plan'), dict) else {}
+        values = plan.get('search_queries') or []
+        return [str(item).strip() for item in values if str(item).strip()]
+
+    def _rerank_preferred_qualnames(self, payload: dict[str, Any]) -> list[str]:
+        plan = ((payload.get('search_plan') or {}).get('search_plan') or {}) if isinstance(payload.get('search_plan'), dict) else {}
+        values = plan.get('preferred_qualnames') or []
+        return [str(item).strip() for item in values if str(item).strip()]
+
+    def _looks_like_ui_action_request(self, request_text: str) -> bool:
+        ui_terms = (
+            'панел',
+            'инструмент',
+            'кнопк',
+            'toolbar',
+            'tool bar',
+            'action',
+            'button',
+            'меню',
+            'окн',
+            'ui',
+            'интерфейс',
+        )
+        return any(term in request_text for term in ui_terms)
+
+    def _rerank_card_priority_score(
+        self,
+        card: dict[str, Any],
+        *,
+        request_text: str,
+        search_queries: list[str],
+        preferred_qualnames: set[str],
+        ui_request: bool,
+    ) -> tuple[int, list[str]]:
+        qualname = str(card.get('qualname') or '')
+        name = str(card.get('name') or qualname.rsplit('.', 1)[-1])
+        parent_qualname = str(card.get('parent_qualname') or '')
+        searchable_identity = f'{qualname}\n{name}\n{parent_qualname}'.casefold()
+        source_text = self._card_source_text(card)
+        score = 0
+        reasons: list[str] = []
+
+        if qualname in preferred_qualnames:
+            score += 60
+            reasons.append('preferred_qualname')
+
+        for query in search_queries:
+            query_norm = query.casefold().strip()
+            if not query_norm:
+                continue
+            if query_norm == name.casefold() or query_norm == qualname.casefold() or query_norm in searchable_identity:
+                score += 45
+                reasons.append(f'search_query:{query}')
+            elif query_norm in source_text:
+                score += 10
+                reasons.append(f'search_query_in_source:{query}')
+
+        if ui_request and self._card_has_ui_action_patterns(card):
+            score += 45
+            reasons.append('ui_action_source_patterns')
+
+        if ui_request and str(card.get('kind') or '') == 'method' and any(
+            marker in name.casefold() for marker in ('setup', 'init', 'ui', 'toolbar', 'action')
+        ):
+            score += 25
+            reasons.append('ui_setup_method_name')
+
+        # If the request explicitly says to use an existing method, keep that
+        # method visible to the reranker, but do not let this rule alone make it
+        # a stronger target than an actual UI setup candidate.
+        if qualname and qualname.casefold() in request_text:
+            score += 20
+            reasons.append('explicit_qualname_in_request')
+        elif name and re.search(rf'\b{re.escape(name.casefold())}\b', request_text):
+            score += 12
+            reasons.append('explicit_name_in_request')
+
+        return score, self._dedupe(reasons)
+
+    def _card_source_text(self, card: dict[str, Any]) -> str:
+        parts = [
+            str(card.get('source_excerpt') or ''),
+            str(card.get('docstring') or ''),
+            str(card.get('knowledge_title') or ''),
+        ]
+        for member in card.get('class_members') or []:
+            if isinstance(member, dict):
+                parts.append(str(member.get('qualname') or ''))
+                parts.append(str(member.get('signature') or ''))
+                parts.append(str(member.get('docstring') or ''))
+        for sibling in card.get('siblings') or []:
+            if isinstance(sibling, dict):
+                parts.append(str(sibling.get('qualname') or ''))
+                parts.append(str(sibling.get('signature') or ''))
+                parts.append(str(sibling.get('docstring') or ''))
+        return '\n'.join(parts).casefold()
+
+    def _card_has_ui_action_patterns(self, card: dict[str, Any]) -> bool:
+        text = self._card_source_text(card)
+        patterns = (
+            'qtoolbar',
+            'addtoolbar',
+            'actionstoolbar',
+            'actions_toolbar',
+            'addaction',
+            'qaction',
+            '.triggered',
+            '.connect',
+            'панель инструментов',
+            'кнопк',
+        )
+        return any(pattern in text for pattern in patterns)
+
+    def _candidate_prompt_diagnostics(
+        self,
+        original_cards: list[dict[str, Any]],
+        included_cards: list[dict[str, Any]],
+        priority_report: dict[str, Any],
+    ) -> dict[str, Any]:
+        scores = priority_report.get('scores') if isinstance(priority_report, dict) else {}
+        if not isinstance(scores, dict):
+            scores = {}
+        included_ids = [str(card.get('candidate_id') or '') for card in included_cards if isinstance(card, dict)]
+        included_set = set(included_ids)
+        original_ids = [str(card.get('candidate_id') or '') for card in original_cards if isinstance(card, dict)]
+
+        def entry(card: dict[str, Any]) -> dict[str, Any]:
+            candidate_id = str(card.get('candidate_id') or '')
+            score_payload = scores.get(candidate_id) if isinstance(scores.get(candidate_id), dict) else {}
+            return {
+                'candidate_id': candidate_id,
+                'qualname': str(card.get('qualname') or ''),
+                'kind': str(card.get('kind') or ''),
+                'priority_score': int(score_payload.get('priority_score') or 0),
+                'priority_reasons': list(score_payload.get('priority_reasons') or []),
+            }
+
+        return {
+            'original_count': len(original_cards),
+            'included_count': len(included_cards),
+            'dropped_count': max(0, len(original_cards) - len(included_cards)),
+            'original_candidate_ids': original_ids,
+            'included': [entry(card) for card in included_cards if isinstance(card, dict)],
+            'dropped': [entry(card) for card in original_cards if isinstance(card, dict) and str(card.get('candidate_id') or '') not in included_set],
+            'priority_inputs': priority_report.get('priority_inputs') if isinstance(priority_report, dict) else {},
+        }
 
     def _shrink_candidate_cards(self, payload: dict[str, Any], trim_steps: list[str]) -> bool:
         cards = payload.get('candidate_cards') or []
@@ -388,6 +627,110 @@ class AnalysisLlmAssistService:
         updated['_diagnostics'] = diagnostics
         return updated
 
+    def _ensure_rerank_json_repaired_warning(
+        self,
+        parsed: dict[str, Any],
+        parse_error_message: str | None,
+    ) -> dict[str, Any]:
+        updated = dict(parsed or {})
+        warnings = [item for item in updated.get('warnings') or [] if isinstance(item, dict)]
+        if not any(str(item.get('code') or '') == 'analysis_llm_rerank_json_repaired' for item in warnings):
+            warnings.append(
+                {
+                    'code': 'analysis_llm_rerank_json_repaired',
+                    'message': (
+                        'LLM вернула JSON с поврежденной структурой для analyze rerank; '
+                        'ответ был восстановлен и затем разобран как полноценный JSON. '
+                        f'Исходная ошибка: {parse_error_message or "unknown"}'
+                    ),
+                }
+            )
+        updated['warnings'] = warnings
+        diagnostics = dict(updated.get('_diagnostics') or {})
+        diagnostics['json_repair'] = {
+            'step': 'analyze_candidate_rerank',
+            'parse_recovered': True,
+            'parse_repair_applied': True,
+            'parse_error': parse_error_message or '',
+        }
+        updated['_diagnostics'] = diagnostics
+        return updated
+
+    def _try_parse_repaired_rerank_response(self, content: str) -> dict[str, Any] | None:
+        repaired = self._repair_premature_top_level_json_close(content)
+        if not repaired:
+            return None
+        try:
+            parsed = self._parse_json_object(repaired)
+        except json.JSONDecodeError:
+            return None
+        if self._rerank_parse_lost_selection_fields(repaired, parsed):
+            return None
+        return parsed
+
+    def _repair_premature_top_level_json_close(self, content: str) -> str | None:
+        text = self._strip_json_fence(content)
+        if not text or '{' not in text:
+            return None
+
+        known_late_fields = (
+            'insert_scope',
+            'expected_new_symbol_kind',
+            'parent_qualname',
+            'recommended_candidate_id',
+            'recommended_target',
+            'target_role',
+            'target_confidence',
+            'target_reason',
+            'manual_review_required',
+            'warnings',
+            'ranked_candidates',
+            'alternatives',
+        )
+        result: list[str] = []
+        depth = 0
+        in_string = False
+        escaped = False
+        changed = False
+        for pos, char in enumerate(text):
+            if in_string:
+                result.append(char)
+                if escaped:
+                    escaped = False
+                elif char == '\\':
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+
+            if char == '"':
+                in_string = True
+                result.append(char)
+                continue
+            if char == '{':
+                depth += 1
+                result.append(char)
+                continue
+            if char == '}':
+                tail = text[pos + 1:].lstrip()
+                if depth == 1 and tail.startswith(',') and any(f'"{field}"' in tail[:3000] for field in known_late_fields):
+                    changed = True
+                    # Keep the top-level object open; the following comma starts
+                    # the next top-level field and remains valid JSON after the
+                    # premature brace is removed.
+                    continue
+                depth -= 1
+                result.append(char)
+                continue
+            result.append(char)
+
+        if not changed:
+            return None
+        repaired = ''.join(result).strip()
+        if not repaired.endswith('}'):
+            repaired = repaired.rstrip(',\n\r\t ') + '}'
+        return repaired
+
     def _rerank_parse_lost_selection_fields(self, content: str, parsed: dict[str, Any]) -> bool:
         if not isinstance(parsed, dict):
             return False
@@ -425,6 +768,8 @@ class AnalysisLlmAssistService:
         parsed: dict[str, Any],
         candidate_cards: list[dict[str, Any]],
         parse_recovered: bool,
+        parse_repair_applied: bool = False,
+        parse_mode: str = 'strict_json',
         parse_error_message: str | None = None,
     ) -> dict[str, Any]:
         ranked = parsed.get('ranked_candidates') if isinstance(parsed, dict) else None
@@ -448,6 +793,8 @@ class AnalysisLlmAssistService:
             'strict_json_contract_ok': not parse_recovered,
             'invalid_json_contract': bool(parse_recovered),
             'parse_recovered': parse_recovered,
+            'parse_repair_applied': parse_repair_applied,
+            'parse_mode': parse_mode,
             'parse_error': parse_error_message or None,
             'parsed_top_level_keys': sorted(str(key) for key in parsed.keys()),
             'recommended_candidate_id': recommended_candidate_id or None,
@@ -906,7 +1253,7 @@ class AnalysisLlmAssistService:
             ranked_candidates.append({
                 'candidate_id': str(recommended_candidate_id),
                 'rank': 1,
-                'reason': 'Извлечено из невалидного JSON-ответа LLM.',
+                'reason': 'Эвристически извлечено из невалидного JSON-ответа LLM; требуется ручная проверка.',
             })
         for match in re.finditer(r'"candidate_id"\s*:\s*"([^"]+)"', content):
             candidate_id = match.group(1)
@@ -915,7 +1262,7 @@ class AnalysisLlmAssistService:
                 ranked_candidates.append({
                     'candidate_id': candidate_id,
                     'rank': len(ranked_candidates) + 1,
-                    'reason': 'Извлечено из невалидного JSON-ответа LLM.',
+                    'reason': 'Эвристически извлечено из невалидного JSON-ответа LLM; требуется ручная проверка.',
                 })
             if len(ranked_candidates) >= 5:
                 break
@@ -946,11 +1293,11 @@ class AnalysisLlmAssistService:
         return {
             'recommended_operation': operation,
             'operation_confidence': extract_number('operation_confidence'),
-            'operation_reason': extract_string('operation_reason') or 'Извлечено из невалидного JSON-ответа LLM.',
+            'operation_reason': extract_string('operation_reason') or 'Эвристически извлечено из невалидного JSON-ответа LLM; требуется ручная проверка.',
             'insert_scope': {
                 'value': insert_scope,
                 'confidence': extract_number('confidence'),
-                'reason': extract_string('reason') or 'Извлечено из невалидного JSON-ответа LLM.',
+                'reason': extract_string('reason') or 'Эвристически извлечено из невалидного JSON-ответа LLM; требуется ручная проверка.',
             },
             'expected_new_symbol_kind': extract_string('expected_new_symbol_kind') or 'unknown',
             'parent_qualname': parent_qualname,
@@ -958,11 +1305,11 @@ class AnalysisLlmAssistService:
             'recommended_target': recommended_target,
             'target_role': target_role,
             'target_confidence': extract_number('target_confidence'),
-            'target_reason': extract_string('target_reason') or 'Извлечено из невалидного JSON-ответа LLM.',
-            'manual_review_required': False,
+            'target_reason': extract_string('target_reason') or 'Эвристически извлечено из невалидного JSON-ответа LLM; требуется ручная проверка.',
+            'manual_review_required': True,
             'warnings': [
                 {
-                    'code': 'analysis_llm_rerank_invalid_json_contract',
+                    'code': 'analysis_llm_rerank_json_recovered',
                     'message': (
                         'LLM вернула невалидный JSON для analyze rerank; '
                         f'часть полей восстановлена эвристически: {parse_error}'

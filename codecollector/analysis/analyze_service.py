@@ -151,6 +151,7 @@ class AnalyzeService:
 
         target_recommendation: dict[str, Any] = {}
         skip_rerank_reason = self._candidate_rerank_skip_reason(search_plan)
+        mentioned_symbol_matches = self._mentioned_symbol_matches(candidates, explicit_symbol_names)
         if self.llm_assist is not None and candidates and not skip_rerank_reason:
             try:
                 candidate_rerank_started_at = time.perf_counter()
@@ -162,6 +163,7 @@ class AnalyzeService:
                     search_plan=search_plan,
                     candidates=candidates,
                     services=services,
+                    mentioned_symbols=mentioned_symbol_matches,
                 )
                 record_timing('candidate_rerank_total_sec', candidate_rerank_started_at)
                 candidates_before_rerank = list(candidates)
@@ -205,18 +207,22 @@ class AnalyzeService:
 
         target_resolution_started_at = time.perf_counter()
         recommended_target = self._recommended_target(candidates, target_recommendation)
-        exact_target_override = self._exact_target_override_for_explicit_symbol_names(
+        (
+            recommended_target,
+            candidates,
+            target_recommendation,
+            exact_match_operation_source,
+        ) = self._apply_exact_symbol_match_diagnostics(
             candidates=candidates,
             target_recommendation=target_recommendation,
             recommended_target=recommended_target,
             explicit_symbol_names=explicit_symbol_names,
             requested_operation=effective_operation,
         )
-        if exact_target_override is not None:
-            recommended_target, candidates, target_recommendation = exact_target_override
+        if exact_match_operation_source:
             effective_operation = 'replace_symbol'
-            operation_source = 'explicit_symbol_exact_match'
-            operation_confidence = self._safe_float(target_recommendation.get('operation_confidence')) or 1.0
+            operation_source = exact_match_operation_source
+            operation_confidence = self._safe_float(target_recommendation.get('operation_confidence')) or operation_confidence
             operation_reason = str(target_recommendation.get('operation_reason') or operation_reason or '').strip() or None
             override_scope = self._insert_scope_from_payload(target_recommendation)
             if override_scope:
@@ -586,12 +592,13 @@ class AnalyzeService:
         return None, updated
 
     def _explicit_symbol_name_hints(self, input_requirements: list[dict[str, Any]]) -> set[str]:
-        """Extract explicit code-like target names from user-facing CR text.
+        """Extract code-like names mentioned in user-facing CR text.
 
-        The extraction is deliberately conservative. It only treats identifiers
-        containing underscores or dotted names as explicit target hints. Names
-        mentioned only in protective constraints such as "do not change X" are
-        skipped: those names describe boundaries, not target selection.
+        These names are neutral retrieval hints only. Analyze does not infer from
+        static text matching whether a mentioned symbol is a target, dependency,
+        boundary, example, or unrelated reference; that role is left to LLM rerank
+        and manual review when needed. Protective constraints are still skipped to
+        preserve the existing import-targeting behavior.
         """
         texts: list[str] = []
         for item in input_requirements or []:
@@ -722,7 +729,34 @@ class AnalyzeService:
                     reason="точное совпадение имени symbol из текста CR",
                 )
 
-    def _exact_target_override_for_explicit_symbol_names(
+    def _mentioned_symbol_matches(
+        self,
+        candidates: list[SearchCandidate],
+        explicit_symbol_names: set[str],
+    ) -> list[dict[str, Any]]:
+        if not explicit_symbol_names:
+            return []
+        result: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for index, candidate in enumerate(candidates[: self.config.analysis_max_candidate_cards], start=1):
+            if candidate.name not in explicit_symbol_names and candidate.qualname not in explicit_symbol_names:
+                continue
+            if candidate.qualname in seen:
+                continue
+            result.append(
+                {
+                    "candidate_id": f"c{index}",
+                    "qualname": candidate.qualname,
+                    "name": candidate.name,
+                    "kind": candidate.kind,
+                    "file_path": candidate.file_path,
+                    "role": "unknown",
+                }
+            )
+            seen.add(candidate.qualname)
+        return result
+
+    def _apply_exact_symbol_match_diagnostics(
         self,
         *,
         candidates: list[SearchCandidate],
@@ -730,61 +764,147 @@ class AnalyzeService:
         recommended_target: str | None,
         explicit_symbol_names: set[str],
         requested_operation: str,
-    ) -> tuple[str, list[SearchCandidate], dict[str, Any]] | None:
-        if requested_operation != "replace_symbol" or not explicit_symbol_names:
-            return None
-        exact_candidates = [
-            candidate
-            for candidate in candidates
-            if candidate.name in explicit_symbol_names or candidate.qualname in explicit_symbol_names
-        ]
-        if len(exact_candidates) != 1:
-            return None
-        exact = exact_candidates[0]
-        if recommended_target == exact.qualname:
-            return None
+    ) -> tuple[str | None, list[SearchCandidate], dict[str, Any], str | None]:
+        """Record exact symbol mentions without overriding a confident LLM target.
+
+        Exact matches are retrieval/diagnostic evidence. They are not semantic
+        proof that the mentioned symbol is the target: the same mention can point
+        to a callee, dependency, boundary, example, or target. When LLM rerank has
+        already selected an accepted target, this method only records the exact
+        matches as an unconfirmed alternative. If rerank did not provide an
+        accepted target, one exact match may be surfaced as an unconfirmed fallback
+        that always requires manual review.
+        """
+        if not explicit_symbol_names:
+            return recommended_target, candidates, target_recommendation, None
+
+        exact_candidates: list[SearchCandidate] = []
+        seen: set[str] = set()
+        for index, candidate in enumerate(candidates, start=1):
+            if candidate.name not in explicit_symbol_names and candidate.qualname not in explicit_symbol_names:
+                continue
+            if candidate.qualname in seen:
+                continue
+            exact_candidates.append(candidate)
+            seen.add(candidate.qualname)
+
+        if not exact_candidates:
+            return recommended_target, candidates, target_recommendation, None
 
         updated = dict(target_recommendation or {})
+        diagnostics = dict(updated.get("_diagnostics") or {})
+        exact_payload = [
+            {
+                "candidate_id": self._candidate_id_for_qualname(candidates, candidate.qualname),
+                "qualname": candidate.qualname,
+                "name": candidate.name,
+                "kind": candidate.kind,
+                "file_path": candidate.file_path,
+            }
+            for candidate in exact_candidates
+        ]
+        llm_target = str(updated.get("recommended_target") or "").strip() or None
+        exact_selected = bool(recommended_target and any(candidate.qualname == recommended_target for candidate in exact_candidates))
+        diagnostics["exact_symbol_matches"] = {
+            "matches": exact_payload,
+            "llm_recommended_target": llm_target,
+            "selected_target": recommended_target,
+            "conflicts_with_selected_target": bool(recommended_target and not exact_selected),
+            "used_as_target": exact_selected,
+            "used_as_unconfirmed_fallback": False,
+        }
+        post_processing = dict(updated.get("post_processing") or {})
+        post_processing["explicit_symbol_matches"] = {
+            "matches": exact_payload,
+            "selected_target": recommended_target,
+            "used_as_target": exact_selected,
+            "used_as_unconfirmed_fallback": False,
+            "note": (
+                "Точное совпадение имени символа используется только как диагностический сигнал; "
+                "роль упомянутого символа определяет LLM rerank или ручная проверка."
+            ),
+        }
+        updated["_diagnostics"] = diagnostics
+        updated["post_processing"] = post_processing
+        updated["exact_symbol_matches"] = exact_payload
+        updated["exact_symbol_match_conflict"] = bool(recommended_target and not exact_selected)
+        updated["exact_symbol_match_used_as_target"] = exact_selected
+        updated["exact_symbol_match_used_as_unconfirmed_fallback"] = False
+
+        if recommended_target or requested_operation != "replace_symbol" or len(exact_candidates) != 1:
+            return recommended_target, candidates, updated, None
+
+        exact = exact_candidates[0]
         parent_qualname = exact.qualname.rsplit(".", 1)[0] if exact.kind == "method" and "." in exact.qualname else None
         insert_scope = "class_body" if exact.kind == "method" else "module_body"
+        existing_warnings = [item for item in updated.get("warnings") or [] if isinstance(item, dict)]
+        existing_warnings.append(
+            {
+                "code": "exact_match_requires_review",
+                "message": (
+                    "Символ найден по точному совпадению в запросе, но его роль не подтверждена "
+                    "LLM rerank. Target требует ручной проверки."
+                ),
+            }
+        )
+        fallback_confidence = max(self._safe_float(updated.get("target_confidence")), 0.5)
         updated.update(
             {
                 "recommended_operation": "replace_symbol",
-                "operation_confidence": 1.0,
+                "operation_confidence": max(self._safe_float(updated.get("operation_confidence")), 0.5),
                 "operation_reason": (
-                    f"В CR явно указан symbol `{exact.name}`, и в индексе найдено точное совпадение "
-                    f"{exact.qualname}. Для replace_symbol точное совпадение имеет приоритет над похожими методами."
+                    "LLM rerank не дал уверенный target; точное совпадение имени символа показано "
+                    "только как неподтвержденный fallback для ручной проверки."
                 ),
                 "insert_scope": {
                     "value": insert_scope,
-                    "confidence": 1.0,
-                    "reason": "Scope определен по типу найденного точного symbol.",
+                    "confidence": 0.5,
+                    "reason": "Scope определен по типу неподтвержденного exact-match символа.",
                 },
                 "expected_new_symbol_kind": exact.kind,
                 "parent_qualname": parent_qualname,
-                "recommended_candidate_id": None,
+                "recommended_candidate_id": self._candidate_id_for_qualname(candidates, exact.qualname),
                 "recommended_target": exact.qualname,
-                "target_role": "target",
-                "target_confidence": 1.0,
+                "target_role": "unconfirmed_exact_match",
+                "target_confidence": fallback_confidence,
                 "target_reason": (
-                    f"Точное совпадение с явно указанным symbol `{exact.name}` из CR. "
-                    "Похожие методы с другим именем не выбираются как target для replace_symbol."
+                    "Символ найден по точному совпадению в запросе; роль target не подтверждена LLM rerank."
                 ),
-                "manual_review_required": False,
-                "post_processing": {
-                    **(updated.get("post_processing") or {}),
-                    "explicit_symbol_exact_match": {
-                        "symbol_name": exact.name,
-                        "qualname": exact.qualname,
-                    },
-                },
+                "manual_review_required": True,
+                "warnings": existing_warnings,
             }
         )
+        diagnostics = dict(updated.get("_diagnostics") or {})
+        diagnostics["exact_symbol_matches"] = {
+            **dict(diagnostics.get("exact_symbol_matches") or {}),
+            "selected_target": exact.qualname,
+            "conflicts_with_selected_target": False,
+            "used_as_target": False,
+            "used_as_unconfirmed_fallback": True,
+        }
+        post_processing = dict(updated.get("post_processing") or {})
+        post_processing["explicit_symbol_matches"] = {
+            **dict(post_processing.get("explicit_symbol_matches") or {}),
+            "selected_target": exact.qualname,
+            "used_as_target": False,
+            "used_as_unconfirmed_fallback": True,
+        }
+        updated["_diagnostics"] = diagnostics
+        updated["post_processing"] = post_processing
+        updated["exact_symbol_match_conflict"] = False
+        updated["exact_symbol_match_used_as_target"] = False
+        updated["exact_symbol_match_used_as_unconfirmed_fallback"] = True
         reordered = sorted(
             candidates,
             key=lambda item: (0 if item.qualname == exact.qualname else 1, -item.score, item.qualname),
         )
-        return exact.qualname, reordered, updated
+        return exact.qualname, reordered, updated, "exact_symbol_match_unconfirmed"
+
+    def _candidate_id_for_qualname(self, candidates: list[SearchCandidate], qualname: str) -> str | None:
+        for index, candidate in enumerate(candidates[: self.config.analysis_max_candidate_cards], start=1):
+            if candidate.qualname == qualname:
+                return f"c{index}"
+        return None
 
     def _collect_recall_candidates(
         self,
@@ -1791,6 +1911,8 @@ class AnalyzeService:
         result: list[dict[str, Any]] = []
         persistent_warning_codes = {
             'analysis_llm_rerank_invalid_json_contract',
+            'analysis_llm_rerank_json_repaired',
+            'analysis_llm_rerank_json_recovered',
         }
         for warning in warnings:
             code = str(warning.get('code') or '')

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import difflib
+import hashlib
 import json
 import shutil
 import time
@@ -21,6 +22,8 @@ from codecollector.vector_search.ollama_embeddings import reset_embedding_usage,
 
 LOGGER = get_logger(__name__)
 
+WORKSPACE_BASELINE_FILENAME = '.codecollector_workspace_baseline.json'
+
 
 def _utc_now() -> str:
     from datetime import datetime, timezone
@@ -34,6 +37,10 @@ SKIP_DIR_NAMES = {
     '.git',
     '.idea',
     '.vscode',
+}
+
+SKIP_FILE_NAMES = {
+    WORKSPACE_BASELINE_FILENAME,
 }
 
 BINARY_SUFFIXES = {
@@ -51,6 +58,15 @@ class ResolvedWorkspace:
     project_id: str | None
     project_root: Path | None
     run_id: str | None
+
+
+class WorkspaceApplyConflictError(RuntimeError):
+    def __init__(self, message: str, details: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.details = details
+
+    def to_dict(self) -> dict[str, Any]:
+        return dict(self.details)
 
 
 class WorkspaceService:
@@ -284,6 +300,8 @@ class WorkspaceService:
 
     def _is_skipped_path(self, rel_path: str) -> bool:
         path = Path(rel_path)
+        if path.name in SKIP_FILE_NAMES:
+            return True
         if any(part in SKIP_DIR_NAMES for part in path.parts):
             return True
         if path.suffix.lower() in BINARY_SUFFIXES:
@@ -635,6 +653,136 @@ class WorkspaceService:
         visit(bundle_fragment)
         return result
 
+    def _workspace_baseline_path(self, workspace_path: Path) -> Path:
+        return workspace_path / WORKSPACE_BASELINE_FILENAME
+
+    def _load_workspace_baseline(self, workspace_path: Path) -> dict[str, Any] | None:
+        path = self._workspace_baseline_path(workspace_path)
+        if not path.exists():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding='utf-8'))
+        except Exception as exc:  # noqa: BLE001 - invalid guard metadata should block safely.
+            raise WorkspaceApplyConflictError(
+                'Workspace baseline metadata is unreadable; apply is blocked for safety',
+                {
+                    'guard': 'workspace_base_hash',
+                    'status': 'blocked',
+                    'reason': 'invalid_workspace_baseline',
+                    'baseline_path': str(path),
+                    'error': str(exc),
+                    'conflicts': [],
+                },
+            ) from exc
+        if not isinstance(payload, dict):
+            raise WorkspaceApplyConflictError(
+                'Workspace baseline metadata has unsupported format; apply is blocked for safety',
+                {
+                    'guard': 'workspace_base_hash',
+                    'status': 'blocked',
+                    'reason': 'invalid_workspace_baseline_format',
+                    'baseline_path': str(path),
+                    'conflicts': [],
+                },
+            )
+        return payload
+
+    def _sha256_file(self, path: Path) -> str:
+        hasher = hashlib.sha256()
+        with path.open('rb') as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b''):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+
+    def _current_file_fingerprint(self, path: Path) -> dict[str, Any]:
+        if not path.exists() or not path.is_file():
+            return {'exists': False, 'sha256': None}
+        return {'exists': True, 'sha256': self._sha256_file(path)}
+
+    def _verify_workspace_base_hashes(
+        self,
+        resolved: ResolvedWorkspace,
+        changed_files: list[str],
+        excluded_files: set[str],
+    ) -> dict[str, Any]:
+        baseline = self._load_workspace_baseline(resolved.workspace_path)
+        if baseline is None:
+            return {
+                'guard': 'workspace_base_hash',
+                'status': 'skipped',
+                'reason': 'missing_workspace_baseline',
+                'baseline_path': str(self._workspace_baseline_path(resolved.workspace_path)),
+                'checked_files': [],
+                'unprotected_files': [self._normalize_rel_path(item) for item in changed_files if not self._is_excluded_path(item, excluded_files)],
+                'conflicts': [],
+            }
+
+        files = baseline.get('files')
+        if not isinstance(files, dict):
+            raise WorkspaceApplyConflictError(
+                'Workspace baseline metadata has no files section; apply is blocked for safety',
+                {
+                    'guard': 'workspace_base_hash',
+                    'status': 'blocked',
+                    'reason': 'invalid_workspace_baseline_files',
+                    'baseline_path': str(self._workspace_baseline_path(resolved.workspace_path)),
+                    'conflicts': [],
+                },
+            )
+
+        checked_files: list[str] = []
+        unprotected_files: list[str] = []
+        conflicts: list[dict[str, Any]] = []
+        for raw_rel in changed_files:
+            rel = self._normalize_rel_path(raw_rel)
+            if not rel or self._is_excluded_path(rel, excluded_files) or self._is_skipped_path(rel):
+                continue
+            base = files.get(rel)
+            if not isinstance(base, dict):
+                unprotected_files.append(rel)
+                continue
+            checked_files.append(rel)
+            expected_exists = bool(base.get('exists'))
+            expected_hash = base.get('sha256') if expected_exists else None
+            current = self._current_file_fingerprint((resolved.project_root or Path()) / rel)
+            actual_exists = bool(current.get('exists'))
+            actual_hash = current.get('sha256') if actual_exists else None
+
+            reason = ''
+            if expected_exists and not actual_exists:
+                reason = 'current_file_deleted_after_workspace_creation'
+            elif not expected_exists and actual_exists:
+                reason = 'current_file_created_after_workspace_creation'
+            elif expected_exists and actual_exists and expected_hash != actual_hash:
+                reason = 'current_file_changed_after_workspace_creation'
+
+            if reason:
+                conflicts.append({
+                    'file': rel,
+                    'reason': reason,
+                    'expected_exists': expected_exists,
+                    'actual_exists': actual_exists,
+                    'expected_sha256': expected_hash,
+                    'actual_sha256': actual_hash,
+                })
+
+        result = {
+            'guard': 'workspace_base_hash',
+            'status': 'ok' if not conflicts else 'blocked',
+            'reason': None if not conflicts else 'project_changed_after_workspace_creation',
+            'baseline_path': str(self._workspace_baseline_path(resolved.workspace_path)),
+            'baseline_created_at': baseline.get('created_at'),
+            'checked_files': checked_files,
+            'unprotected_files': unprotected_files,
+            'conflicts': conflicts,
+        }
+        if conflicts:
+            raise WorkspaceApplyConflictError(
+                'Workspace is based on an older project file version; apply is blocked for safety',
+                result,
+            )
+        return result
+
     def apply_workspace(
         self,
         workspace_id: str,
@@ -670,6 +818,12 @@ class WorkspaceService:
         excluded_set = {self._normalize_rel_path(item) for item in excluded_files}
         counts['changed_files'] = len(changed_files)
         counts['excluded_files'] = len(excluded_files)
+
+        stage_started = time.perf_counter()
+        base_hash_guard = self._verify_workspace_base_hashes(resolved, changed_files, excluded_set)
+        timings['base_hash_guard_ms'] = int((time.perf_counter() - stage_started) * 1000)
+        counts['base_hash_guard_checked_files'] = len(base_hash_guard.get('checked_files') or [])
+        counts['base_hash_guard_unprotected_files'] = len(base_hash_guard.get('unprotected_files') or [])
 
         applied_files: list[str] = []
         copied_files: list[str] = []
@@ -821,6 +975,7 @@ class WorkspaceService:
             'applied': True,
             'onboarding': onboarding_payload,
             'traceability_update': traceability_update,
+            'base_hash_guard': base_hash_guard,
         }
 
     def delete_workspace(self, workspace_id: str) -> dict[str, Any]:

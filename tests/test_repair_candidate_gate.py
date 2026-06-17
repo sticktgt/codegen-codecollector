@@ -103,3 +103,46 @@ def test_repair_candidate_gate_is_production_block_for_report() -> None:
     assert report.passed is False
     assert report.verdict == "verification_failed"
     assert report.summary["production_failed"] is True
+
+
+def test_repair_not_applied_block_preserves_repair_failure_as_verification_issue() -> None:
+    service = _service()
+
+    block = service._repair_not_applied_block(
+        {
+            'status': 'error',
+            'error_type': 'operation_mismatch',
+            'message': 'Repair returned operation replace_symbol, expected insert_after_symbol',
+            'trace_path': '/tmp/trace.json',
+        }
+    )
+
+    assert block.ok is False
+    assert block.name == 'external_repair_not_applied'
+    assert block.issues[0].code == 'repair_not_applied'
+    assert block.details['error_type'] == 'operation_mismatch'
+    assert block.details['trace_path'] == '/tmp/trace.json'
+
+
+def test_repair_not_applied_block_keeps_original_verification_report_failed() -> None:
+    service = _service()
+    original = VerificationBlock(
+        name='runtime_pytest_recommended',
+        ok=False,
+        issues=[VerificationIssue(code='duplicate_symbol_definition', message='duplicate symbol')],
+    )
+    repair_block = service._repair_not_applied_block(
+        {
+            'status': 'error',
+            'error_type': 'operation_mismatch',
+            'message': 'wrong operation',
+        }
+    )
+
+    report = build_verification_report(blocks=[original, repair_block])
+
+    assert report.passed is False
+    assert report.verdict == 'verification_failed'
+    codes = [issue.code for block in report.blocks for issue in block.issues]
+    assert codes == ['duplicate_symbol_definition', 'repair_not_applied']
+    assert 'operation_mismatch' in service._repair_not_applied_warning({'error_type': 'operation_mismatch', 'message': 'wrong operation'})

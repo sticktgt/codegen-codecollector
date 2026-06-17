@@ -1,42 +1,25 @@
-Выбери лучшую operation и лучший target/anchor для change request codecollector.
+Выбери лучший target или anchor для change request codecollector.
 
-Верни только валидный JSON без markdown.
-Ответ должен быть одним цельным JSON-объектом: не закрывай верхний объект до перечисления всех обязательных полей и не добавляй второй JSON-объект после него.
-Перед финальным ответом проверь структуру: ответ должен успешно парситься как один JSON-объект через json.loads, верхний объект должен закрываться только один раз и последним значимым символом ответа.
-Если не уверен в дополнительном поле, заполни его безопасным простым значением, но не ломай JSON-структуру.
+Верни только один валидный JSON-объект без markdown, комментариев и текста вне JSON.
+Не используй trailing comma. Не закрывай верхний JSON-объект до последнего поля.
+
+Главная задача rerank: выбрать candidate_id из candidate_cards. Не пересказывай search plan и не пиши длинные рассуждения.
+Все reason-поля должны быть короткими: одна строка до 160 символов.
 
 JSON-формат ответа:
 {
-  "change_kind": {
-    "value": "symbol_change | import_change | file_level_change | uncertain",
-    "confidence": 0.0,
-    "reason": "короткое объяснение"
-  },
-  "recommended_operation": "replace_symbol | insert_after_symbol | unknown",
-  "operation_confidence": 0.0,
-  "operation_reason": "короткое объяснение",
-  "insert_scope": {
-    "value": "module_body | class_body | unknown",
-    "confidence": 0.0,
-    "reason": "короткое объяснение"
-  },
-  "expected_new_symbol_kind": "function | class | method | unknown",
-  "parent_qualname": "qualname or null",
   "recommended_candidate_id": "candidate id or null",
   "recommended_target": "qualname or null",
-  "target_role": "target | anchor | method_anchor | parent_class | unknown",
+  "recommended_operation": "replace_symbol | insert_after_symbol | unknown",
+  "operation_confidence": 0.0,
+  "insert_scope": "module_body | class_body | unknown",
+  "expected_new_symbol_kind": "function | class | method | unknown",
+  "parent_qualname": "qualname or null",
+  "target_role": "target | anchor | method_anchor | parent_class | dependency | unknown",
   "target_confidence": 0.0,
-  "target_reason": "короткое объяснение",
+  "target_reason": "коротко",
   "manual_review_required": false,
   "warnings": [{"code": "string", "message": "string"}],
-  "reuse_existing_logic": {
-    "mode": "required | recommended | none",
-    "confidence": 0.0,
-    "reason": "короткое объяснение",
-    "contracts": [
-      {"qualname": "qualname", "role": "same_class_helper | project_contract | other", "reason": "коротко"}
-    ]
-  },
   "ranked_candidates": [
     {"candidate_id": "string", "rank": 1, "reason": "коротко"}
   ],
@@ -44,30 +27,21 @@ JSON-формат ответа:
 }
 
 Правила выбора:
-- Сначала определи change_kind. Если запрос или search_plan указывает на import_change/file_level_change, не выбирай метод только потому, что он использует имя из import.
-- Для replace_symbol выбирай symbol, который непосредственно реализует изменяемое поведение.
-- Если CR просит «реализовать/дореализовать/заполнить» поведение и среди candidates есть существующий method/function stub с NotImplementedError/TODO, совпадающий с задачей по смыслу, выбирай replace_symbol этого stub. Не добавляй новый symbol рядом с существующей заглушкой.
-- Не выбирай wrapper/controller/use-case метод, если есть более конкретный callee с нужной логикой.
-- Для insert_after_symbol выбирай anchor-symbol: место, рядом с которым логично добавить новый symbol; не используй insert_after_symbol для реализации уже существующей заглушки.
-- Для insert_after_symbol + insert_scope=module_body target_role должен быть "anchor".
-- Для insert_after_symbol + insert_scope=class_body target_role должен быть "method_anchor" или "parent_class".
-- Если пользователь явно просит добавить метод в класс, используй insert_scope=class_body, expected_new_symbol_kind=method и заполни parent_qualname.
-- Если пользователь использует слово "функция" в смысле новой возможности/обработчика, но candidate_cards показывают, что похожий API/handler слой реализован методами класса/controller, выбирай insert_scope=class_body и expected_new_symbol_kind=method.
-- Если пользователь просит добавить top-level helper/function/class, используй insert_scope=module_body.
-- Для insert_after_symbol + module_body выбирай разумный top-level anchor (function/class) в подходящем файле; не возвращай null, если такой candidate есть.
-- Не выбирай method как финальный module_body anchor; если близкий candidate — method, предпочти top-level anchor в том же файле.
-- Если change_kind="import_change" или change_kind="file_level_change", а candidate_cards содержат только методы/классы, которые используют нужное имя, но не определяют сам import/file-level change, верни recommended_target=null и manual_review_required=true.
-- Если правильного target/anchor нет среди candidate_cards, верни recommended_target=null и manual_review_required=true.
-- Если данных недостаточно, честно верни manual_review_required=true.
-- Если user_operation задана и кажется неверной, не меняй ее молча; укажи warning.
-- ranked_candidates должен содержать до 5 лучших candidate_id из candidate_cards в порядке полезности для человека.
-- Первый элемент ranked_candidates должен совпадать с recommended_candidate_id, если recommended_candidate_id не null.
-- Не добавляй в ranked_candidates кандидатов, которых нет во входных candidate_cards.
-- Если CR описывает несколько операций/методов одного класса, а кандидаты относятся к одному parent class, поднимать recommended_target до parent class.
-- Если для выполнения CR полезно переиспользовать уже существующую логику из того же класса или видимого проектного контракта, заполни reuse_existing_logic.
-- Используй reuse_existing_logic.mode="recommended", если переиспользование похоже полезным, но запрос не требует этого явно. Используй mode="required" только если без этого получится дублирование уже существующего поведения или запрос явно требует переиспользования существующей логики.
-- В reuse_existing_logic.contracts указывай только реально видимые qualname из candidate_cards, class_members или siblings. Не придумывай новые методы.
-- Если подходящего существующего метода или контракта не видно, верни reuse_existing_logic.mode="none" и contracts=[].
+- mentioned_symbols — это символы из индекса проекта, которые были упомянуты в запросе. Их роль неизвестна: это может быть target, вызываемый метод, зависимость, ограничение, пример или нерелевантная ссылка. Само упоминание символа не означает, что его нужно менять.
+- Роль упомянутых символов определяй только по полному запросу и context candidate_cards.
+- recommended_candidate_id и ranked_candidates должны ссылаться только на candidate_id из candidate_cards.
+- Если правильного target/anchor нет среди candidate_cards, верни recommended_candidate_id=null, recommended_target=null и manual_review_required=true.
+- Если user_operation задана, не меняй её молча. Если она кажется неверной, сохрани её в recommended_operation и добавь warning.
+- Для replace_symbol выбирай существующий symbol, который непосредственно нужно заменить целиком.
+- Для insert_after_symbol выбирай anchor-symbol: место, рядом с которым нужно добавить новый function/class/method.
+- Для insert_after_symbol + module_body target_role должен быть "anchor".
+- Для insert_after_symbol + class_body target_role должен быть "method_anchor" или "parent_class".
+- Если запрос просит использовать существующий метод, этот метод может быть dependency/callee, а не target. Target должен быть местом, где меняется код.
+- Если запрос просит кнопку, toolbar, action, menu или подключение обработчика, ищи candidate с UI setup/action code: QToolBar, addToolBar, addAction, QAction, triggered, connect.
+- Если запрос просит не создавать новый метод, не выбирай insert_after_symbol без явного основания; предпочитай replace_symbol существующего setup/handler метода или manual_review_required=true.
+- Если candidate является нужной зависимостью, но не местом изменения, укажи его ниже в ranked_candidates, но не делай recommended_target.
+- ranked_candidates должен содержать до 5 лучших candidate_id для ручной проверки.
+- Первый ranked_candidates должен совпадать с recommended_candidate_id, если recommended_candidate_id не null.
 
 Входные данные:
 $payload_json
